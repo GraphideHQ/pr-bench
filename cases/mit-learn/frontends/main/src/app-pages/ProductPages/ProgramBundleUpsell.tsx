@@ -1,0 +1,171 @@
+import React from "react"
+import Link from "next/link"
+import { styled } from "@mitodl/smoot-design"
+import { programsQueries } from "api/mitxonline-hooks/programs"
+import { Skeleton } from "ol-components"
+import type {
+  BaseProgram,
+  V2ProgramDetail,
+} from "@mitodl/mitxonline-api-axios/v2"
+import { DisplayModeEnum } from "@mitodl/mitxonline-api-axios/v2"
+import { parseReqTree } from "./util"
+import { useQuery } from "@tanstack/react-query"
+import { programPageView } from "@/common/urls"
+
+const BundleUpsellContainer = styled.div(({ theme }) => ({
+  backgroundColor: theme.custom.colors.lightGray1,
+  display: "flex",
+  flexDirection: "column",
+  gap: "12px",
+  // Sits flush inside the InfoBox card, below the offerings grid, at every
+  // width — a top border separates it from the grid. (It is never a standalone
+  // bordered card; that doubled the card's own border on tablet.)
+  [theme.breakpoints.up("sm")]: {
+    borderTop: `1px solid ${theme.custom.colors.lightGray2}`,
+    padding: "24px 32px",
+  },
+  [theme.breakpoints.down("sm")]: {
+    borderTop: `1px solid ${theme.custom.colors.lightGray2}`,
+    padding: "24px 16px",
+  },
+}))
+
+const SectionLabel = styled.span(({ theme }) => ({
+  ...theme.typography.subtitle3,
+  display: "block",
+  color: theme.custom.colors.darkGray1,
+  textTransform: "uppercase",
+  letterSpacing: "0.0875em",
+}))
+
+const BundleUpsellItem = styled.div(({ theme }) => ({
+  display: "flex",
+  flexDirection: "column",
+  gap: "4px",
+  borderLeft: `2px solid ${theme.custom.colors.red}`,
+  paddingLeft: "12px",
+  "& + &": {
+    marginTop: "8px",
+  },
+}))
+
+const BundleUpsellTitle = styled.span(({ theme }) => ({
+  ...theme.typography.subtitle1,
+  display: "block",
+}))
+
+const BundleDescription = styled.p(({ theme }) => ({
+  ...theme.typography.body2,
+  margin: 0,
+  color: theme.custom.colors.darkGray1,
+}))
+
+const BundleDetailsLink = styled(Link)(({ theme }) => ({
+  ...theme.typography.subtitle2,
+  color: theme.custom.colors.red,
+  fontWeight: theme.typography.fontWeightMedium,
+  textDecoration: "none",
+  "&::after": {
+    content: '" >"',
+    ariaHidden: "true",
+  },
+  "&:hover": {
+    textDecoration: "underline",
+  },
+}))
+
+type ProgramBundleUpsellItemProps =
+  | { loading: true; program?: undefined }
+  | { loading?: false; program: V2ProgramDetail }
+
+const ProgramBundleUpsellItem: React.FC<ProgramBundleUpsellItemProps> = ({
+  loading,
+  program,
+}) => {
+  if (loading) {
+    return (
+      <BundleUpsellItem>
+        <BundleUpsellTitle>
+          <Skeleton width="80%" variant="text" />
+        </BundleUpsellTitle>
+        <BundleDescription>
+          <Skeleton width="90%" variant="text" />
+        </BundleDescription>
+        <Skeleton width={140} variant="text" />
+      </BundleUpsellItem>
+    )
+  }
+
+  const hasPricedProgram =
+    !!program.products[0]?.price &&
+    program.enrollment_modes.some((m) => m.requires_payment)
+
+  const parsedReqs = parseReqTree(program.req_tree)
+  const totalRequired = parsedReqs.reduce(
+    (sum, req) => sum + req.items.length,
+    0,
+  )
+
+  return (
+    <BundleUpsellItem data-testid="program-bundle-upsell-item">
+      <BundleUpsellTitle>{program.title}</BundleUpsellTitle>
+      {hasPricedProgram && (
+        <BundleDescription>
+          {`Includes ${totalRequired} course${
+            totalRequired > 1 ? "s" : ""
+          } with a single purchase`}
+        </BundleDescription>
+      )}
+      <BundleDetailsLink
+        href={programPageView({
+          readable_id: program.readable_id,
+          display_mode: program.display_mode,
+        })}
+      >
+        View program details
+      </BundleDetailsLink>
+    </BundleUpsellItem>
+  )
+}
+
+const ProgramBundleUpsell: React.FC<{ programs: BaseProgram[] }> = ({
+  programs,
+}) => {
+  const ids = programs.map((p) => p.id)
+  const { data, isLoading, isError } = useQuery({
+    ...programsQueries.programsList({ id: ids }),
+    enabled: ids.length > 0,
+  })
+
+  const filteredPrograms = (data?.results ?? []).filter(
+    (d): d is V2ProgramDetail =>
+      /**
+       * Exclude programs with display_mode="course" from bundle upsell.
+       * These programs are presented as courses and should not appear as
+       * bundleable programs.
+       */
+      d.display_mode !== DisplayModeEnum.Course,
+  )
+
+  if (!isLoading && filteredPrograms.length === 0) {
+    if (isError) {
+      console.warn(
+        `ProgramBundleUpsell: programs list query failed for ids=${ids.join(",")}`,
+      )
+    }
+    return null
+  }
+
+  return (
+    <BundleUpsellContainer data-testid="program-bundle-upsell">
+      <SectionLabel>Part of a Program</SectionLabel>
+      {isLoading
+        ? programs.map((p) => <ProgramBundleUpsellItem key={p.id} loading />)
+        : filteredPrograms.map((program) => (
+            <ProgramBundleUpsellItem key={program.id} program={program} />
+          ))}
+    </BundleUpsellContainer>
+  )
+}
+
+export default ProgramBundleUpsell

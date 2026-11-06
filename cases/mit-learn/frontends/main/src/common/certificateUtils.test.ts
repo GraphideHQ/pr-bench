@@ -1,0 +1,220 @@
+import {
+  CertificateType,
+  getCertificateBadgeLines,
+  getCertificateBadgeTypography,
+  getCertificateInfo,
+  getCertificateLinkedInUrl,
+  getCertificateTitle,
+  getVerifiableCredentialDownloadAPIURL,
+  getVerifiableCredentialLinkedInURL,
+  getVerifierPlusViewerURL,
+} from "./certificateUtils"
+import { factories } from "api/test-utils"
+
+describe("getCertificateInfo", () => {
+  it("returns default certificate label when no program type is provided", () => {
+    expect(getCertificateInfo().displayType).toBe("Certificate")
+  })
+
+  it("returns MicroMasters badge label for micromasters program types", () => {
+    expect(getCertificateInfo("MicroMasters®").displayType).toBe(
+      "MicroMasters® Certificate",
+    )
+    expect(getCertificateInfo("  MicroMasters®  ").displayType).toBe(
+      "MicroMasters® Certificate",
+    )
+    expect(getCertificateInfo("MicroMasters").displayType).toBe(
+      "MicroMasters® Certificate",
+    )
+  })
+
+  it("falls back to default for micromasters-prefixed values that are not the exact descriptor", () => {
+    expect(getCertificateInfo("MicroMasters Professional").displayType).toBe(
+      "Certificate",
+    )
+    expect(getCertificateInfo("Microbiology Masters").displayType).toBe(
+      "Certificate",
+    )
+  })
+
+  it("returns series badge label for series program types", () => {
+    expect(getCertificateInfo("Series").displayType).toBe("Series Certificate")
+  })
+
+  it("returns program badge label for program program types", () => {
+    expect(getCertificateInfo("Program").displayType).toBe(
+      "Program Certificate",
+    )
+  })
+
+  it("falls back to default label for unrecognized program types", () => {
+    expect(getCertificateInfo("Degree").displayType).toBe("Certificate")
+  })
+})
+
+describe("getCertificateTitle", () => {
+  it("prefers the CMS product name when present", () => {
+    expect(getCertificateTitle("Universal AI", "Fundamentals of ML")).toBe(
+      "Universal AI",
+    )
+  })
+
+  it("falls back to the program/course title when product name is missing", () => {
+    expect(getCertificateTitle(null, "Fundamentals of ML")).toBe(
+      "Fundamentals of ML",
+    )
+    expect(getCertificateTitle(undefined, "Fundamentals of ML")).toBe(
+      "Fundamentals of ML",
+    )
+  })
+
+  it("falls back when product name is empty or whitespace only", () => {
+    expect(getCertificateTitle("", "Fundamentals of ML")).toBe(
+      "Fundamentals of ML",
+    )
+    expect(getCertificateTitle("   ", "Fundamentals of ML")).toBe(
+      "Fundamentals of ML",
+    )
+  })
+
+  it("trims surrounding whitespace from the product name", () => {
+    expect(getCertificateTitle("  Universal AI  ", "fallback")).toBe(
+      "Universal AI",
+    )
+  })
+})
+
+describe("getCertificateBadgeLines", () => {
+  it("returns a single line for course certificates", () => {
+    expect(getCertificateBadgeLines()).toEqual({ primary: "Certificate" })
+  })
+
+  it("splits MicroMasters into two lines with a registered mark", () => {
+    expect(getCertificateBadgeLines("MicroMasters®")).toEqual({
+      primary: "MicroMasters",
+      secondary: "Certificate",
+      registeredMark: true,
+    })
+  })
+
+  it("splits series and program descriptors across two lines", () => {
+    expect(getCertificateBadgeLines("Series")).toEqual({
+      primary: "Series",
+      secondary: "Certificate",
+    })
+    expect(getCertificateBadgeLines("Program")).toEqual({
+      primary: "Program",
+      secondary: "Certificate",
+    })
+  })
+
+  it("keeps display type and badge lines in sync for the same program type", () => {
+    const programType = "MicroMasters®"
+    expect(getCertificateInfo(programType).displayType).toBe(
+      "MicroMasters® Certificate",
+    )
+    expect(getCertificateBadgeLines(programType)).toEqual({
+      primary: "MicroMasters",
+      secondary: "Certificate",
+      registeredMark: true,
+    })
+  })
+})
+
+describe("getCertificateBadgeTypography", () => {
+  const defaultTypography = {
+    fontSizePx: 24,
+    lineHeightPx: 30,
+    registeredMarkScale: 0.645,
+  }
+
+  const micromastersTypography = {
+    fontSizePx: 18,
+    lineHeightPx: 26,
+    registeredMarkScale: 0.645,
+  }
+
+  it("returns 24px typography for course certificates and unrecognized types", () => {
+    expect(getCertificateBadgeTypography()).toEqual(defaultTypography)
+    expect(getCertificateBadgeTypography(null)).toEqual(defaultTypography)
+    expect(getCertificateBadgeTypography("Degree")).toEqual(defaultTypography)
+  })
+
+  it("returns 24px typography for program and series descriptors", () => {
+    expect(getCertificateBadgeTypography("Program")).toEqual(defaultTypography)
+    expect(getCertificateBadgeTypography("Series")).toEqual(defaultTypography)
+  })
+
+  it("returns 18px typography for micromasters descriptors", () => {
+    expect(getCertificateBadgeTypography("MicroMasters®")).toEqual(
+      micromastersTypography,
+    )
+    expect(getCertificateBadgeTypography("  MicroMasters®  ")).toEqual(
+      micromastersTypography,
+    )
+  })
+})
+
+describe("getCertificateLinkedInUrl", () => {
+  const pageUrl = "https://example.com/certificate/program/abc"
+
+  it("uses the CMS product name for program certificates", () => {
+    const certificate = factories.mitxonline.programCertificate()
+    certificate.certificate_page.product_name = "Universal AI"
+    certificate.program.title = "Fundamentals of Programming and ML"
+
+    const url = new URL(
+      getCertificateLinkedInUrl(CertificateType.Program, certificate, pageUrl),
+    )
+
+    expect(url.searchParams.get("name")).toBe("Universal AI")
+  })
+
+  it("falls back to the program title when product name is empty", () => {
+    const certificate = factories.mitxonline.programCertificate()
+    certificate.certificate_page.product_name = ""
+    certificate.program.title = "Fundamentals of Programming and ML"
+
+    const url = new URL(
+      getCertificateLinkedInUrl(CertificateType.Program, certificate, pageUrl),
+    )
+
+    expect(url.searchParams.get("name")).toBe(
+      "Fundamentals of Programming and ML",
+    )
+  })
+
+  it("uses the course title for course certificates", () => {
+    const certificate = factories.mitxonline.courseCertificate()
+    certificate.course_run.course.title = "Intro to Python"
+
+    const url = new URL(
+      getCertificateLinkedInUrl(CertificateType.Course, certificate, pageUrl),
+    )
+
+    expect(url.searchParams.get("name")).toBe("Intro to Python")
+  })
+})
+
+describe("getVerifierPlusViewerURL", () => {
+  it("wraps the download URL in a VerifierPlus viewer link", () => {
+    const credential = factories.mitxonline.verifiableCredential()
+    const downloadUrl = getVerifiableCredentialDownloadAPIURL(credential)
+
+    expect(getVerifierPlusViewerURL(credential)).toBe(
+      `https://verifierplus.org/#verify?vc=${encodeURIComponent(downloadUrl)}`,
+    )
+  })
+})
+
+describe("getVerifiableCredentialLinkedInURL", () => {
+  it("points certUrl at the VerifierPlus viewer, not the raw JSON download endpoint", () => {
+    const credential = factories.mitxonline.verifiableCredential()
+
+    const url = new URL(getVerifiableCredentialLinkedInURL(credential))
+    const certUrl = url.searchParams.get("certUrl")
+
+    expect(certUrl).toBe(getVerifierPlusViewerURL(credential))
+    expect(certUrl).not.toBe(getVerifiableCredentialDownloadAPIURL(credential))
+  })
+})

@@ -1,0 +1,137 @@
+import v8 from "node:v8"
+import { faker } from "@faker-js/faker/locale/en"
+import failOnConsole from "jest-fail-on-console"
+
+const seed = process.env.FAKER_SEED
+  ? parseInt(process.env.FAKER_SEED, 10)
+  : Math.floor(Math.random() * 0xffffffff)
+faker.seed(seed)
+console.info(`Faker seed: ${seed}  →  FAKER_SEED=${seed} to reproduce`)
+
+import "@testing-library/jest-dom"
+import "cross-fetch/polyfill"
+import { resetAllWhenMocks } from "jest-when"
+import * as matchers from "jest-extended"
+import { mockRouter } from "ol-test-utilities/mocks/nextNavigation"
+import { setDefaultTimezone } from "ol-test-utilities"
+
+expect.extend(matchers)
+
+setDefaultTimezone("UTC")
+
+// NEXT_PUBLIC_* test values are NOT set here. Only the `main` workspace's app
+// code reads them (via the env() helper, which falls back to process.env under
+// jsdom), so they live in main/src/test-utils/setupJest.tsx. The api workspace
+// configures its clients with hardcoded test URLs in its own setup, and leaf
+// packages (ol-*) don't read NEXT_PUBLIC_* at all.
+
+/**
+ * jsdom does not expose `structuredClone`, which real browsers and Node both
+ * have. `@mui/x-charts` calls it while building series state, so any test that
+ * renders a chart dies with a ReferenceError without this.
+ *
+ * Implemented with v8's serializer rather than a JSON round-trip so it behaves
+ * like the real thing for Dates, Maps and Sets instead of flattening them to
+ * strings and plain objects.
+ */
+if (typeof globalThis.structuredClone === "undefined") {
+  globalThis.structuredClone = <T>(value: T): T =>
+    v8.deserialize(v8.serialize(value as never)) as T
+}
+
+// Pulled from the docs - see https://jestjs.io/docs/manual-mocks#mocking-methods-which-are-not-implemented-in-jsdom
+
+Object.defineProperty(window, "matchMedia", {
+  writable: true,
+  value: jest.fn().mockImplementation((query) => ({
+    matches: false,
+    media: query,
+    onchange: null,
+    addListener: jest.fn(), // deprecated
+    removeListener: jest.fn(), // deprecated
+    addEventListener: jest.fn(),
+    removeEventListener: jest.fn(),
+    dispatchEvent: jest.fn(),
+  })),
+})
+
+Element.prototype.scrollIntoView = jest.fn()
+
+window.IntersectionObserver = jest.fn().mockImplementation(() => ({
+  observe: () => null,
+  unobserve: () => null,
+  disconnect: () => null,
+}))
+
+/*
+ * This used to live in ol-ckeditor but we also need it now for NukaCarousel,
+ * so it's now here so it's available across the board.
+ */
+class FakeResizeObserver {
+  observe() {
+    /** pass */
+  }
+  unobserve() {
+    /** pass */
+  }
+  disconnect() {
+    /** pass */
+  }
+}
+const polyfillResizeObserver = () => {
+  if (
+    window.ResizeObserver !== undefined &&
+    // @ts-expect-error happyDOM specific property
+    window.happyDOM === undefined
+  ) {
+    console.info(
+      "ResizeObserver is already defined (expected if using the Happy DOM test environment). Skipping polyfill.",
+    )
+  }
+  window.ResizeObserver = window.ResizeObserver || FakeResizeObserver
+}
+polyfillResizeObserver()
+
+jest.mock("next/navigation", () => {
+  return {
+    ...jest.requireActual("ol-test-utilities/mocks/nextNavigation")
+      .nextNavigationMocks,
+  }
+})
+
+beforeEach(() => {
+  mockRouter.setCurrentUrl("/")
+  window.history.replaceState({}, "", "/")
+})
+afterEach(() => {
+  /**
+   * Clear all mock call counts between tests.
+   * This does NOT clear mock implementations.
+   * Mock implementations are always cleared between test files.
+   */
+  jest.clearAllMocks()
+  resetAllWhenMocks()
+})
+
+/**
+ * NOTE: This registers hooks (afterEach, etc) with Jest that cause tests to
+ * fail when console.warn or console.error are called.
+ *
+ * However, method calls occurring in beforeEach hooks earlier or afterEach hooks
+ * after this line will not error.
+ * - beforeEach hooks declared earlier than this call
+ * - afterEach hooks declared later than this call
+ */
+failOnConsole({
+  allowMessage(message, _methodName, _context) {
+    const ALLLOWED_PATTERNS = [
+      /**
+       * A warning thrown by next/image.
+       * See https://nextjs.org/docs/messages/next-image-unconfigured-qualities
+       * We do not currently use next/jest, but that may eventually handle this.
+       */
+      /which is not configured in images.qualities/.test(message),
+    ]
+    return ALLLOWED_PATTERNS.some((x) => x === true)
+  },
+})

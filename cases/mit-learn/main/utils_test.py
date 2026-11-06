@@ -1,0 +1,804 @@
+"""Utils tests"""
+
+import asyncio
+import datetime
+import json
+from math import ceil
+from tempfile import NamedTemporaryFile
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from django.contrib.auth import get_user_model
+from django.core.cache import caches
+from django.http import QueryDict
+from django.utils.decorators import method_decorator
+from rest_framework.renderers import BrowsableAPIRenderer, JSONRenderer
+from rest_framework.response import Response
+from rest_framework.test import APIRequestFactory, force_authenticate
+from rest_framework.views import APIView
+
+from main import utils as main_utils
+from main.constants import (
+    ALLOWED_HTML_ATTRIBUTES_WITH_LINKS,
+    ALLOWED_HTML_TAGS_WITH_LINKS,
+)
+from main.factories import UserFactory
+from main.utils import (
+    _sorted_query_string,
+    cache_page_for_all_users,
+    cache_page_for_anonymous_users,
+    call_fastly_purge_api,
+    chunks,
+    clean_data,
+    clear_views_cache,
+    extract_values,
+    filter_dict_keys,
+    filter_dict_with_renamed_keys,
+    frontend_absolute_url,
+    html_to_plain_text,
+    is_near_now,
+    markdown_to_plain_text,
+    merge_strings,
+    normalize_to_start_of_day,
+    now_in_utc,
+    prefetched_iterator,
+    run_on_worker_loop,
+    write_to_file,
+)
+
+User = get_user_model()
+
+
+def test_now_in_utc():
+    """now_in_utc() should return the current time set to the UTC time zone"""
+    now = now_in_utc()
+    assert is_near_now(now)
+    assert now.tzinfo == datetime.UTC
+
+
+def test_is_near_now():
+    """
+    Test is_near_now for now
+    """
+    now = datetime.datetime.now(tz=datetime.UTC)
+    assert is_near_now(now) is True
+    later = now + datetime.timedelta(0, 6)
+    assert is_near_now(later) is False
+    earlier = now - datetime.timedelta(0, 6)
+    assert is_near_now(earlier) is False
+
+
+def test_normalize_to_start_of_day():
+    """
+    Test that normalize_to_start_of_day zeroes out the time components
+    """
+    assert normalize_to_start_of_day(
+        datetime.datetime(2018, 1, 3, 5, 6, 7)  # noqa: DTZ001
+    ) == datetime.datetime(  # noqa: DTZ001
+        2018, 1, 3
+    )
+
+
+def test_chunks():
+    """
+    Test for chunks
+    """
+    input_list = list(range(113))
+    output_list = []
+    for nums in chunks(input_list):
+        output_list += nums
+    assert output_list == input_list
+
+    output_list = []
+    for nums in chunks(input_list, chunk_size=1):
+        output_list += nums
+    assert output_list == input_list
+
+    output_list = []
+    for nums in chunks(input_list, chunk_size=124):
+        output_list += nums
+    assert output_list == input_list
+
+
+def test_chunks_iterable():
+    """
+    Test that chunks works on non-list iterables too
+    """
+    count = 113
+    input_range = range(count)
+    chunk_output = []
+    for chunk in chunks(input_range, chunk_size=10):
+        chunk_output.append(chunk)  # noqa: PERF402
+    assert len(chunk_output) == ceil(113 / 10)
+
+    range_list = []
+    for chunk in chunk_output:
+        range_list += chunk
+    assert range_list == list(range(count))
+
+
+@pytest.mark.parametrize(
+    ("list_or_string", "output"),
+    [
+        ["str", ["str"]],  # noqa: PT007
+        [["str", None, [None]], ["str"]],  # noqa: PT007
+        [[["a"], "b", ["c", "d"], "e"], ["a", "b", "c", "d", "e"]],  # noqa: PT007
+    ],
+)
+def test_merge_strings(list_or_string, output):
+    """
+    merge_strings should flatten a nested list of strings
+    """
+    assert merge_strings(list_or_string) == output
+
+
+def test_filter_dict_keys():
+    """filter_dict_keys should return a dict with only the specified list of keys"""
+    d = {"a": 1, "b": 2, "c": 3, "d": 4}
+    assert filter_dict_keys(d, ["b", "d"]) == {"b": 2, "d": 4}
+
+    with pytest.raises(KeyError):
+        assert filter_dict_keys(d, ["b", "missing"])
+
+    assert filter_dict_keys(d, ["b", "missing"], optional=True) == {"b": 2}
+
+
+def test_filter_dict_with_renamed_keys():
+    """
+    filter_dict_with_renamed_keys should return a dict with only the keys in a filter dict,
+    and should rename those keys according to the values in the filter dict.
+    """
+    d = {"a": 1, "b": 2, "c": 3, "d": 4}
+    assert filter_dict_with_renamed_keys(d, {"b": "b1", "d": "d1"}) == {
+        "b1": 2,
+        "d1": 4,
+    }
+
+    with pytest.raises(KeyError):
+        assert filter_dict_with_renamed_keys(d, {"b": "b1", "missing": "d1"})
+
+    assert filter_dict_with_renamed_keys(
+        d, {"b": "b1", "missing": "d1"}, optional=True
+    ) == {"b1": 2}
+
+
+def test_html_to_plain_text():
+    """
+    html_to_plain_text should turn a string with HTML markup into plain text with line breaks
+    replaced by spaces.
+    """
+    html = "<div><b>bold</b><p>text with\n\nline breaks</p></div>"
+    normal_text = "open discussions"
+    assert html_to_plain_text(html) == "boldtext with  line breaks"
+    assert html_to_plain_text(normal_text) == normal_text
+
+
+def test_markdown_to_plain_text():
+    """
+    markdown_to_plain_text should turn a Markdown string into plain text with line breaks
+    replaced by spaces.
+    """
+    markdown = "# header\n\nsome body text\n\n1. bullet 1\n2. bullet 2"
+    normal_text = "open discussions"
+    assert (
+        markdown_to_plain_text(markdown) == "header some body text  bullet 1 bullet 2"
+    )
+    assert html_to_plain_text(normal_text) == normal_text
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("chunk_size", [2, 3, 5, 7, 9, 10])
+def test_prefetched_iterator(chunk_size):
+    """
+    prefetched_iterator should yield all items in the record set across chunk boundaries
+    """
+    users = UserFactory.create_batch(10)
+    fetched_users = list(prefetched_iterator(User.objects.all(), chunk_size=chunk_size))
+    assert len(users) == len(fetched_users)
+    for user in users:
+        assert user in fetched_users
+
+
+def test_extract_values():
+    """
+    extract_values should return the correct match from a dict
+    """
+    test_json = {
+        "a": {"b": {"c": [{"d": [1, 2, 3]}, {"d": [4, 5], "e": "f", "b": "g"}]}}
+    }
+    assert extract_values(test_json, "b") == [test_json["a"]["b"], "g"]
+    assert extract_values(test_json, "d") == [[1, 2, 3], [4, 5]]
+    assert extract_values(test_json, "e") == ["f"]
+
+
+def test_write_to_file():
+    """Test that write_to_file creates a file with the correct contents"""
+    content = (
+        b"-----BEGIN"
+        b" CERTIFICATE-----\nMIID5DCCA02gAwIBAgIRTUTVwsj4Vy+l6+XTYjnIQ==\n-----END"
+        b" CERTIFICATE-----"
+    )
+    with NamedTemporaryFile() as outfile:
+        write_to_file(outfile.name, content)
+        with open(outfile.name, "rb") as infile:  # noqa: PTH123
+            assert infile.read() == content
+
+
+def test_frontend_absolute_url(settings):
+    """
+    frontend_absolute_url should generate urls to the frontend
+    """
+    settings.APP_BASE_URL = "http://example.com/"
+
+    assert frontend_absolute_url("/") == "http://example.com/"
+    assert frontend_absolute_url("/path") == "http://example.com/path"
+    assert frontend_absolute_url("path") == "http://example.com/path"
+
+
+@pytest.mark.parametrize(
+    ("input_text", "output_text"),
+    [
+        ("The cat sat on the mat & spat.\n", "The cat sat on the mat &amp; spat.\n"),
+        (
+            "the <b class='foo'>dog</b> chased a <a href='http://hog.mit.edu'>hog</a>",
+            "the <b>dog</b> chased a hog",
+        ),
+        (
+            "<p><style type='text/css'> <!--/*--><![CDATA[/* ><!--*/ <!--td {border: 1px solid #ccc;}br {mso-data-placement:same-cell;}--> /*--><!]]>*/ </style>What a mess</p>",
+            "<p>What a mess</p>",
+        ),
+        (
+            "<script type='javascript'>alert('xss');</script><style>\nh1 {color:red;}\np {color:blue;}\n</style><p>Some text</p>",
+            "<p>Some text</p>",
+        ),
+        (
+            "<p><img src='' onerror='alert(\"xss!\")'/>Hello, world!</p>",
+            "<p>Hello, world!</p>",
+        ),
+        (None, ""),
+        ("", ""),
+    ],
+)
+def test_clean_data(input_text, output_text):
+    """clean_data function should return expected output"""
+    assert clean_data(input_text) == output_text
+
+
+def test_clean_data_preserves_allowed_links():
+    """clean_data keeps <a href> when anchors + href are explicitly allowed,
+    but still strips unsafe URL schemes.
+    """
+    html = (
+        "See <a href='https://ocw.mit.edu' title='OCW'>MIT OCW</a> "
+        "and <a href='javascript:alert(1)'>bad</a>"
+    )
+    result = clean_data(
+        html,
+        tags=ALLOWED_HTML_TAGS_WITH_LINKS,
+        attributes=ALLOWED_HTML_ATTRIBUTES_WITH_LINKS,
+    )
+    assert 'href="https://ocw.mit.edu"' in result
+    assert 'title="OCW"' in result
+    assert 'rel="noopener noreferrer"' in result
+    assert ">MIT OCW</a>" in result
+    assert "javascript:" not in result  # nh3 drops unsafe schemes
+
+
+def _create_mock_request(
+    *, is_authenticated=False, path="/test/", query="", accept="application/json"
+):
+    """Create a mock request object for testing cache decorators."""
+    request = MagicMock()
+    request.user.is_authenticated = is_authenticated
+    request.path = path
+    request.GET = QueryDict(query)
+    request.headers = {"Accept": accept}
+    request.accepted_renderer = (
+        BrowsableAPIRenderer() if "text/html" in accept else JSONRenderer()
+    )
+    return request
+
+
+def _create_view():
+    """Create a simple view function that tracks call count."""
+    call_count = {"count": 0}
+
+    def view(request):
+        call_count["count"] += 1
+        return Response({"result": "fresh", "call": call_count["count"]})
+
+    view.call_count = call_count
+    return view
+
+
+def test_sorted_query_string_empty():
+    """Empty query dict returns empty string."""
+    query_dict = QueryDict("")
+    assert _sorted_query_string(query_dict) == ""
+
+
+def test_sorted_query_string_single_param():
+    """Single parameter is formatted correctly."""
+    query_dict = QueryDict("foo=bar")
+    assert _sorted_query_string(query_dict) == "foo=bar"
+
+
+def test_sorted_query_string_multiple_params_sorted():
+    """Multiple parameters are sorted alphabetically by key."""
+    query_dict = QueryDict("z=last&a=first&m=middle")
+    assert _sorted_query_string(query_dict) == "a=first&m=middle&z=last"
+
+
+def test_sorted_query_string_multi_value():
+    """Multi-value parameters are expanded and sorted."""
+    query_dict = QueryDict("topic=math&topic=science&a=first")
+    result = _sorted_query_string(query_dict)
+    assert result == "a=first&topic=math&topic=science"
+
+
+@pytest.fixture
+def view_cache(settings):
+    """Enable view caching against a fresh locmem backend."""
+    settings.REDIS_VIEW_CACHE_DURATION = 60
+    settings.CACHES = {
+        **settings.CACHES,
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+            "LOCATION": "view-cache-tests",
+        },
+    }
+    caches["default"].clear()
+    return caches["default"]
+
+
+def _decorated_api_view(decorator=None, status=200):
+    """Build a real DRF view with a cache decorator applied to its handler."""
+    calls = {"count": 0}
+
+    class CachedView(APIView):
+        authentication_classes = ()
+        permission_classes = ()
+        versioning_class = None
+
+        @method_decorator(decorator or cache_page_for_all_users())
+        def get(self, request):  # noqa: ARG002
+            calls["count"] += 1
+            return Response({"result": "fresh", "call": calls["count"]}, status=status)
+
+    view = CachedView.as_view()
+    view.calls = calls
+    return view
+
+
+def _get(view, path="/test/", user=None):
+    """Issue a GET through the full DRF request/render cycle."""
+    request = APIRequestFactory().get(path)
+    if user is not None:
+        force_authenticate(request, user=user)
+    response = view(request)
+    return response.render() if hasattr(response, "render") else response
+
+
+def test_view_cache_end_to_end(view_cache):
+    """The second request is served from cache with identical JSON."""
+    view = _decorated_api_view()
+
+    first = _get(view)
+    second = _get(view)
+
+    assert view.calls["count"] == 1
+    assert first.content == second.content
+    assert json.loads(second.content) == {"result": "fresh", "call": 1}
+    assert second["Content-Type"] == "application/json"
+
+
+def test_cache_miss_renders_once(view_cache):
+    """A miss caches the bytes from the response's own render pass."""
+    view = _decorated_api_view()
+
+    with patch("main.utils.JSONRenderer") as mock_renderer:
+        first = _get(view)
+
+    mock_renderer.assert_not_called()
+    assert _get(view).content == first.content
+    assert view.calls["count"] == 1
+
+
+def test_anonymous_users_decorator_caches_anonymous(view_cache):
+    """Anonymous requests are cached by cache_page_for_anonymous_users."""
+    view = _decorated_api_view(cache_page_for_anonymous_users())
+
+    _get(view)
+    _get(view)
+
+    assert view.calls["count"] == 1
+
+
+def test_anonymous_users_decorator_skips_authenticated(view_cache):
+    """Authenticated requests bypass cache_page_for_anonymous_users."""
+    view = _decorated_api_view(cache_page_for_anonymous_users())
+    user = UserFactory.build()
+
+    _get(view, user=user)
+    _get(view, user=user)
+
+    assert view.calls["count"] == 2
+
+
+def test_all_users_decorator_caches_authenticated(view_cache):
+    """Authenticated requests are cached by cache_page_for_all_users."""
+    view = _decorated_api_view()
+
+    _get(view, user=UserFactory.build())
+    _get(view, user=UserFactory.build())
+
+    assert view.calls["count"] == 1
+
+
+def test_cache_timeout_zero_skips_caching(view_cache):
+    """A timeout of 0 disables caching entirely."""
+    view = _decorated_api_view(cache_page_for_all_users(0))
+
+    _get(view)
+    _get(view)
+
+    assert view.calls["count"] == 2
+
+
+def test_cache_default_timeout_resolves_at_request_time(view_cache, settings):
+    """The default timeout is read from settings per request, not at decoration."""
+    settings.REDIS_VIEW_CACHE_DURATION = 0
+    view = _decorated_api_view()
+    settings.REDIS_VIEW_CACHE_DURATION = 60
+
+    _get(view)
+    _get(view)
+
+    assert view.calls["count"] == 1
+
+
+def test_cache_default_timeout_zero_skips_caching(view_cache, settings):
+    """A default timeout of 0 disables caching entirely."""
+    settings.REDIS_VIEW_CACHE_DURATION = 0
+    view = _decorated_api_view()
+
+    _get(view)
+    _get(view)
+
+    assert view.calls["count"] == 2
+
+
+def test_cache_only_caches_200_responses(view_cache):
+    """Non-200 responses are not cached."""
+    view = _decorated_api_view(status=404)
+
+    _get(view)
+    _get(view)
+
+    assert view.calls["count"] == 2
+
+
+@patch("main.utils.caches")
+def test_async_cache_stores_rendered_json_bytes(mock_caches):
+    """The async decorator caches the bytes from the response's render pass."""
+    mock_cache = MagicMock()
+    mock_cache.aget = AsyncMock(return_value=None)
+    mock_caches.__getitem__.return_value = mock_cache
+
+    async def view(request):
+        return Response({"result": "fresh"})
+
+    decorated = cache_page_for_all_users(300)(view)
+    response = asyncio.run(decorated(_create_mock_request()))
+
+    # complete the render pass DRF runs after the handler returns
+    response.accepted_renderer = JSONRenderer()
+    response.accepted_media_type = "application/json"
+    response.renderer_context = {}
+    response.render()
+
+    assert mock_cache.set.call_args.args[1] == response.content
+    assert json.loads(response.content) == {"result": "fresh"}
+
+
+@patch("main.utils.caches")
+def test_cache_returns_cached_response(mock_caches):
+    """Subsequent requests return cached data (legacy dict entries)."""
+    mock_cache = MagicMock()
+    cached_data = {"result": "cached", "call": 0}
+    mock_cache.get.return_value = cached_data
+    mock_caches.__getitem__.return_value = mock_cache
+
+    view = _create_view()
+    decorated = cache_page_for_all_users(300)(view)
+
+    response = decorated(_create_mock_request())
+
+    assert view.call_count["count"] == 0
+    assert response.data == cached_data
+
+
+@patch("main.utils.caches")
+def test_cache_hit_returns_bytes_without_rendering(mock_caches):
+    """Cached rendered bytes are returned directly as an HttpResponse."""
+    mock_cache = MagicMock()
+    mock_cache.get.return_value = b'{"result": "cached"}'
+    mock_caches.__getitem__.return_value = mock_cache
+
+    view = _create_view()
+    decorated = cache_page_for_all_users(300)(view)
+
+    response = decorated(_create_mock_request())
+
+    assert view.call_count["count"] == 0
+    assert response.content == b'{"result": "cached"}'
+    assert response["Content-Type"] == "application/json"
+
+
+@patch("main.utils.caches")
+def test_cache_hit_html_request_gets_negotiable_response(mock_caches):
+    """Browsable API (HTML) requests get a DRF Response from cached bytes."""
+    mock_cache = MagicMock()
+    mock_cache.get.return_value = b'{"result": "cached"}'
+    mock_caches.__getitem__.return_value = mock_cache
+
+    view = _create_view()
+    decorated = cache_page_for_all_users(300)(view)
+
+    response = decorated(_create_mock_request(accept="text/html,application/xhtml+xml"))
+
+    assert view.call_count["count"] == 0
+    assert isinstance(response, Response)
+    assert response.data == {"result": "cached"}
+
+
+@patch("main.utils.caches")
+def test_cache_key_consistent_for_same_url(mock_caches):
+    """Same URL generates same cache key regardless of request object."""
+    mock_cache = MagicMock()
+    mock_cache.get.return_value = None
+    mock_caches.__getitem__.return_value = mock_cache
+
+    view = _create_view()
+    decorated = cache_page_for_all_users(300)(view)
+
+    decorated(_create_mock_request(path="/api/test/", query="a=1&b=2"))
+    key1 = mock_cache.get.call_args_list[0][0][0]
+
+    decorated(_create_mock_request(path="/api/test/", query="a=1&b=2"))
+    key2 = mock_cache.get.call_args_list[1][0][0]
+
+    assert key1 == key2
+
+
+@patch("main.utils.caches")
+def test_cache_key_consistent_with_reordered_params(mock_caches):
+    """Query params in different order produce same cache key."""
+    mock_cache = MagicMock()
+    mock_cache.get.return_value = None
+    mock_caches.__getitem__.return_value = mock_cache
+
+    view = _create_view()
+    decorated = cache_page_for_all_users(300)(view)
+
+    decorated(_create_mock_request(path="/api/test/", query="b=2&a=1"))
+    key1 = mock_cache.get.call_args_list[0][0][0]
+
+    decorated(_create_mock_request(path="/api/test/", query="a=1&b=2"))
+    key2 = mock_cache.get.call_args_list[1][0][0]
+
+    assert key1 == key2
+
+
+@patch("main.utils.caches")
+def test_cache_key_different_for_different_paths(mock_caches):
+    """Different paths produce different cache keys."""
+    mock_cache = MagicMock()
+    mock_cache.get.return_value = None
+    mock_caches.__getitem__.return_value = mock_cache
+
+    view = _create_view()
+    decorated = cache_page_for_all_users(300)(view)
+
+    decorated(_create_mock_request(path="/api/test1/"))
+    key1 = mock_cache.get.call_args_list[0][0][0]
+
+    decorated(_create_mock_request(path="/api/test2/"))
+    key2 = mock_cache.get.call_args_list[1][0][0]
+
+    assert key1 != key2
+
+
+@patch("main.utils.caches")
+def test_cache_uses_specified_backend(mock_caches):
+    """Cache decorator uses the specified cache backend."""
+    mock_cache = MagicMock()
+    mock_cache.get.return_value = None
+    mock_caches.__getitem__.return_value = mock_cache
+
+    view = _create_view()
+    decorated = cache_page_for_all_users(300, cache="redis")(view)
+
+    request = _create_mock_request()
+    decorated(request)
+
+    mock_caches.__getitem__.assert_called_with("redis")
+
+
+@patch("main.utils.caches")
+def test_cache_key_includes_prefix(mock_caches):
+    """Cache key includes the specified prefix."""
+    mock_cache = MagicMock()
+    mock_cache.get.return_value = None
+    mock_caches.__getitem__.return_value = mock_cache
+
+    view = _create_view()
+    decorated = cache_page_for_all_users(300, key_prefix="search")(view)
+
+    request = _create_mock_request(path="/api/test/")
+    decorated(request)
+
+    cache_key = mock_cache.get.call_args[0][0]
+    assert "search" in cache_key
+    assert cache_key.startswith("views.decorators.cache.cache_page.search.GET.")
+
+
+@patch("main.utils.caches")
+def test_cache_key_format(mock_caches):
+    """Cache key follows expected format: views.decorators.cache.cache_page.{prefix}.GET.{hash}."""
+    mock_cache = MagicMock()
+    mock_cache.get.return_value = None
+    mock_caches.__getitem__.return_value = mock_cache
+
+    view = _create_view()
+    decorated = cache_page_for_all_users(300, key_prefix="myprefix")(view)
+
+    request = _create_mock_request(path="/api/test/")
+    decorated(request)
+
+    cache_key = mock_cache.get.call_args[0][0]
+    assert cache_key.startswith("views.decorators.cache.cache_page.myprefix.GET.")
+    # The rest should be a 32-character MD5 hash
+    hash_part = cache_key.split(".")[-1]
+    assert len(hash_part) == 32
+    assert all(c in "0123456789abcdef" for c in hash_part)
+
+
+@patch("main.utils.caches")
+def test_clear_views_cache_uses_large_itersize(mock_caches):
+    """
+    delete_pattern must be called with a large itersize (SCAN COUNT).
+
+    The default of 10 means a full-keyspace scan needs ~keyspace/10 round-trips
+    against the Redis shared with the Celery broker; a 55s scan on prod. Pinning
+    itersize guards against a regression back to the slow default.
+    """
+    mock_cache = MagicMock()
+    mock_cache.delete_pattern.return_value = 3
+    mock_caches.__getitem__.return_value = mock_cache
+
+    result = clear_views_cache()
+
+    mock_cache.delete_pattern.assert_called_once_with("views.*", itersize=1000)
+    assert result == 3
+
+
+@pytest.mark.parametrize("soft", [True, False])
+def test_call_fastly_purge_api_soft_header(mocker, settings, soft):
+    """soft=True sends the Fastly-Soft-Purge: 1 header; default sends none"""
+    settings.FASTLY_API_KEY = "fake-key"
+    mock_request = mocker.patch("main.utils.requests.request")
+    mock_request.return_value.json.return_value = {"status": "ok"}
+
+    call_fastly_purge_api("/c/unit/mitx", soft=soft)
+
+    headers = mock_request.call_args.kwargs["headers"]
+    assert headers.get("Fastly-Soft-Purge") == ("1" if soft else None)
+
+
+def test_run_on_worker_loop_returns_the_result():
+    """A coroutine's return value comes back to the sync caller"""
+
+    async def coro():
+        return "done"
+
+    assert run_on_worker_loop(coro()) == "done"
+
+
+def test_run_on_worker_loop_propagates_an_exception():
+    """A failing coroutine raises in the caller rather than being swallowed"""
+
+    async def coro():
+        msg = "nope"
+        raise ValueError(msg)
+
+    with pytest.raises(ValueError, match="nope"):
+        run_on_worker_loop(coro())
+
+
+def test_run_on_worker_loop_reuses_one_loop():
+    """
+    Every call in a process runs on the same loop.
+
+    This is the whole point of the helper. asyncio.run (and async_to_sync)
+    create a loop per call and close it on return, while the Qdrant clients
+    bind to the loop alive when they were built. Call two would drive a
+    cached gRPC channel onto a closed loop, so retrieval fails and generation
+    is skipped rather than producing metadata. The helper keeps subsequent
+    calls on the original live loop.
+    """
+
+    async def which_loop():
+        return asyncio.get_running_loop()
+
+    first = run_on_worker_loop(which_loop())
+    second = run_on_worker_loop(which_loop())
+
+    assert first is second
+    assert not first.is_closed()
+
+
+@pytest.fixture
+def isolated_worker_loop(monkeypatch):
+    """
+    Give a test the worker loop's module state to itself.
+
+    The helper holds its loop in a module global and deliberately never
+    closes it -- the process outliving it is the point -- so a test that
+    drives it has to reset that state going in and close what it created
+    coming out, rather than leaking an epoll fd into the rest of the suite.
+
+    Yields:
+        list: every loop the helper created during the test
+    """
+    monkeypatch.setattr(main_utils, "_worker_loop", None)
+    monkeypatch.setattr(main_utils, "_worker_loop_pid", None)
+    created = []
+    new_event_loop = asyncio.new_event_loop
+
+    def tracked_new_event_loop():
+        loop = new_event_loop()
+        created.append(loop)
+        return loop
+
+    monkeypatch.setattr(asyncio, "new_event_loop", tracked_new_event_loop)
+    yield created
+    for loop in created:
+        loop.close()
+
+
+def test_run_on_worker_loop_does_not_reuse_an_inherited_loop(
+    mocker, isolated_worker_loop
+):
+    """
+    A forked child builds its own loop instead of running on the parent's.
+
+    This is the prefork-safety branch, and the reason the loop is created
+    lazily: a Celery prefork child inherits the parent's loop object, whose
+    epoll fd it shares with every sibling. Running on it there is the same
+    unusable-loop failure the helper exists to prevent, and just as silent,
+    since content retrieval swallows it. A pid that stands still between
+    calls cannot exercise this, so the pid moves here instead of forking.
+    """
+
+    async def which_loop():
+        return asyncio.get_running_loop()
+
+    process = {"pid": 1111}
+    # A callable rather than a side_effect list: os.getpid is shared with
+    # everything else running during the test, so an extra call must not
+    # exhaust an iterator.
+    mocker.patch("main.utils.os.getpid", side_effect=lambda: process["pid"])
+
+    parent_loop = run_on_worker_loop(which_loop())
+    process["pid"] = 2222
+    child_loop = run_on_worker_loop(which_loop())
+    child_loop_again = run_on_worker_loop(which_loop())
+
+    assert child_loop is not parent_loop
+    # The child keeps its own loop across calls, exactly as the parent did.
+    assert child_loop_again is child_loop
+    assert len(isolated_worker_loop) == 2
+    # The inherited loop is dropped, never closed: its fd belongs to the
+    # parent too, and closing it in a child would break the parent's.
+    assert not parent_loop.is_closed()

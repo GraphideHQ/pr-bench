@@ -1,0 +1,153 @@
+import {
+  LearningResourcesApi,
+  LearningpathsApi,
+  UserlistsApi,
+  OfferorsApi,
+  TopicsApi,
+  WebsiteContentApi,
+  ProgramLettersApi,
+  LearningResourcesSearchApi,
+  PlatformsApi,
+  LearningResourcesUserSubscriptionApi,
+  SchoolsApi,
+  FeaturedApi,
+  MediaApi,
+  VideoPlaylistsApi,
+  PodcastEpisodesApi,
+  HubspotApi,
+} from "./generated/v1/api"
+
+import { UnsubscribeApi } from "@mitodl/mit-learn-api-axios/v1"
+
+import {
+  ChannelsApi,
+  WidgetListsApi,
+  UsersApi,
+  NewsEventsApi,
+  ProfilesApi,
+  ProgramCertificatesApi,
+  TestimonialsApi,
+  LearningResourcesSearchAdminParamsApi,
+  VectorLearningResourcesSearchApi,
+} from "./generated/v0/api"
+
+import axiosInstance from "./axios"
+
+const BASE_PATH = ""
+
+const learningResourcesApi = new LearningResourcesApi(
+  undefined,
+  BASE_PATH,
+  axiosInstance,
+)
+
+const learningResourcesSearchApi = new LearningResourcesSearchApi(
+  undefined,
+  BASE_PATH,
+  axiosInstance,
+)
+
+const learningResourcesSearchAdminParamsApi =
+  new LearningResourcesSearchAdminParamsApi(undefined, BASE_PATH, axiosInstance)
+
+const featuredApi = new FeaturedApi(undefined, BASE_PATH, axiosInstance)
+
+const learningPathsApi = new LearningpathsApi(
+  undefined,
+  BASE_PATH,
+  axiosInstance,
+)
+
+const userListsApi = new UserlistsApi(undefined, BASE_PATH, axiosInstance)
+
+const offerorsApi = new OfferorsApi(undefined, BASE_PATH, axiosInstance)
+
+const platformsApi = new PlatformsApi(undefined, BASE_PATH, axiosInstance)
+
+const topicsApi = new TopicsApi(undefined, BASE_PATH, axiosInstance)
+
+const websiteContentApi = new WebsiteContentApi(
+  undefined,
+  BASE_PATH,
+  axiosInstance,
+)
+const mediaApi = new MediaApi(undefined, BASE_PATH, axiosInstance)
+const hubspotApi = new HubspotApi(undefined, BASE_PATH, axiosInstance)
+
+const programLettersApi = new ProgramLettersApi(
+  undefined,
+  BASE_PATH,
+  axiosInstance,
+)
+
+const channelsApi = new ChannelsApi(undefined, BASE_PATH, axiosInstance)
+
+const widgetListsApi = new WidgetListsApi(undefined, BASE_PATH, axiosInstance)
+
+const searchSubscriptionApi = new LearningResourcesUserSubscriptionApi(
+  undefined,
+  BASE_PATH,
+  axiosInstance,
+)
+
+const usersApi = new UsersApi(undefined, BASE_PATH, axiosInstance)
+
+const profilesApi = new ProfilesApi(undefined, BASE_PATH, axiosInstance)
+
+const programCertificatesApi = new ProgramCertificatesApi(
+  undefined,
+  BASE_PATH,
+  axiosInstance,
+)
+
+const schoolsApi = new SchoolsApi(undefined, BASE_PATH, axiosInstance)
+
+const newsEventsApi = new NewsEventsApi(undefined, BASE_PATH, axiosInstance)
+const testimonialsApi = new TestimonialsApi(undefined, BASE_PATH, axiosInstance)
+
+const videoPlaylistsApi = new VideoPlaylistsApi(
+  undefined,
+  BASE_PATH,
+  axiosInstance,
+)
+const podcastEpisodesApi = new PodcastEpisodesApi(
+  undefined,
+  BASE_PATH,
+  axiosInstance,
+)
+const vectorLearningResourcesSearchApi = new VectorLearningResourcesSearchApi(
+  undefined,
+  BASE_PATH,
+  axiosInstance,
+)
+
+const unsubscribeApi = new UnsubscribeApi(undefined, BASE_PATH, axiosInstance)
+
+export {
+  learningResourcesApi,
+  learningPathsApi,
+  userListsApi,
+  topicsApi,
+  websiteContentApi,
+  mediaApi,
+  hubspotApi,
+  offerorsApi,
+  programCertificatesApi,
+  programLettersApi,
+  learningResourcesSearchApi,
+  channelsApi,
+  widgetListsApi,
+  usersApi,
+  profilesApi,
+  platformsApi,
+  searchSubscriptionApi,
+  schoolsApi,
+  newsEventsApi,
+  featuredApi,
+  testimonialsApi,
+  learningResourcesSearchAdminParamsApi,
+  videoPlaylistsApi,
+  podcastEpisodesApi,
+  vectorLearningResourcesSearchApi,
+  unsubscribeApi,
+}

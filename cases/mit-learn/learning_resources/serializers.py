@@ -1,0 +1,2092 @@
+"""Serializers for learning_resources"""
+
+import json
+import logging
+from datetime import UTC, datetime
+from decimal import Decimal
+from uuid import uuid4
+
+import dateparser
+from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.db import transaction
+from django.db.models import F, Max, Prefetch, Q
+from drf_spectacular.utils import extend_schema_field, extend_schema_serializer
+from isodate import parse_duration
+from rest_framework import serializers
+from rest_framework.exceptions import ValidationError
+
+from learning_resources import constants, models
+from learning_resources.constants import (
+    LEARNING_MATERIAL_RESOURCE_TYPE_GROUP,
+    PROGRAM_COURSE_CACHE_KEY_PUBLISHED,
+    PROGRAM_COURSE_CACHE_KEY_TEST_MODE,
+    RESOURCE_TYPE_GROUP_CHOICES,
+    Availability,
+    CertificationType,
+    Format,
+    LearningResourceDelivery,
+    LearningResourceType,
+    LevelType,
+    Pace,
+)
+from learning_resources.utils import (
+    BLANK_SLUG_PATH_SEGMENT,
+    build_resource_summary_dict,
+    json_to_markdown,
+    learn_url_for_resource,
+    path_slug,
+)
+from main.serializers import COMMON_IGNORED_FIELDS, WriteableSerializerMethodField
+
+log = logging.getLogger(__name__)
+
+
+def _get_program_child_resource_map(
+    missing_ids: list[int],
+    *,
+    include_test_mode_children: bool,
+    program_relation_types: list[str],
+) -> dict[int, models.LearningResource]:
+    """Load child resources used for program course summaries."""
+    visibility_q = Q(published=True)
+    if include_test_mode_children:
+        visibility_q |= Q(test_mode=True)
+
+    child_resources = (
+        models.LearningResource.objects.filter(
+            id__in=missing_ids,
+        )
+        .filter(visibility_q)
+        .prefetch_related(
+            Prefetch(
+                "topics",
+                queryset=models.LearningResourceTopic.objects.for_serialization(),
+            ),
+            Prefetch(
+                "children",
+                queryset=models.LearningResourceRelationship.objects.filter(
+                    relation_type__in=program_relation_types
+                ),
+                to_attr="program_children",
+            ),
+        )
+    )
+    return {resource.id: resource for resource in child_resources}
+
+
+class LearningResourceInstructorSerializer(serializers.ModelSerializer):
+    """
+    Serializer for LearningResourceInstructor model
+    """
+
+    class Meta:
+        model = models.LearningResourceInstructor
+        exclude = COMMON_IGNORED_FIELDS
+
+
+class LearningResourcePriceSerializer(serializers.ModelSerializer):
+    """
+    Serializer for LearningResourcePrice model
+    """
+
+    class Meta:
+        model = models.LearningResourcePrice
+        exclude = "id", *COMMON_IGNORED_FIELDS
+
+
+class LearningResourceTopicSerializer(serializers.ModelSerializer):
+    """
+    Serializer for LearningResourceTopic model
+    """
+
+    channel_url = serializers.CharField(read_only=True, allow_null=True)
+
+    class Meta:
+        """Meta options for the serializer."""
+
+        model = models.LearningResourceTopic
+        fields = ["id", "name", "icon", "parent", "channel_url"]
+
+
+class WriteableTopicsMixin(serializers.Serializer):
+    """Class for editable topics"""
+
+    topics = WriteableSerializerMethodField()
+
+    def validate_topics(self, topics):
+        """Validate specified topics exist."""
+        if len(topics) > 0:
+            if isinstance(topics[0], dict):
+                topics = [topic["id"] for topic in topics]
+            try:
+                valid_topic_ids = set(
+                    models.LearningResourceTopic.objects.filter(
+                        id__in=topics
+                    ).values_list("id", flat=True)
+                )
+            except ValueError as ve:
+                msg = "Topic ids must be integers"
+                raise ValidationError(msg) from ve
+            missing = set(topics).difference(valid_topic_ids)
+            if missing:
+                msg = f"Invalid topic ids: {missing}"
+                raise ValidationError(msg)
+        return {"topics": topics}
+
+    @extend_schema_field(LearningResourceTopicSerializer(many=True))
+    def get_topics(self, instance):
+        """Return the list of topics"""
+        return [
+            LearningResourceTopicSerializer(topic).data
+            for topic in instance.topics_for_serialization()
+        ]
+
+
+class LearningResourceTypeField(serializers.ReadOnlyField):
+    """Field for LearningResource.resource_type"""
+
+
+class LearningResourceOfferorSerializer(serializers.ModelSerializer):
+    """Serializer for LearningResourceOfferor with basic details"""
+
+    channel_url = serializers.CharField(read_only=True, allow_null=True)
+
+    class Meta:
+        model = models.LearningResourceOfferor
+        fields = ("code", "name", "channel_url", "display_facet")
+
+
+class LearningResourceOfferorDetailSerializer(LearningResourceOfferorSerializer):
+    """Serializer for LearningResourceOfferor with all details"""
+
+    channel_url = serializers.CharField(read_only=True, allow_null=True)
+
+    class Meta:
+        model = models.LearningResourceOfferor
+        exclude = COMMON_IGNORED_FIELDS
+
+
+@extend_schema_field(
+    {
+        "type": "object",
+        "title": "CourseResourceCertificationType",
+        "properties": {
+            "code": {"enum": CertificationType.names()},
+            "name": {"type": "string"},
+        },
+        "required": ["code", "name"],
+    }
+)
+class CertificateTypeField(serializers.Field):
+    """Serializer for LearningResource.certification_type"""
+
+    def to_representation(self, value):
+        """Serialize certification type as a dict"""
+        return {"code": value, "name": CertificationType[value].value}
+
+
+@extend_schema_field({"type": "array", "items": {"type": "string"}})
+class LearningResourceContentTagField(serializers.Field):
+    """Serializer for LearningResourceContentTag"""
+
+    def to_representation(self, value):
+        """Serialize content tags as a list of names"""
+        return sorted([tag.name for tag in value.all()])
+
+
+class LearningResourcePlatformSerializer(serializers.ModelSerializer):
+    """Serializer for LearningResourcePlatform"""
+
+    class Meta:
+        model = models.LearningResourcePlatform
+        fields = ("code", "name")
+
+
+class LearningResourceBaseDepartmentSerializer(serializers.ModelSerializer):
+    """
+    Serializer for LearningResourceDepartment, minus school
+
+    The absence of the departments list is to avoid a circular serialization structure.
+    """
+
+    channel_url = serializers.CharField(read_only=True, allow_null=True)
+
+    class Meta:
+        model = models.LearningResourceDepartment
+        fields = ["department_id", "name", "channel_url"]
+
+
+class LearningResourceBaseSchoolSerializer(serializers.ModelSerializer):
+    """
+    Base serializer for LearningResourceSchool model, minus departments list
+
+    The absence of the departments list is to avoid a circular serialization structure.
+    """
+
+    class Meta:
+        model = models.LearningResourceSchool
+        fields = ["id", "name", "url"]
+
+
+class LearningResourceDepartmentSerializer(LearningResourceBaseDepartmentSerializer):
+    """Full serializer for LearningResourceDepartment, including school"""
+
+    school = LearningResourceBaseSchoolSerializer(read_only=True, allow_null=True)
+
+    class Meta:
+        model = models.LearningResourceDepartment
+        fields = [*LearningResourceBaseDepartmentSerializer.Meta.fields, "school"]
+
+
+class LearningResourceSchoolSerializer(LearningResourceBaseSchoolSerializer):
+    """
+    Serializer for LearningResourceSchool model, including list of departments
+    """
+
+    departments = LearningResourceBaseDepartmentSerializer(many=True)
+
+    class Meta:
+        model = models.LearningResourceSchool
+        fields = [*LearningResourceBaseSchoolSerializer.Meta.fields, "departments"]
+
+
+class LearningResourceContentTagSerializer(serializers.ModelSerializer):
+    """Serializer for LearningResourceContentTag"""
+
+    class Meta:
+        model = models.LearningResourceContentTag
+        fields = ["id", "name"]
+
+
+class LearningResourceImageSerializer(serializers.ModelSerializer):
+    """Serializer for LearningResourceImage"""
+
+    class Meta:
+        model = models.LearningResourceImage
+        exclude = COMMON_IGNORED_FIELDS
+
+
+@extend_schema_field(
+    {
+        "type": "object",
+        "properties": {
+            "code": {"enum": LevelType.names()},
+            "name": {"type": "string"},
+        },
+        "required": ["code", "name"],
+    }
+)
+class LearningResourceLevelSerializer(serializers.Field):
+    def to_representation(self, value):
+        return {"code": value, "name": LevelType[value].value}
+
+
+@extend_schema_field(
+    {
+        "type": "object",
+        "title": "CourseResourceDeliveryInner",
+        "properties": {
+            "code": {"enum": LearningResourceDelivery.names()},
+            "name": {"type": "string"},
+        },
+        "required": ["code", "name"],
+    }
+)
+class LearningResourceDeliverySerializer(serializers.Field):
+    def to_representation(self, value):
+        return {"code": value, "name": LearningResourceDelivery[value].value}
+
+
+@extend_schema_field(
+    {
+        "type": "object",
+        "title": "CourseResourceFormatInner",
+        "properties": {
+            "code": {"enum": Format.names()},
+            "name": {"type": "string"},
+        },
+        "required": ["code", "name"],
+    }
+)
+class FormatSerializer(serializers.Field):
+    def to_representation(self, value):
+        return {"code": value, "name": Format[value].value}
+
+
+@extend_schema_field(
+    {
+        "type": "object",
+        "title": "CourseResourcePaceInner",
+        "properties": {
+            "code": {"enum": Pace.names()},
+            "name": {"type": "string"},
+        },
+        "required": ["code", "name"],
+    }
+)
+class PaceSerializer(serializers.Field):
+    def to_representation(self, value):
+        return {"code": value, "name": Pace[value].value}
+
+
+class ResourceTypeGroupChoiceField(serializers.ChoiceField):
+    """
+    The resource type group for UI grouping.
+    """
+
+    # Note: This serializer centralizes the OpenAPI schema/help text for this field
+    # and is intended to be subclassed (for example, by ComputedResourceTypeGroupField).
+
+    DEFAULT_HELP_TEXT = (
+        "The resource type group for UI grouping.\n\n"
+        "For courses/programs, this is derived from resource_category\n"
+        "(which may differ from resource_type).\n"
+        'For all other types, returns "learning_material".'
+    )
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("help_text", self.DEFAULT_HELP_TEXT)
+        super().__init__(RESOURCE_TYPE_GROUP_CHOICES, **kwargs)
+
+
+class ComputedResourceTypeGroupField(ResourceTypeGroupChoiceField):
+    """ResourceTypeGroupChoiceField that computes value from a model instance."""
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("read_only", True)
+        kwargs.setdefault("source", "*")  # Pass all instance fields to the serializer
+        super().__init__(**kwargs)
+
+    def to_representation(self, instance):
+        """
+        Compute the resource type group for UI grouping.
+
+        For courses and programs, this is derived from the instance's
+        resource_category (falling back to resource_type if the category
+        is not a valid LearningResourceType). For all other resource types,
+        this returns the learning material resource type group.
+        """
+        if instance.resource_type in [
+            LearningResourceType.course.name,
+            LearningResourceType.program.name,
+        ]:
+            try:
+                return LearningResourceType(instance.resource_category).name
+            except ValueError:
+                return instance.resource_type
+        return LEARNING_MATERIAL_RESOURCE_TYPE_GROUP
+
+
+class LearningResourceRunSerializer(serializers.ModelSerializer):
+    """Serializer for the LearningResourceRun model"""
+
+    instructors = LearningResourceInstructorSerializer(
+        read_only=True, allow_null=True, many=True
+    )
+    image = LearningResourceImageSerializer(read_only=True, allow_null=True)
+
+    level = serializers.ListField(child=LearningResourceLevelSerializer())
+    delivery = serializers.ListField(
+        child=LearningResourceDeliverySerializer(), read_only=True
+    )
+    format = serializers.ListField(child=FormatSerializer(), read_only=True)
+    pace = serializers.ListField(child=PaceSerializer(), read_only=True)
+    resource_prices = LearningResourcePriceSerializer(read_only=True, many=True)
+
+    class Meta:
+        model = models.LearningResourceRun
+        exclude = [
+            "learning_resource",
+            "b2b_only",
+            "is_variant",
+            "archive_key",
+            *COMMON_IGNORED_FIELDS,
+        ]
+
+
+class ResourceListMixin(serializers.Serializer):
+    """Common fields for LearningPath and other future resource lists"""
+
+    item_count = serializers.IntegerField(
+        read_only=True,
+        help_text="Number of published items in the list.",
+    )
+
+
+class CourseNumberSerializer(serializers.Serializer):
+    """Serializer for CourseNumber"""
+
+    value = serializers.CharField()
+    department = LearningResourceDepartmentSerializer()
+    listing_type = serializers.CharField()
+
+
+class ProgramSerializer(serializers.ModelSerializer):
+    """Serializer for the Program model"""
+
+    course_count = serializers.IntegerField(read_only=True)
+    program_count = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = models.Program
+        include = ("course_count", "program_count")
+        exclude = ("learning_resource", *COMMON_IGNORED_FIELDS)
+
+
+class CourseSerializer(serializers.ModelSerializer):
+    """Serializer for the Course model"""
+
+    course_numbers = CourseNumberSerializer(many=True, allow_null=True)
+
+    class Meta:
+        model = models.Course
+        exclude = ("learning_resource", *COMMON_IGNORED_FIELDS)
+
+
+class LearningPathSerializer(serializers.ModelSerializer, ResourceListMixin):
+    """Serializer for the LearningPath model"""
+
+    class Meta:
+        model = models.LearningPath
+        exclude = ("learning_resource", "author", *COMMON_IGNORED_FIELDS)
+
+
+class PodcastEpisodeParentSerializer(serializers.Serializer):
+    """Minimal parent-podcast summary embedded in an episode."""
+
+    id = serializers.IntegerField(source="parent_id")
+    title = serializers.CharField(source="parent.title")
+    readable_id = serializers.CharField(source="parent.readable_id")
+    learn_url = serializers.SerializerMethodField(
+        help_text="Where this podcast lives within Learn"
+    )
+
+    def get_learn_url(self, instance) -> str:
+        """
+        Return the parent podcast's own page on Learn.
+
+        A podcast has no URL-forming parent of its own, hence the empty parent
+        list. `parent` is select_related by the `_podcasts` prefetch, so this
+        costs no extra query.
+        """
+        return learn_url_for_resource(instance.parent, [])
+
+
+class PodcastEpisodeSerializer(serializers.ModelSerializer):
+    """
+    Serializer for PodcastEpisode
+    """
+
+    podcasts = serializers.SerializerMethodField()
+    parent_podcasts = serializers.SerializerMethodField()
+    has_transcript = serializers.SerializerMethodField()
+
+    def get_podcasts(self, instance) -> list[int]:
+        """Get the podcast id(s) the episode belongs to"""
+        return [podcast.parent_id for podcast in instance.learning_resource.podcasts]
+
+    def get_has_transcript(self, instance) -> bool:
+        """
+        Whether a transcript is available from the transcript endpoint.
+
+        The text itself is excluded from this serializer, so this is how a
+        client knows whether to fetch it.
+        """
+        return bool(instance.transcript)
+
+    @extend_schema_field(PodcastEpisodeParentSerializer(many=True))
+    def get_parent_podcasts(self, instance):
+        """Get summary info for the podcast(s) the episode belongs to"""
+        return PodcastEpisodeParentSerializer(
+            instance.learning_resource.podcasts, many=True
+        ).data
+
+    class Meta:
+        model = models.PodcastEpisode
+        # `transcript` and `rss` are large per-episode text blobs with no
+        # consumer in a list, nested or search payload: a page of 20 episodes
+        # would carry ~700KB of transcript. Fetch the transcript from
+        # /api/v1/podcast_episodes/{id}/transcript/ instead, gated on
+        # `has_transcript`. The search index re-adds `transcript` in
+        # learning_resources_search.serializers.
+        exclude = (
+            "learning_resource",
+            "transcript",
+            "rss",
+            *COMMON_IGNORED_FIELDS,
+        )
+
+
+class PodcastEpisodeTranscriptSerializer(serializers.ModelSerializer):
+    """
+    Serializer for a single podcast episode's transcript.
+
+    Kept out of PodcastEpisodeSerializer so the text is only ever sent when a
+    client asks for this one episode's transcript.
+    """
+
+    id = serializers.IntegerField(source="learning_resource_id", read_only=True)
+
+    class Meta:
+        model = models.PodcastEpisode
+        fields = ("id", "transcript")
+
+
+class PodcastSerializer(serializers.ModelSerializer):
+    """
+    Serializer for Podcasts
+    """
+
+    episode_count = serializers.IntegerField()
+
+    class Meta:
+        model = models.Podcast
+        exclude = ("learning_resource", *COMMON_IGNORED_FIELDS)
+
+
+class VideoChannelSerializer(serializers.ModelSerializer):
+    """Serializer for the VideoChannel model"""
+
+    class Meta:
+        model = models.VideoChannel
+        exclude = ["published", "etl_source", *COMMON_IGNORED_FIELDS]
+
+
+class CaptionUrlSerializer(serializers.Serializer):
+    """Serializer for caption URL entries"""
+
+    language = serializers.CharField()
+    language_name = serializers.CharField()
+    url = serializers.URLField()
+
+
+class NullableURLField(serializers.URLField):
+    """URLField that returns None for empty strings"""
+
+    def to_representation(self, value):
+        return super().to_representation(value) if value else None
+
+
+class VideoSerializer(serializers.ModelSerializer):
+    """Serializer for the Video model"""
+
+    caption_urls = CaptionUrlSerializer(many=True, read_only=True)
+    streaming_url = NullableURLField(allow_blank=True, allow_null=True, read_only=True)
+    cover_image_url = NullableURLField(
+        allow_blank=True, allow_null=True, read_only=True
+    )
+
+    class Meta:
+        model = models.Video
+        exclude = ("learning_resource", "transcript", *COMMON_IGNORED_FIELDS)
+
+
+class VideoPlaylistSerializer(serializers.ModelSerializer):
+    """Serializer for the VideoPlaylist model"""
+
+    channel = VideoChannelSerializer(read_only=True, allow_null=True)
+
+    video_count = serializers.IntegerField()
+
+    parent_learning_resource_id = serializers.IntegerField(
+        read_only=True, allow_null=True
+    )
+
+    parent_title = serializers.SerializerMethodField()
+
+    parent_url = serializers.SerializerMethodField()
+
+    parent_course_numbers = serializers.SerializerMethodField()
+
+    @extend_schema_field({"type": "string", "nullable": True})
+    def get_parent_title(self, instance) -> str | None:
+        """Return the title of the parent learning resource, if any"""
+        parent = instance.parent_learning_resource
+        return parent.title if parent else None
+
+    def get_parent_course_numbers(self, instance) -> list[str]:
+        """Extract the course number(s) from the parent course, if any"""
+        parent = instance.parent_learning_resource
+        if parent and hasattr(parent, LearningResourceType.course.name):
+            return [
+                coursenum["value"] for coursenum in (parent.course.course_numbers or [])
+            ]
+        return []
+
+    @extend_schema_field({"type": "string", "nullable": True})
+    def get_parent_url(self, instance) -> str | None:
+        """Return the URL of the parent learning resource, if any"""
+        parent = instance.parent_learning_resource
+        return parent.url if parent else None
+
+    class Meta:
+        model = models.VideoPlaylist
+        include = ("video_count",)
+        exclude = (
+            "learning_resource",
+            "parent_learning_resource",
+            *COMMON_IGNORED_FIELDS,
+        )
+
+
+class MicroLearningPathRelationshipSerializer(serializers.ModelSerializer):
+    """
+    Serializer containing only parent and child ids for a learning path relationship
+    """
+
+    parent = serializers.ReadOnlyField(
+        source="parent_id",
+        help_text="The id of the parent learning resource",
+    )
+    child = serializers.ReadOnlyField(source="child_id")
+
+    class Meta:
+        model = models.LearningResourceRelationship
+        fields = ("id", "parent", "child")
+
+
+class MicroUserListRelationshipSerializer(serializers.ModelSerializer):
+    """
+    Serializer containing only parent and child ids for a user list relationship
+    """
+
+    parent = serializers.ReadOnlyField(
+        source="parent_id", help_text="The id of the parent learning resource"
+    )
+    child = serializers.ReadOnlyField(source="child_id")
+
+    class Meta:
+        model = models.UserListRelationship
+        fields = ("id", "parent", "child")
+
+
+class ResourceChildSummarySerializer(serializers.Serializer):
+    """Serializer for child course/program entries within a program."""
+
+    title = serializers.CharField()
+    readable_id = serializers.CharField()
+    description = serializers.CharField()
+    resource_type = serializers.CharField()
+    topics = serializers.ListField(child=serializers.CharField())
+    parent_program = serializers.CharField(required=False)
+
+
+class LearningResourceMetadataDisplaySerializer(serializers.Serializer):
+    """
+    Serializer to render course information as a text document
+    """
+
+    title = serializers.CharField(help_text="Title", read_only=True)
+    description = serializers.CharField(help_text="Description", read_only=True)
+
+    full_description = serializers.CharField(
+        help_text="Full Description", read_only=True, allow_null=True
+    )
+    url = serializers.CharField(help_text="Website", read_only=True)
+    free = serializers.BooleanField(help_text="Free", read_only=True, allow_null=True)
+    topics = serializers.SerializerMethodField(help_text="Topics")
+    price = serializers.SerializerMethodField(help_text="Price", allow_null=True)
+    extra_price_info = serializers.SerializerMethodField(
+        help_text="Extra Price Information", allow_null=True
+    )
+    certification = serializers.SerializerMethodField(
+        help_text="Certificate", allow_null=True
+    )
+    instructors = serializers.SerializerMethodField(
+        help_text="Instructors", allow_null=True
+    )
+    runs = serializers.SerializerMethodField(help_text="Runs/Sessions", allow_null=True)
+    offered_by = serializers.SerializerMethodField(
+        help_text="Offered By", allow_null=True
+    )
+    languages = serializers.SerializerMethodField(
+        help_text="Languages", allow_null=True
+    )
+
+    levels = serializers.SerializerMethodField(help_text="Levels", allow_null=True)
+    departments = serializers.SerializerMethodField(help_text="Departments")
+    platform = serializers.SerializerMethodField(help_text="Platform", allow_null=True)
+    number_of_courses = serializers.SerializerMethodField(
+        help_text="Number of Courses", allow_null=True
+    )
+    number_of_programs = serializers.SerializerMethodField(
+        help_text="Number of Programs", allow_null=True
+    )
+    program_courses = serializers.SerializerMethodField(
+        help_text="Child courses and programs included in this learning resource",
+        allow_null=True,
+    )
+    location = serializers.SerializerMethodField(help_text="Location", allow_null=True)
+    starts = serializers.SerializerMethodField(help_text="Starts", allow_null=True)
+    format_type = serializers.SerializerMethodField(help_text="Format", allow_null=True)
+    as_taught_in = serializers.SerializerMethodField(
+        help_text="As Taught In", allow_null=True
+    )
+    duration = serializers.SerializerMethodField(help_text="Duration", allow_null=True)
+
+    def all_runs_are_identical(self, serialized_resource):
+        """Check if all runs are identical"""
+        distinct_resource_prices = set()
+        distinct_delivery_methods = set()
+        resource_delivery = [
+            delivery["code"] for delivery in serialized_resource["delivery"]
+        ]
+        has_in_person = (
+            "in_person" in resource_delivery or "hybrid" in resource_delivery
+        )
+
+        distinct_locations = set()
+        for run in serialized_resource.get("runs", []):
+            resource_prices = run.get("resource_prices", [])
+            distinct_resource_prices.add(
+                tuple((price["currency"], price["amount"]) for price in resource_prices)
+            )
+            distinct_delivery_methods.update(
+                [delivery["code"] for delivery in run.get("delivery", [])]
+            )
+            if run.get("location"):
+                distinct_locations.add(run["location"])
+        if len(distinct_resource_prices) > 1:
+            return False
+        if len(distinct_delivery_methods) != 1:
+            return False
+        return not (
+            (has_in_person and len(distinct_locations) != 1)
+            or (not has_in_person and len(distinct_locations) > 0)
+        )
+
+    def show_start_anytime(self, serialized_resource):
+        """Determine if start is "anytime" for a program or course"""
+        return (
+            serialized_resource["resource_type"]
+            in [LearningResourceType.program.name, LearningResourceType.course.name]
+            and serialized_resource.get("availability") == Availability.anytime.name
+        )
+
+    def _parse_run_start(self, run):
+        """Parse a run's start_date as a UTC datetime, or None if unusable"""
+        start_date = run.get("start_date")
+        parsed = dateparser.parse(start_date) if start_date else None
+        if parsed is None:
+            return None
+        return (
+            parsed.replace(tzinfo=UTC)
+            if parsed.tzinfo is None
+            else parsed.astimezone(UTC)
+        )
+
+    def _run_sort_key(self, run):
+        """Sort key for a run; dateless or unparseable runs sort last."""
+        return self._parse_run_start(run) or datetime.max.replace(tzinfo=UTC)
+
+    def runs_by_date(self, serialized_resource):
+        """Get runs sorted by date"""
+        return sorted(serialized_resource.get("runs", []), key=self._run_sort_key)
+
+    def dates_for_runs(self, serialized_resource):
+        """Get a list of sorted and formatted run dates"""
+        show_start_anytime = self.show_start_anytime(serialized_resource)
+        runs_with_dates = []
+        runs = self.runs_by_date(serialized_resource)
+        for run in runs:
+            formatted = self.format_run_date(run, show_start_anytime)
+            if formatted:
+                runs_with_dates.append(formatted)
+        return runs_with_dates
+
+    def total_runs_with_dates(self, serialized_resource):
+        """Get the total number of runs with valid dates"""
+        formatted = self.dates_for_runs(serialized_resource)
+        return len(formatted)
+
+    def format_run_date(self, run, as_taught_in):
+        """Format the run date based on available data"""
+        parsed_start = self._parse_run_start(run)
+        if as_taught_in:
+            run_semester = run.get("semester", "")
+            if run_semester:
+                run_semester = run_semester.capitalize()
+                if run.get("year"):
+                    return f"{run_semester} {run['year']}"
+                if run.get("start_date"):
+                    return f"{run_semester} {run['start_date']}"
+            if parsed_start:
+                return parsed_start.strftime("%B, %Y")
+        if parsed_start:
+            return parsed_start.strftime("%B %d, %Y")
+        return None
+
+    def should_show_format(self, serialized_resource):
+        """Determine if the format should be displayed"""
+        return (
+            serialized_resource.get("resource_type")
+            in [LearningResourceType.program.name, LearningResourceType.course.name]
+            and self.all_runs_are_identical(serialized_resource)
+            and len(serialized_resource.get("delivery", [])) > 0
+        )
+
+    @extend_schema_field({"type": "array", "items": {"type": "string"}})
+    def get_as_taught_in(self, serialized_resource):
+        """Get the as-taught-in value"""
+        if self.total_runs_with_dates(
+            serialized_resource
+        ) > 0 and self.show_start_anytime(serialized_resource):
+            return self.dates_for_runs(serialized_resource)
+        return None
+
+    @extend_schema_field({"type": "number"})
+    def get_number_of_courses(self, serialized_resource):
+        """Return the number of courses in a program"""
+        if (
+            serialized_resource.get("resource_type")
+            == LearningResourceType.program.name
+        ):
+            return serialized_resource["program"].get("course_count", 0)
+        return None
+
+    @extend_schema_field({"type": "number"})
+    def get_number_of_programs(self, serialized_resource):
+        """Return the number of child programs in a program"""
+        if (
+            serialized_resource.get("resource_type")
+            == LearningResourceType.program.name
+        ):
+            return serialized_resource["program"].get("program_count", 0)
+        return None
+
+    @extend_schema_field(ResourceChildSummarySerializer(many=True))
+    def get_program_courses(self, serialized_resource):
+        """Return details about courses/programs in a program"""
+        if (
+            serialized_resource.get("resource_type")
+            != LearningResourceType.program.name
+        ):
+            return None
+        program_relation_types = {
+            constants.LearningResourceRelationTypes.PROGRAM_COURSES,
+            constants.LearningResourceRelationTypes.PROGRAM_PROGRAMS,
+        }
+        children = [
+            c
+            for c in serialized_resource.get("children", [])
+            if c.get("relation_type") in program_relation_types
+        ]
+        if not children:
+            return None
+        courses = self._collect_courses_from_children(children)
+        return courses if courses else None
+
+    def _collect_courses_from_children(
+        self,
+        children_data,
+        max_depth=2,
+        visited=None,
+        parent_program_title=None,
+    ):
+        """Recursively collect courses from program children.
+
+        For PROGRAM_PROGRAMS children, recurse into their children to find
+        actual courses. For PROGRAM_COURSES children, include directly.
+        """
+        if max_depth <= 0:
+            return []
+        if visited is None:
+            visited = set()
+
+        child_ids = [c["child"] for c in children_data if c["child"] not in visited]
+        if not child_ids:
+            return []
+        visited.update(child_ids)
+
+        program_relation_types = [
+            constants.LearningResourceRelationTypes.PROGRAM_COURSES,
+            constants.LearningResourceRelationTypes.PROGRAM_PROGRAMS,
+        ]
+        include_test_mode_children = self.context.get(
+            "include_test_mode_children", False
+        )
+        """
+        Caching here to cut down on queries. Separate caches were added because display
+        API endpoints (like learning_resources) should only show published children,
+        while AI/vector search endpoints (content_files) need test_mode courses too.
+        Without separate cache keys, courses might show up where they don't belong or
+        not show up where they should, depending on where this function got called 1st.
+        """
+        cache_key = (
+            PROGRAM_COURSE_CACHE_KEY_TEST_MODE
+            if include_test_mode_children
+            else PROGRAM_COURSE_CACHE_KEY_PUBLISHED
+        )
+        resource_cache = self.context.setdefault(cache_key, {})
+        missing_ids = [cid for cid in child_ids if cid not in resource_cache]
+
+        if missing_ids:
+            resource_cache.update(
+                _get_program_child_resource_map(
+                    missing_ids,
+                    include_test_mode_children=include_test_mode_children,
+                    program_relation_types=program_relation_types,
+                )
+            )
+
+        child_map = {
+            cid: resource_cache[cid] for cid in child_ids if cid in resource_cache
+        }
+
+        courses = []
+        for child_rel in children_data:
+            child = child_map.get(child_rel["child"])
+            if not child:
+                continue
+
+            entry = build_resource_summary_dict(child)
+            if parent_program_title:
+                entry["parent_program"] = parent_program_title
+
+            relation_type = child_rel.get("relation_type")
+            if (
+                child.resource_type == LearningResourceType.program.name
+                and relation_type
+                == constants.LearningResourceRelationTypes.PROGRAM_PROGRAMS
+            ):
+                # Include the sub-program itself for structural context
+                courses.append(entry)
+                # Recurse using prefetched children (no extra DB query)
+                sub_children = [
+                    {
+                        "child": rel.child_id,
+                        "relation_type": rel.relation_type,
+                        "position": rel.position,
+                    }
+                    for rel in child.program_children
+                ]
+                courses.extend(
+                    self._collect_courses_from_children(
+                        sub_children,
+                        max_depth - 1,
+                        visited,
+                        parent_program_title=child.title,
+                    )
+                )
+            else:
+                courses.append(entry)
+
+        return courses
+
+    @extend_schema_field({"type": "string"})
+    def get_duration(self, serialized_resource):
+        """Get the duration of a video or podcast episode"""
+        resource_type = serialized_resource.get("resource_type")
+        if resource_type in [
+            LearningResourceType.video.name,
+            LearningResourceType.podcast_episode.name,
+        ]:
+            duration = (serialized_resource[resource_type] or {}).get("duration")
+            if duration:
+                return str(parse_duration(duration))
+        return None
+
+    @extend_schema_field({"type": "string"})
+    def get_location(self, serialized_resource):
+        """Get the location of a course or program"""
+        resource_delivery = [
+            delivery["code"] for delivery in serialized_resource["delivery"]
+        ]
+        has_in_person = (
+            LearningResourceDelivery.in_person.name in resource_delivery
+            or LearningResourceDelivery.hybrid.name in resource_delivery
+        )
+        if self.should_show_format(serialized_resource) and has_in_person:
+            return serialized_resource.get("location")
+        return None
+
+    @extend_schema_field({"type": "array", "items": {"type": "string"}})
+    def get_departments(self, serialized_resource):
+        """Get the departments for a course or program"""
+        department_vals = []
+        for department in serialized_resource.get("departments", []):
+            school = (
+                f" ({department['school']['name']})" if department.get("school") else ""
+            )
+            department_vals.append(f"{department['name']}{school}")
+        return department_vals if len(department_vals) > 0 else None
+
+    @extend_schema_field({"type": "string"})
+    def get_platform(self, serialized_resource):
+        """Get the platform for a course or program"""
+        return (
+            serialized_resource["platform"].get("name")
+            if serialized_resource.get("platform")
+            else None
+        )
+
+    @extend_schema_field({"type": "array", "items": {"type": "string"}})
+    def get_format_type(self, serialized_resource):
+        """Get the format type for a course"""
+        if self.should_show_format(serialized_resource):
+            return [
+                delivery["name"] for delivery in serialized_resource.get("delivery", [])
+            ]
+        return None
+
+    @extend_schema_field({"type": "array", "items": {"type": "string"}})
+    def get_levels(self, serialized_resource):
+        """Get the levels for a course or program"""
+        levels = []
+        for run in serialized_resource.get("runs", []):
+            if run.get("level"):
+                levels.extend(lvl["name"] for lvl in run["level"])
+        # sorted for the same reason as get_instructors
+        return sorted(set(levels)) if len(levels) > 0 else None
+
+    @extend_schema_field({"type": "array", "items": {"type": "string"}})
+    def get_languages(self, serialized_resource):
+        """Get the languages for a course"""
+        languages = []
+        for run in serialized_resource.get("runs", []):
+            if run.get("languages"):
+                languages.extend(run["languages"])
+        # sorted for the same reason as get_instructors
+        return sorted(set(languages)) if len(languages) > 0 else None
+
+    @extend_schema_field({"type": "string"})
+    def get_offered_by(self, serialized_resource):
+        """Get the offeror"""
+        return (
+            serialized_resource.get("offered_by").get("name")
+            if serialized_resource.get("offered_by")
+            else None
+        )
+
+    @extend_schema_field({"type": "array", "items": {"type": "string"}})
+    def get_starts(self, serialized_resource):
+        """Get the start date(s) for a course"""
+        show_start_anytime = self.show_start_anytime(serialized_resource)
+
+        runs_with_dates = self.total_runs_with_dates(serialized_resource)
+        runs_identical = self.all_runs_are_identical(serialized_resource)
+        if show_start_anytime:
+            return Availability.anytime.value
+        if runs_with_dates > 0 and runs_identical and not show_start_anytime:
+            return self.dates_for_runs(serialized_resource)
+        return None
+
+    @extend_schema_field(
+        {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string"},
+                    "start_date": {"type": "string"},
+                    "instructors": {"type": "array", "items": {"type": "string"}},
+                    "duration": {"type": "string"},
+                    "price": {"type": "string"},
+                    "format": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["code", "name"],
+            },
+        }
+    )
+    def get_runs(self, serialized_resource):
+        """Get the runs for a course"""
+        runs = []
+        if self.all_runs_are_identical(serialized_resource):
+            return None
+        for run in serialized_resource.get("runs", []):
+            parsed_start = self._parse_run_start(run)
+            formatted_date = parsed_start.strftime("%B %d, %Y") if parsed_start else ""
+            location = run.get("location") or "Online"
+            duration = run.get("duration")
+            prices = run.get("prices", [])
+            price = f"${prices[0]}" if prices else None
+            delivery_modes = [delivery["name"] for delivery in run.get("delivery", [])]
+            instructors = [
+                instructor.get("full_name")
+                for instructor in run.get("instructors", [])
+                if instructor.get("full_name")
+            ]
+            runs.append(
+                {
+                    "start_date": formatted_date,
+                    "location": location,
+                    "instructors": instructors,
+                    "duration": duration,
+                    "format": delivery_modes,
+                    "price": price,
+                }
+            )
+        return runs if len(runs) > 0 else None
+
+    @extend_schema_field({"type": "array", "items": {"type": "string"}})
+    def get_instructors(self, serialized_resource):
+        """Get a list of instriuctors for a course"""
+        instructors = set()
+        for run in serialized_resource.get("runs", []):
+            for instructor in run.get("instructors", []):
+                instructors.add(instructor["full_name"])
+        # sorted, not list(): this rendering is the resource's embedding
+        # identity, and set order varies with the process hash seed, so an
+        # unsorted list gives each worker a different checksum for the same
+        # resource and re-embeds the catalog on every restart.
+        return sorted(instructors) if len(instructors) > 0 else None
+
+    @extend_schema_field({"type": "string"})
+    def get_certification(self, serialized_resource):
+        """Get the certification type for a course"""
+        if serialized_resource.get(
+            "certification_type"
+        ) and not serialized_resource.get("free"):
+            return serialized_resource["certification_type"].get("name")
+        if (
+            serialized_resource.get("free")
+            and serialized_resource["certification_type"]
+            and serialized_resource["certification_type"]["code"]
+            == CertificationType.none.name
+        ):
+            return CertificationType.none.value
+        return None
+
+    @extend_schema_field({"type": "string"})
+    def get_extra_price_info(self, serialized_resource):
+        """
+        Get the extra price information for a course
+        Example: "With Certificate: $100"
+        """
+        if not self.all_runs_are_identical(serialized_resource):
+            return None
+        prices = serialized_resource.get("prices", [])
+        is_free_with_certificate = (
+            serialized_resource.get("free")
+            and serialized_resource.get("certification_type", {}).get("code")
+            == CertificationType.completion.name
+        )
+        if is_free_with_certificate and prices and len(prices) > 1:
+            return f"Earn a certificate: ${prices[1]}"
+        return None
+
+    @extend_schema_field({"type": "string"})
+    def get_price(self, serialized_resource):
+        """Get the price of a course"""
+        if not self.all_runs_are_identical(serialized_resource):
+            return None
+        prices = serialized_resource.get("prices", [])
+        if not serialized_resource.get("free") and prices:
+            return f"${serialized_resource['prices'][0]}"
+        return "Free"
+
+    @extend_schema_field({"type": "array", "items": {"type": "string"}})
+    def get_topics(self, serialized_resource):
+        """Get the topics for a course"""
+        return [topic["name"] for topic in serialized_resource.get("topics", [])]
+
+    def render_document(self):
+        """Render the course information object"""
+        data = self.data
+        display_sections = dict(self.fields)
+        rendered_data = {}
+        for section, field in display_sections.items():
+            display_text = data.get(section)
+            if display_text is not None:
+                rendered_data[field.help_text] = display_text
+        return rendered_data
+
+    def _document_heading(self):
+        """Heading prefixed to the rendered metadata document"""
+        resource_type = self.instance.get("resource_type", "course")
+        return f"# Information about this {resource_type}:"
+
+    def render_markdown(self):
+        """Render the whole resource metadata document as markdown"""
+        return (
+            f"{self._document_heading()}\n\n{json_to_markdown(self.render_document())}"
+        )
+
+    def render_chunks(self):
+        """Convert resource info to markdown chunks"""
+        from langchain_text_splitters import RecursiveJsonSplitter
+
+        rendered_doc = self.render_document()
+        """
+        We cant use tiktoken for token size calculation so
+        we use a rough calculation of 4*chunk_size characters:
+        https://help.openai.com/en/articles/4936856-what-are-tokens-and-how-to-count-them
+        """
+        chunk_size = (
+            settings.CONTENT_FILE_EMBEDDING_CHUNK_SIZE_OVERRIDE
+            if settings.CONTENT_FILE_EMBEDDING_CHUNK_SIZE_OVERRIDE
+            else 512
+        )
+        return [
+            (
+                f"{self._document_heading()}\n\n"
+                f"{json_to_markdown(json.loads(json_fragment))}"
+            )
+            for json_fragment in RecursiveJsonSplitter(
+                max_chunk_size=chunk_size * 4
+            ).split_text(
+                json_data=rendered_doc,
+                convert_lists=False,
+            )
+        ]
+
+
+class LearningResourceRelationshipChildField(serializers.ModelSerializer):
+    """
+    Serializer field for the LearningResourceRelationship model that uses
+    the LearningResourceSerializer to serialize the child resources
+    """
+
+    readable_id = serializers.ReadOnlyField(source="child.readable_id")
+    title = serializers.ReadOnlyField(source="child.title")
+
+    class Meta:
+        model = models.LearningResourceRelationship
+        fields = (
+            "child",
+            "position",
+            "relation_type",
+            "title",
+            "readable_id",
+        )
+
+
+@extend_schema_serializer(exclude_fields=COMMON_IGNORED_FIELDS)
+class LearningResourceBaseSerializer(serializers.ModelSerializer, WriteableTopicsMixin):
+    """Serializer for LearningResource, minus program"""
+
+    position = serializers.IntegerField(read_only=True, allow_null=True)
+    offered_by = LearningResourceOfferorSerializer(read_only=True, allow_null=True)
+    platform = LearningResourcePlatformSerializer(read_only=True, allow_null=True)
+    course_feature = LearningResourceContentTagField(
+        source="resource_tags", read_only=True, allow_null=True
+    )
+    departments = LearningResourceDepartmentSerializer(
+        read_only=True, allow_null=True, many=True
+    )
+    certification = serializers.ReadOnlyField(read_only=True)
+    certification_type = CertificateTypeField(read_only=True)
+    prices = serializers.ListField(
+        child=serializers.DecimalField(max_digits=12, decimal_places=2),
+        read_only=True,
+    )
+    resource_prices = LearningResourcePriceSerializer(
+        source="resource_prices_for_serialization", read_only=True, many=True
+    )
+    runs = LearningResourceRunSerializer(
+        source="published_runs", read_only=True, many=True, allow_null=True
+    )
+    image = serializers.SerializerMethodField()
+    views = serializers.IntegerField(source="views_count", read_only=True)
+
+    delivery = serializers.ListField(
+        child=LearningResourceDeliverySerializer(), read_only=True
+    )
+    free = serializers.SerializerMethodField()
+    resource_type_group = ComputedResourceTypeGroupField()
+    format = serializers.ListField(child=FormatSerializer(), read_only=True)
+    pace = serializers.ListField(child=PaceSerializer(), read_only=True)
+    children = serializers.SerializerMethodField(allow_null=True)
+    best_run_id = serializers.SerializerMethodField(allow_null=True)
+    learn_url = serializers.SerializerMethodField(
+        help_text="Where this resource lives within Learn"
+    )
+    url_slug = serializers.SerializerMethodField(
+        help_text=(
+            "Slug derived from the title, for use in this resource's URL. It is "
+            "cosmetic: lookups ignore it, and it changes whenever the title "
+            "does. Titles that yield no ASCII slug get the literal "
+            f'"{BLANK_SLUG_PATH_SEGMENT}", so this is never blank.'
+        )
+    )
+
+    def get_url_slug(self, instance) -> str:
+        """Return the slug segment of the resource's URL."""
+        return path_slug(instance.title)
+
+    def get_learn_url(self, instance) -> str:
+        """
+        Return the resource's own page on Learn where it has one, else its drawer.
+
+        Never null, so consumers need no fallback of their own.
+        """
+        if instance.resource_type == constants.LearningResourceType.video.name:
+            parent_ids = [playlist.parent_id for playlist in instance.playlists]
+        elif (
+            instance.resource_type
+            == constants.LearningResourceType.podcast_episode.name
+        ):
+            parent_ids = [podcast.parent_id for podcast in instance.podcasts]
+        else:
+            parent_ids = []
+        return learn_url_for_resource(instance, parent_ids)
+
+    @extend_schema_field(LearningResourceRelationshipChildField(allow_null=True))
+    def get_children(self, instance):
+        return LearningResourceRelationshipChildField(
+            instance.children_for_serialization(), many=True, read_only=True
+        ).data
+
+    def get_best_run_id(self, instance) -> int | None:
+        """Return the best run id for the resource, if it has runs"""
+        best_run = instance.best_run
+        if best_run:
+            return best_run.id
+        return None
+
+    def get_free(self, instance) -> bool:
+        """Return true if the resource is free/has a free option"""
+        if instance.resource_type in [
+            LearningResourceType.course.name,
+            LearningResourceType.program.name,
+        ]:
+            prices = instance.resource_price_amounts_for_serialization()
+            return not instance.professional and (
+                Decimal("0.00") in prices or not prices or prices == []
+            )
+        else:
+            return True
+
+    @extend_schema_field(LearningResourceImageSerializer(allow_null=True))
+    def get_image(self, instance) -> dict | None:
+        """
+        Return the resource.image if it exists. Otherwise, for learning paths only,
+        return the image of the first child resource.
+        """
+        if instance.image:
+            return LearningResourceImageSerializer(instance=instance.image).data
+        elif (
+            instance.resource_type == constants.LearningResourceType.learning_path.value
+        ):
+            list_item = instance.first_child_relationship_for_serialization()
+            if list_item and list_item.child.image:
+                return LearningResourceImageSerializer(
+                    instance=list_item.child.image
+                ).data
+            return None
+        return None
+
+    class Meta:
+        model = models.LearningResource
+        read_only_fields = [
+            "free",
+            "prices",
+            "resource_prices",
+            "resource_category",
+            "certification",
+            "children",
+            "certification_type",
+            "professional",
+            "views",
+            "require_summaries",
+            "platform",
+            "offered_by",
+            "readable_id",
+            "learn_url",
+            "url_slug",
+        ]
+        exclude = [
+            "resource_tags",
+            "resources",
+            "etl_source",
+            "etl_checksum",
+            "view_count",
+            "updated_on",
+        ]
+
+
+class ProgramResourceSerializer(LearningResourceBaseSerializer):
+    """Serializer for program resources"""
+
+    resource_type = LearningResourceTypeField(
+        default=constants.LearningResourceType.program.name
+    )
+
+    program = ProgramSerializer(read_only=True)
+
+
+class CourseResourceSerializer(LearningResourceBaseSerializer):
+    """Serializer for course resources"""
+
+    resource_type = LearningResourceTypeField(
+        default=constants.LearningResourceType.course.name
+    )
+    course = CourseSerializer(read_only=True)
+
+
+class LearningPathResourceSerializer(LearningResourceBaseSerializer):
+    """CRUD serializer for LearningPath resources"""
+
+    resource_type = LearningResourceTypeField(
+        default=constants.LearningResourceType.learning_path.name
+    )
+
+    resource_category = serializers.ReadOnlyField(
+        default=constants.LearningResourceType.learning_path.value
+    )
+
+    learning_path = LearningPathSerializer(read_only=True)
+
+    def validate_resource_type(self, value):
+        """Only allow LearningPath resources to be CRUDed"""
+        if value != constants.LearningResourceType.learning_path.name:
+            msg = "Only LearningPath resources are editable"
+            raise serializers.ValidationError(msg)
+        return value
+
+    def create(self, validated_data):
+        """Ensure that the LearningPath is created by the requesting user; set topics"""
+        # defined here because we disallow them as input
+        validated_data["readable_id"] = uuid4().hex
+        validated_data["resource_type"] = self.fields["resource_type"].default
+
+        request = self.context.get("request")
+        topics_data = validated_data.pop("topics", [])
+
+        with transaction.atomic():
+            path_resource = super().create(validated_data)
+            path_resource.topics.set(
+                models.LearningResourceTopic.objects.filter(id__in=topics_data)
+            )
+            models.LearningPath.objects.create(
+                learning_resource=path_resource, author=request.user
+            )
+        return path_resource
+
+    def update(self, instance, validated_data):
+        """Set learning path topics and update the model object"""
+        topics_data = validated_data.pop("topics", None)
+        with transaction.atomic():
+            resource = super().update(instance, validated_data)
+            if topics_data is not None:
+                resource.topics.set(
+                    models.LearningResourceTopic.objects.filter(id__in=topics_data)
+                )
+        return resource
+
+
+class PodcastResourceSerializer(LearningResourceBaseSerializer):
+    """Serializer for podcast resources"""
+
+    resource_type = LearningResourceTypeField(
+        default=constants.LearningResourceType.podcast.name
+    )
+
+    podcast = PodcastSerializer(read_only=True)
+
+
+class PodcastEpisodeResourceSerializer(LearningResourceBaseSerializer):
+    """Serializer for podcast episode resources"""
+
+    resource_type = LearningResourceTypeField(
+        default=constants.LearningResourceType.podcast_episode.name
+    )
+
+    podcast_episode = PodcastEpisodeSerializer(read_only=True)
+
+
+class VideoPlaylistResourceSerializer(LearningResourceBaseSerializer):
+    """Serializer for video playlist resources"""
+
+    resource_type = LearningResourceTypeField(
+        default=constants.LearningResourceType.video_playlist.name
+    )
+
+    video_playlist = VideoPlaylistSerializer(read_only=True)
+
+
+class ContentFileSerializer(serializers.ModelSerializer):
+    """
+    Serializer class for course run ContentFiles
+    """
+
+    run_id = serializers.IntegerField(source="run.id", required=False)
+    run_readable_id = serializers.CharField(source="run.run_id", required=False)
+    run_title = serializers.CharField(source="run.title", required=False)
+    run_slug = serializers.CharField(source="run.slug", required=False)
+    source_path = serializers.CharField(required=False)
+    semester = serializers.CharField(source="run.semester", required=False)
+    require_summaries = serializers.SerializerMethodField()
+    checksum = serializers.CharField(required=False)
+    year = serializers.IntegerField(source="run.year", required=False)
+    topics = serializers.SerializerMethodField()
+    resource_id = serializers.SerializerMethodField()
+    departments = serializers.SerializerMethodField()
+    resource_readable_id = serializers.SerializerMethodField()
+    course_number = serializers.SerializerMethodField()
+    content_feature_type = LearningResourceContentTagField(source="content_tags")
+    offered_by = serializers.SerializerMethodField()
+    platform = serializers.SerializerMethodField()
+    direct_learning_resource_id = serializers.IntegerField(
+        source="direct_learning_resource.id", required=False, allow_null=True
+    )
+
+    def get_learning_resource(self, instance):
+        if instance.run:
+            return instance.run.learning_resource
+        if instance.learning_resource:
+            return instance.learning_resource
+        return instance.direct_learning_resource
+
+    @extend_schema_field({"type": "boolean"})
+    def get_require_summaries(self, instance):
+        """Return whether the run requires summaries"""
+        return self.get_learning_resource(instance).require_summaries
+
+    @extend_schema_field(LearningResourcePlatformSerializer())
+    def get_platform(self, instance):
+        platform = self.get_learning_resource(instance).platform
+        return LearningResourcePlatformSerializer(platform).data
+
+    @extend_schema_field(LearningResourceOfferorSerializer())
+    def get_offered_by(self, instance):
+        offered_by = self.get_learning_resource(instance).offered_by
+        return LearningResourceOfferorSerializer(offered_by).data
+
+    @extend_schema_field({"type": "string"})
+    def get_resource_readable_id(self, instance):
+        return self.get_learning_resource(instance).readable_id
+
+    @extend_schema_field(LearningResourceDepartmentSerializer(many=True))
+    def get_departments(self, instance):
+        return LearningResourceDepartmentSerializer(
+            self.get_learning_resource(instance).departments, many=True
+        ).data
+
+    @extend_schema_field({"type": "string"})
+    def get_resource_id(self, instance):
+        return str(self.get_learning_resource(instance).id)
+
+    @extend_schema_field(LearningResourceTopicSerializer(many=True))
+    def get_topics(self, instance):
+        return LearningResourceTopicSerializer(
+            self.get_learning_resource(instance).topics, many=True
+        ).data
+
+    def get_course_number(self, instance) -> list[str]:
+        """Extract the course number(s) from the associated course"""
+        resource = self.get_learning_resource(instance)
+        if hasattr(resource, LearningResourceType.course.name):
+            return [coursenum["value"] for coursenum in resource.course.course_numbers]
+        return []
+
+    class Meta:
+        model = models.ContentFile
+        fields = [
+            "id",
+            "run_id",
+            "direct_learning_resource_id",
+            "run_title",
+            "run_slug",
+            "departments",
+            "semester",
+            "year",
+            "topics",
+            "key",
+            "uid",
+            "title",
+            "description",
+            "require_summaries",
+            "url",
+            "content_feature_type",
+            "content_type",
+            "content",
+            "content_title",
+            "content_author",
+            "content_language",
+            "checksum",
+            "image_src",
+            "resource_id",
+            "resource_readable_id",
+            "source_path",
+            "course_number",
+            "file_type",
+            "file_extension",
+            "offered_by",
+            "platform",
+            "run_readable_id",
+            "file_extension",
+            "edx_module_id",
+            "summary",
+            "flashcards",
+            "youtube_id",
+        ]
+
+
+class NestedContentFileSerializer(ContentFileSerializer):
+    """
+    ContentFileSerializer without the large text fields (content, summary,
+    flashcards), for nesting inside learning resource API responses.
+    The search indexing path re-adds full content where needed.
+    """
+
+    class Meta(ContentFileSerializer.Meta):
+        fields = [
+            field
+            for field in ContentFileSerializer.Meta.fields
+            if field not in constants.CONTENT_FILE_LARGE_FIELDS
+        ]
+
+
+class VideoResourceSerializer(LearningResourceBaseSerializer):
+    """Serializer for video resources"""
+
+    resource_type = LearningResourceTypeField(
+        default=constants.LearningResourceType.video.name
+    )
+
+    video = VideoSerializer(read_only=True, allow_null=True)
+
+    playlists = serializers.SerializerMethodField()
+
+    content_files = serializers.SerializerMethodField()
+    description = serializers.SerializerMethodField()
+
+    @extend_schema_field(NestedContentFileSerializer(many=True, allow_null=True))
+    def get_content_files(self, instance):
+        """Serialize content files with prefetch."""
+        content_files = instance.direct_content_files_for_serialization()
+        return NestedContentFileSerializer(
+            content_files,
+            many=True,
+            read_only=True,
+        ).data
+
+    @extend_schema_field({"type": "string", "nullable": True})
+    def get_description(self, instance):
+        if instance.description:
+            return instance.description
+        content_files = instance.direct_content_files_for_serialization()
+        return content_files[0].description if content_files else None
+
+    def get_playlists(self, instance) -> list[str]:
+        """Get the playlist id(s) the video belongs to"""
+        return [playlist.parent_id for playlist in instance.playlists]
+
+
+class DocumentResourceSerializer(LearningResourceBaseSerializer):
+    """Serializer for document resources"""
+
+    resource_type = LearningResourceTypeField(
+        default=constants.LearningResourceType.document.name
+    )
+
+    content_files = serializers.SerializerMethodField()
+    description = serializers.SerializerMethodField()
+
+    @extend_schema_field(NestedContentFileSerializer(many=True, allow_null=True))
+    def get_content_files(self, instance):
+        """Serialize content files with prefetch."""
+        content_files = instance.direct_content_files_for_serialization()
+        return NestedContentFileSerializer(
+            content_files,
+            many=True,
+            read_only=True,
+        ).data
+
+    @extend_schema_field({"type": "string", "nullable": True})
+    def get_description(self, instance):
+        if instance.description:
+            return instance.description
+        content_files = instance.direct_content_files_for_serialization()
+        return content_files[0].description if content_files else None
+
+
+class LearningResourceSerializer(serializers.Serializer):
+    """Serializer for LearningResource"""
+
+    serializer_cls_mapping = {
+        serializer_cls().fields["resource_type"].default: serializer_cls
+        for serializer_cls in (
+            ProgramResourceSerializer,
+            CourseResourceSerializer,
+            LearningPathResourceSerializer,
+            PodcastResourceSerializer,
+            PodcastEpisodeResourceSerializer,
+            VideoResourceSerializer,
+            VideoPlaylistResourceSerializer,
+            DocumentResourceSerializer,
+        )
+    }
+
+    def _child_serializer(self, resource_type):
+        """
+        Return a reusable serializer instance for a resource_type.
+
+        Constructing a DRF serializer deep-copies its whole field tree, so
+        building one per object makes bulk serialization (search hydration)
+        dominated by setup rather than output. Under many=True the
+        ListSerializer reuses a single child, so this cache spans the list --
+        which is how a normal many=True serializer already behaves.
+        """
+        if not hasattr(self, "_child_serializer_cache"):
+            self._child_serializer_cache = {}
+        if resource_type not in self._child_serializer_cache:
+            self._child_serializer_cache[resource_type] = self.serializer_cls_mapping[
+                resource_type
+            ](context=self.context)
+        return self._child_serializer_cache[resource_type]
+
+    def to_representation(self, instance):
+        """Serialize a LearningResource based on resource_type"""
+        return self._child_serializer(instance.resource_type).to_representation(
+            instance
+        )
+
+
+class LearningResourceRelationshipSerializer(serializers.ModelSerializer):
+    """CRUD serializer for LearningResourceRelationship"""
+
+    resource = LearningResourceSerializer(read_only=True, source="child")
+
+    def create(self, validated_data):
+        parent = validated_data.get("parent")
+        parent_id = validated_data.get("parent_id")
+        parent_filter = (
+            {"parent": parent} if parent is not None else {"parent_id": parent_id}
+        )
+        create_kwargs = (
+            {"parent": parent} if parent is not None else {"parent_id": parent_id}
+        )
+
+        items = models.LearningResourceRelationship.objects.filter(
+            **parent_filter,
+            relation_type=validated_data["relation_type"],
+        )
+        max_position = items.aggregate(Max("position"))["position__max"]
+        position = (items.count() if max_position is None else max_position) + 1
+        item, _ = models.LearningResourceRelationship.objects.get_or_create(
+            **create_kwargs,
+            child=validated_data["child"],
+            relation_type=validated_data["relation_type"],
+            defaults={"position": position},
+        )
+        return item
+
+    def update(self, instance, validated_data):
+        position = validated_data["position"]
+        # to perform an update on position we atomically:
+        # 1) move everything between the old position and the new position towards the old position by 1  # noqa: E501
+        # 2) move the item into its new position
+        # this operation gets slower the further the item is moved, but it is sufficient for now  # noqa: E501
+        with transaction.atomic():
+            path_items = models.LearningResourceRelationship.objects.filter(
+                parent=instance.parent,
+                relation_type=instance.relation_type,
+            )
+            if position > instance.position:
+                # move items between the old and new positions up, inclusive of the new position  # noqa: E501
+                path_items.filter(
+                    position__lte=position, position__gt=instance.position
+                ).update(position=F("position") - 1)
+            else:
+                # move items between the old and new positions down, inclusive of the new position  # noqa: E501
+                path_items.filter(
+                    position__lt=instance.position, position__gte=position
+                ).update(position=F("position") + 1)
+            # now move the item into place
+            instance.position = position
+            instance.save()
+
+        return instance
+
+    class Meta:
+        model = models.LearningResourceRelationship
+        extra_kwargs = {"position": {"required": False}}
+        exclude = COMMON_IGNORED_FIELDS
+
+
+class LearningPathRelationshipSerializer(LearningResourceRelationshipSerializer):
+    """Specialized serializer for a LearningPath relationship"""
+
+    relation_type = serializers.HiddenField(
+        default=constants.LearningResourceRelationTypes.LEARNING_PATH_ITEMS.value
+    )
+
+
+class LearningPathRelationshipCreateSerializer(LearningPathRelationshipSerializer):
+    """Create serializer for nested learning path items.
+
+    The parent is derived from the nested route and must not be client-supplied.
+    """
+
+    class Meta(LearningResourceRelationshipSerializer.Meta):
+        read_only_fields = ("parent",)
+
+
+class UserListSerializer(serializers.ModelSerializer, WriteableTopicsMixin):
+    """
+    Simplified serializer for UserList model.
+    """
+
+    item_count = serializers.IntegerField(
+        read_only=True,
+        help_text="Number of published items in the list.",
+    )
+    image = serializers.SerializerMethodField()
+
+    def get_image(self, instance) -> dict:
+        """Return the image of the first item"""
+        list_item = instance.first_child_relationship_for_serialization()
+        if list_item and list_item.child.image:
+            return LearningResourceImageSerializer(instance=list_item.child.image).data
+        return None
+
+    def create(self, validated_data):
+        """Create a new user list"""
+        User = get_user_model()
+
+        request = self.context.get("request")
+        if request and hasattr(request, "user") and isinstance(request.user, User):
+            validated_data["author"] = request.user
+            topics_data = validated_data.pop("topics", [])
+            with transaction.atomic():
+                userlist = super().create(validated_data)
+                userlist.topics.set(topics_data)
+            return userlist
+        return None
+
+    def update(self, instance, validated_data):
+        """Update an existing user list"""
+        request = self.context.get("request")
+        validated_data["author"] = request.user
+        topics_data = validated_data.pop("topics", None)
+        with transaction.atomic():
+            userlist = super().update(instance, validated_data)
+            if topics_data is not None:
+                userlist.topics.set(topics_data)
+            return userlist
+
+    class Meta:
+        model = models.UserList
+        exclude = ("resources", *COMMON_IGNORED_FIELDS)
+        read_only_fields = ["author"]
+
+
+class UserListRelationshipSerializer(serializers.ModelSerializer):
+    """
+    Serializer for UserListRelationship model
+    """
+
+    resource = LearningResourceSerializer(read_only=True, source="child")
+
+    def create(self, validated_data):
+        user_list = validated_data["parent"]
+        items = models.UserListRelationship.objects.filter(parent=user_list)
+        position = (
+            items.aggregate(Max("position"))["position__max"] or items.count()
+        ) + 1
+        item, _ = models.UserListRelationship.objects.get_or_create(
+            parent=validated_data["parent"],
+            child=validated_data["child"],
+            defaults={"position": position},
+        )
+        return item
+
+    def update(self, instance, validated_data):
+        position = validated_data["position"]
+        with transaction.atomic():
+            if position > instance.position:
+                # move items between old & new positions up, inclusive of new position
+                models.UserListRelationship.objects.filter(
+                    position__lte=position, position__gt=instance.position
+                ).update(position=F("position") - 1)
+            else:
+                models.UserListRelationship.objects.filter(
+                    position__lt=instance.position, position__gte=position
+                ).update(position=F("position") + 1)
+            instance.position = position
+            instance.save()
+
+        return instance
+
+    class Meta:
+        model = models.UserListRelationship
+        extra_kwargs = {"position": {"required": False}}
+        exclude = COMMON_IGNORED_FIELDS
+
+
+class BaseRelationshipRequestSerializer(serializers.Serializer):
+    """
+    Base class for validating requests that set relationships between
+    learning resources
+    """
+
+    learning_resource_id = serializers.IntegerField()
+
+    def validate_learning_resource_id(self, learning_resource_id):
+        """Ensure that the learning resource exists"""
+        try:
+            models.LearningResource.objects.get(id=learning_resource_id)
+        except models.LearningResource.DoesNotExist as dne:
+            msg = f"Invalid learning resource id: {learning_resource_id}"
+            raise ValidationError(msg) from dne
+        return learning_resource_id
+
+
+class SetLearningPathsRequestSerializer(BaseRelationshipRequestSerializer):
+    """
+        Validate request parameters for setting learning paths for a learning resource
+    `
+    """
+
+    learning_path_ids = serializers.ListField(
+        child=serializers.IntegerField(), allow_empty=True
+    )
+
+    def validate_learning_path_ids(self, learning_path_ids):
+        """Ensure that the learning paths exist"""
+        valid_learning_path_ids = set(
+            models.LearningResource.objects.filter(
+                id__in=learning_path_ids,
+                resource_type=LearningResourceType.learning_path.name,
+            ).values_list("id", flat=True)
+        )
+        missing = set(learning_path_ids).difference(valid_learning_path_ids)
+        if missing:
+            msg = f"Invalid learning path ids: {missing}"
+            raise ValidationError(msg)
+        return learning_path_ids
+
+
+class SetUserListsRequestSerializer(BaseRelationshipRequestSerializer):
+    """
+    Validate request parameters for setting userlist for a learning resource
+    """
+
+    userlist_ids = serializers.ListField(
+        child=serializers.IntegerField(), allow_empty=True
+    )
+
+    def validate_userlist_ids(self, userlist_ids):
+        """Ensure that the learning paths exist"""
+        valid_userlist_ids = set(
+            models.UserList.objects.filter(
+                id__in=userlist_ids,
+            ).values_list("id", flat=True)
+        )
+        missing = set(userlist_ids).difference(valid_userlist_ids)
+        if missing:
+            msg = f"Invalid learning path ids: {missing}"
+            raise ValidationError(msg)
+        return userlist_ids
+
+
+class LearningResourceDisplayInfoResponseSerializer(
+    LearningResourceMetadataDisplaySerializer
+):
+    """
+    Serializer for the response of the display info endpoint
+    """
+
+    id = serializers.IntegerField()
+
+
+class LearningResourceSummarySerializer(serializers.ModelSerializer):
+    """
+    Minimal serializer for LearningResource - returns only essential fields
+    for sitemap generation and other use cases requiring minimal data transfer.
+    """
+
+    canonical_parent_ids = serializers.SerializerMethodField()
+    learn_url = serializers.SerializerMethodField(
+        help_text="Where this resource lives within Learn"
+    )
+
+    @extend_schema_field(
+        {
+            "type": "array",
+            "items": {"type": "integer"},
+            "description": (
+                "Ids of the parents that form part of this resource's URL: the "
+                "parent podcasts of a podcast episode, the playlists of a video. "
+                "Empty for every other resource type. Parents are not filtered "
+                "by `published`, so an id here may belong to a resource this "
+                "endpoint will not return."
+            ),
+        }
+    )
+    def get_canonical_parent_ids(self, instance) -> list[int]:
+        """Ids of the parents that form part of this resource's URL."""
+        return instance.canonical_parent_ids
+
+    def get_learn_url(self, instance) -> str:
+        """
+        Return the resource's own page on Learn where it has one, else its drawer.
+
+        Reads the `canonical_parent_ids` annotation the summary queryset already
+        carries, so it costs no extra query.
+        """
+        return learn_url_for_resource(instance, instance.canonical_parent_ids)
+
+    class Meta:
+        """Meta configuration for LearningResourceSummarySerializer"""
+
+        model = models.LearningResource
+        fields = (
+            "id",
+            "last_modified",
+            "url",
+            "title",
+            "resource_type",
+            "canonical_parent_ids",
+            "learn_url",
+        )
+
+
+class CredentialMetadataRequestSerializer(serializers.Serializer):
+    """Request body for the credential metadata endpoint"""
+
+    resource_readable_id = serializers.CharField(
+        required=True,
+        help_text="The readable id of the learning resource to generate metadata for",
+    )
+
+
+class CredentialMetadataErrorsSerializer(serializers.Serializer):
+    """
+    Why a requested Open Badges field is missing from the response.
+    """
+
+    description = serializers.CharField(
+        required=False, help_text="Why no description was generated"
+    )
+    criteria = serializers.CharField(
+        required=False, help_text="Why no criteria were generated"
+    )
+
+
+class CredentialMetadataSerializer(serializers.Serializer):
+    """
+    Generated Open Badges credential metadata for a learning resource.
+    """
+
+    resource_readable_id = serializers.CharField()
+    # The generated fields are `required=False` so that a field which failed to
+    # generate is omitted from the response rather than serialized as blank.
+    # None of these are `read_only`: drf-spectacular marks every read-only
+    # field as required in the response schema, which would tell clients the
+    # generated ones are always present.
+    description = serializers.CharField(
+        required=False,
+        help_text="The Open Badges 3.0 description, 1-2 sentences",
+    )
+    criteria = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        help_text=(
+            "Open Badges 3.0 criteria, one skill-focused bullet per item, for"
+            " rendering into the criteria narrative"
+        ),
+    )
+    # Present only when a field is missing, so that an empty response can be
+    # told apart from one whose generation failed. Absent means every
+    # configured field generated.
+    errors = CredentialMetadataErrorsSerializer(
+        required=False,
+        help_text=(
+            "One entry per requested field that is missing above, saying why."
+            " Absent when every configured field was generated."
+        ),
+    )

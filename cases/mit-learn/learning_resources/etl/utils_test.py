@@ -1,0 +1,1470 @@
+"""ETL utils test"""
+
+import datetime
+import pathlib
+import tarfile
+from decimal import Decimal
+from tempfile import TemporaryDirectory
+
+import pypdf
+import pytest
+import requests
+
+from learning_resources.constants import (
+    CONTENT_TYPE_FILE,
+    CURRENCY_USD,
+    LearningResourceDelivery,
+    LearningResourceType,
+    OfferedBy,
+    RunStatus,
+)
+from learning_resources.etl import utils
+from learning_resources.etl.constants import CommitmentConfig, DurationConfig, ETLSource
+from learning_resources.etl.olx import OlxArchive, get_edx_module_id
+from learning_resources.etl.olx_test import (
+    START_FUTURE,
+    START_LATER,
+    START_PAST,
+    _dated_olx,
+    _reference_olx,
+    _start,
+    _write_html,
+    _write_olx,
+)
+from learning_resources.etl.utils import (
+    get_s3_prefix_for_source,
+    parse_certification,
+    parse_string_to_int,
+    strip_enrollment_modes,
+)
+from learning_resources.factories import (
+    ContentFileFactory,
+    LearningResourceFactory,
+    LearningResourceOfferorFactory,
+    LearningResourceRunFactory,
+    LearningResourceTopicFactory,
+)
+
+pytestmark = pytest.mark.django_db
+
+
+def get_olx_test_docs():
+    """Get a list of edx docs from a sample archive file"""
+    script_dir = pathlib.Path(__file__).parent.absolute().parent.parent
+    with TemporaryDirectory() as temp:
+        with tarfile.open(
+            pathlib.Path(script_dir, "test_json", "exported_courses_12345.tar.gz")
+        ) as tar:
+            tar.extractall(temp, filter="data")
+        with tarfile.open(pathlib.Path(temp, "content-devops-0001.tar.gz")) as tar:
+            tar.extractall(temp, filter="data")
+
+        olx_path = pathlib.Path(temp, "content-devops-0001")
+        return list(utils.documents_from_olx(OlxArchive(olx_path)))
+
+
+@pytest.mark.parametrize("has_bucket", [True, False])
+@pytest.mark.parametrize("metadata", [None, {"foo": "bar"}])
+def test_sync_s3_text(mock_ocw_learning_bucket, has_bucket, metadata):
+    """
+    Verify data is saved to S3 if a bucket and metadata are provided
+    """
+    key = "fake_key"
+    utils.sync_s3_text(
+        mock_ocw_learning_bucket.bucket if has_bucket else None, key, metadata
+    )
+    s3_objects = list(
+        mock_ocw_learning_bucket.bucket.objects.filter(Prefix=f"extracts/{key}")
+    )
+    assert len(s3_objects) == (1 if has_bucket and metadata is not None else 0)
+
+
+@pytest.mark.parametrize("token", ["abc123", "", None])
+@pytest.mark.parametrize("ocr_strategy", ["no_ocr", "ocr_and_text_extraction", None])
+@pytest.mark.parametrize("data", [b"data", b"", None])
+@pytest.mark.parametrize("headers", [None, {"a": "header"}])
+def test_extract_text_metadata(  # noqa: PLR0913
+    mocker, settings, data, token, ocr_strategy, headers
+):
+    """
+    Verify that tika is called and returns a response
+    """
+    settings.TIKA_TIMEOUT = 120
+    settings.TIKA_ACCESS_TOKEN = token
+    settings.TIKA_OCR_STRATEGY = ocr_strategy
+    mock_response = {"metadata": {"Author:": "MIT"}, "content": "Extracted text"}
+    mock_tika = mocker.patch(
+        "learning_resources.etl.utils.tika_parser.from_buffer",
+        return_value=mock_response,
+    )
+    response = utils.extract_text_metadata(data, other_headers=headers)
+
+    expected_headers = {"X-Tika-PDFOcrStrategy": ocr_strategy} if ocr_strategy else {}
+    expected_options = {"timeout": 120, "verify": True}
+
+    if token:
+        expected_headers["X-Access-Token"] = token
+    if headers:
+        expected_headers = {**expected_headers, **headers}
+    expected_options["headers"] = expected_headers
+
+    if data:
+        assert response == mock_response
+        mock_tika.assert_called_once_with(data, requestOptions=expected_options)
+    else:
+        assert response is None
+        mock_tika.assert_not_called()
+
+
+@pytest.mark.parametrize("content", ["text", None])
+def test_extract_text_from_url(mocker, content):
+    """extract_text_from_url should make appropriate requests and calls to extract_text_metadata"""
+    mime_type = "application/pdf"
+    url = "http://test.edu/file.pdf"
+    mock_request = mocker.patch(
+        "learning_resources.etl.utils.requests.get",
+        return_value=mocker.Mock(content=content, is_redirect=False),
+    )
+    mock_extract = mocker.patch("learning_resources.etl.utils.extract_text_metadata")
+    utils.extract_text_from_url(url, mime_type=mime_type)
+
+    mock_request.assert_called_once_with(url, timeout=30, allow_redirects=False)
+    if content:
+        mock_extract.assert_called_once_with(
+            content, other_headers={"Content-Type": mime_type}
+        )
+
+
+def test_extract_text_from_url_refuses_redirect(mocked_responses):
+    """extract_text_from_url should not follow a redirect off the requested host"""
+    url = "https://abc.cloudfront.net/a.vtt"
+    mocked_responses.get(
+        url, status=302, headers={"Location": "http://169.254.169.254/latest/"}
+    )
+
+    with pytest.raises(requests.HTTPError):
+        utils.extract_text_from_url(url)
+
+
+@pytest.mark.parametrize(
+    ("text", "readable_id"),
+    [
+        (
+            "The cat sat on the mat",
+            "the-cat-sat-on-the-mat65e998f1508038ccb0e8afbb2fe10b7b",
+        ),
+        (
+            "the dog chased a hog",
+            "the-dog-chased-a-hog0adcc86118883d4b8bf121c4a0e036d6",
+        ),
+    ],
+)
+def test_generate_readable_id(text, readable_id):
+    """Test that the same readable_id is always created for a given string"""
+    assert utils.generate_readable_id(text) == readable_id
+
+
+def test_strip_extra_whitespace():
+    """Test that extra whitespace is removed from text"""
+    text = " This\n\n is      a\t\ttest. "
+    assert utils.strip_extra_whitespace(text) == "This is a test."
+
+
+def test_parse_dates():
+    """Test that parse_dates returns correct dates"""
+    for datestring in ("May 13-30, 2020", "May 13 - 30,2020"):
+        assert utils.parse_dates(datestring) == (
+            datetime.datetime(2020, 5, 13, 12, tzinfo=datetime.UTC),
+            datetime.datetime(2020, 5, 30, 12, tzinfo=datetime.UTC),
+        )
+    for datestring in ("Jun 24-Aug 11, 2020", "Jun  24 -  Aug 11,    2020"):
+        assert utils.parse_dates(datestring) == (
+            datetime.datetime(2020, 6, 24, 12, tzinfo=datetime.UTC),
+            datetime.datetime(2020, 8, 11, 12, tzinfo=datetime.UTC),
+        )
+    for datestring in ("Nov 25, 2020-Jan 26, 2021", "Nov 25,2020  -Jan   26,2021"):
+        assert utils.parse_dates(datestring) == (
+            datetime.datetime(2020, 11, 25, 12, tzinfo=datetime.UTC),
+            datetime.datetime(2021, 1, 26, 12, tzinfo=datetime.UTC),
+        )
+    assert utils.parse_dates("This is not a date") is None
+
+
+@pytest.mark.parametrize("has_metadata", [True, False])
+@pytest.mark.parametrize("matching_edx_module_id", [True, False])
+@pytest.mark.parametrize("overwrite", [True, False])
+@pytest.mark.parametrize("folder", ["folder", "static"])
+@pytest.mark.parametrize("tika_content", ["tika'ed text", ""])
+def test_transform_content_files(  # noqa: PLR0913
+    mocker,
+    folder,
+    has_metadata,
+    matching_edx_module_id,
+    overwrite,
+    tika_content,
+    settings,
+):
+    """transform_content_files"""
+    settings.SKIP_TIKA = False
+    run = LearningResourceRunFactory.create(published=True)
+    document = "some text in the document"
+    file_extension = ".pdf" if folder == "static" else ".html"
+    content_type = "course"
+    archive_checksum = "7s35721d1647f962d59b8120a52210a7"
+    metadata = {"title": "the title of the course"} if has_metadata else None
+    tika_output = {"content": tika_content, "metadata": metadata}
+
+    if folder == "static":
+        edx_module_id = (
+            f"asset-v1:{run.run_id.replace('course-v1:', '')}+type@asset+block@uuid.pdf"
+        )
+    else:
+        edx_module_id = (
+            f"block-v1:{run.run_id.replace('course-v1:', '')}+type@folder+block@uuid"
+        )
+
+    if matching_edx_module_id:
+        ContentFileFactory.create(
+            content="existing content",
+            content_title=metadata["title"] if metadata else "",
+            content_type=content_type,
+            published=True,
+            run=run,
+            archive_checksum=archive_checksum,
+            key=edx_module_id,
+        )
+
+    documents_mock = mocker.patch(
+        "learning_resources.etl.utils.documents_from_olx",
+        return_value=[
+            (
+                document,
+                {
+                    "content_type": content_type,
+                    "archive_checksum": archive_checksum,
+                    "file_extension": file_extension,
+                    "source_path": f"root/{folder}/uuid{file_extension}",
+                },
+            )
+        ],
+    )
+    extract_mock = mocker.patch(
+        "learning_resources.etl.utils.extract_text_metadata", return_value=tika_output
+    )
+
+    # Mock the video metadata and URL lookup process_olx_path uses
+    video_metadata = {"test": "video"}
+    test_url = "https://example.com/test"
+
+    mocker.patch(
+        "learning_resources.etl.olx.OlxArchive.video_metadata",
+        return_value=video_metadata,
+    )
+    mocker.patch(
+        "learning_resources.etl.utils.get_url_from_module_id", return_value=test_url
+    )
+
+    script_dir = (pathlib.Path(__file__).parent.absolute()).parent.parent
+
+    with utils.unpacked_course_archive(
+        pathlib.Path(script_dir, "test_json", "exported_courses_12345.tar.gz"), run
+    ) as archive:
+        content = list(utils.transform_content_files(archive, run, overwrite=overwrite))
+
+    if tika_content or (matching_edx_module_id and not overwrite):
+        assert content == [
+            {
+                "content": "existing content"
+                if (matching_edx_module_id and not overwrite)
+                else tika_output["content"],
+                "title": metadata["title"] if has_metadata else "Uuid",
+                "key": edx_module_id,
+                "release_date": None,
+                "published": True,
+                "content_title": metadata["title"] if has_metadata else "",
+                "content_type": content_type,
+                "archive_checksum": archive_checksum,
+                "file_extension": file_extension,
+                "source_path": f"root/{folder}/uuid{file_extension}",
+                "edx_module_id": edx_module_id,
+                "url": test_url,
+            }
+        ]
+    else:
+        assert content == []
+
+    if matching_edx_module_id and not overwrite:
+        extract_mock.assert_not_called()
+    else:
+        extract_mock.assert_called_once_with(document, other_headers={})
+    assert documents_mock.called is True
+
+
+def test_documents_from_olx():
+    """documents_from_olx reads the bytes and metadata of each archive path"""
+    parsed_documents = get_olx_test_docs()
+    # the asset manifests, course settings and about page are excluded,
+    # everything else is yielded
+    assert len(parsed_documents) == 85
+    assert not [
+        doc
+        for doc in parsed_documents
+        if "/policies/" in doc[1]["source_path"]
+        or "/about/" in doc[1]["source_path"]
+        or doc[1]["source_path"].endswith("assets/assets.xml")
+    ]
+
+    formula2do = next(
+        doc
+        for doc in parsed_documents
+        if doc[1]["source_path"].endswith("formula2do.xml")
+    )
+    assert formula2do[0] == b'<html filename="formula2do" display_name="To do list"/>\n'
+    assert formula2do[1]["source_path"].endswith("formula2do.xml")
+    assert formula2do[1]["content_type"] == CONTENT_TYPE_FILE
+    assert formula2do[1]["mime_type"].endswith("/xml")
+
+
+@pytest.mark.parametrize(
+    ("etl_source", "expected_setting"),
+    [
+        (ETLSource.xpro.name, "XPRO_COURSE_BUCKET_PREFIX"),
+        (ETLSource.mitxonline.name, "MITX_ONLINE_COURSE_BUCKET_PREFIX"),
+        (ETLSource.oll.name, "OLL_COURSE_BUCKET_PREFIX"),
+        (ETLSource.canvas.name, "CANVAS_COURSE_BUCKET_PREFIX"),
+    ],
+)
+def test_get_s3_prefix_for_source(settings, etl_source, expected_setting):
+    """Test that get_s3_prefix_for_source returns correct prefix for each ETL source"""
+    expected_prefix = getattr(settings, expected_setting)
+    assert get_s3_prefix_for_source(etl_source) == expected_prefix
+
+
+@pytest.mark.parametrize(
+    "invalid_source",
+    [
+        "invalid_source",
+        "ocw",  # OCW is not in the mapping
+        "",
+        "MITX_ONLINE",  # wrong case
+    ],
+)
+def test_get_s3_prefix_for_source_invalid(invalid_source):
+    """Test that get_s3_prefix_for_source raises ValueError for invalid sources"""
+    with pytest.raises(
+        ValueError, match=f"No S3 prefix found for ETL source: {invalid_source}"
+    ):
+        get_s3_prefix_for_source(invalid_source)
+
+
+def test_get_bucket_by_name(aws_settings, mock_course_archive_bucket):  # pylint: disable=unused-argument
+    """The correct bucket should be returned by the function"""
+    assert utils.get_bucket_by_name(aws_settings.COURSE_ARCHIVE_BUCKET_NAME) == (
+        mock_course_archive_bucket.bucket
+    )
+
+
+@pytest.mark.parametrize(
+    ("readable_id", "is_ocw", "dept_ids"),
+    [
+        ("MITx+7.03.2x", False, ["7"]),
+        ("course-v1:MITxT+21A.819.2x", False, ["21A"]),
+        ("11.343", True, ["11"]),
+        ("21W.202", True, ["CMS-W"]),
+        ("21H.331", True, ["21H"]),
+        ("course-v1:MITxT+123.658.2x", False, []),
+        ("MITx+CITE101x", False, []),
+        ("RanD0mStr1ng", False, []),
+    ],
+)
+def test_extract_valid_department_from_id(readable_id, is_ocw, dept_ids):
+    """Test that correct department is extracted from ID"""
+    assert (
+        utils.extract_valid_department_from_id(readable_id, is_ocw=is_ocw) == dept_ids
+    )
+
+
+def test_most_common_topics():
+    """Test that most_common_topics returns the correct topics"""
+    max_topics = 4
+    common_topics = [
+        LearningResourceTopicFactory.create(name=f"Topic {number}")
+        for number in range(997, 1001)
+    ]
+    uncommon_topics = LearningResourceTopicFactory.create_batch(3)
+    resources = []
+    for topic in common_topics:
+        resources.extend(LearningResourceFactory.create_batch(2, topics=[topic]))
+    resources.extend(
+        [LearningResourceFactory.create(topics=[topic]) for topic in uncommon_topics]
+    )
+    assert {
+        topic["name"]
+        for topic in utils.most_common_topics(resources, max_topics=max_topics)
+    } == {topic.name for topic in common_topics}
+
+
+@pytest.mark.parametrize(
+    ("original", "expected"),
+    [
+        (None, LearningResourceDelivery.online.name),
+        (LearningResourceDelivery.online.value, LearningResourceDelivery.online.name),
+        ("Blended", LearningResourceDelivery.hybrid.name),
+        ("In person", LearningResourceDelivery.in_person.name),
+    ],
+)
+def test_parse_format(original, expected):
+    """parse_format should return expected format"""
+    assert utils.transform_delivery(original) == [expected]
+
+
+def test_parse_bad_format(mocker):
+    """An exception log should be called for invalid formats"""
+    mock_log = mocker.patch("learning_resources.etl.utils.log.exception")
+    assert utils.transform_delivery("bad_format") == [
+        LearningResourceDelivery.online.name
+    ]
+    mock_log.assert_called_once_with("Invalid delivery %s", "bad_format")
+
+
+@pytest.mark.parametrize(
+    ("offered_by", "status", "enrollment_modes", "has_cert"),
+    [
+        (
+            OfferedBy.ocw.name,
+            RunStatus.archived.value,
+            [{"mode_slug": "verified"}, {"mode_slug": "audit"}],
+            False,
+        ),
+        (
+            OfferedBy.ocw.name,
+            RunStatus.current.value,
+            [{"mode_slug": "verified"}, {"mode_slug": "audit"}],
+            False,
+        ),
+        (
+            OfferedBy.mitx.name,
+            RunStatus.archived.value,
+            [{"mode_slug": "verified"}, {"mode_slug": "audit"}],
+            False,
+        ),
+        (
+            OfferedBy.mitx.name,
+            RunStatus.current.value,
+            [{"mode_slug": "verified"}, {"mode_slug": "audit"}],
+            True,
+        ),
+        (
+            OfferedBy.mitx.name,
+            RunStatus.upcoming.value,
+            [{"mode_slug": "verified"}, {"mode_slug": "audit"}],
+            True,
+        ),
+        (
+            OfferedBy.mitx.name,
+            RunStatus.current.value,
+            [{"mode_slug": "audit"}],
+            False,
+        ),
+        (
+            OfferedBy.mitx.name,
+            RunStatus.current.value,
+            [{"mode_slug": "verified"}],
+            True,
+        ),
+        (
+            OfferedBy.mitx.name,
+            RunStatus.current.value,
+            [],
+            False,
+        ),
+        (
+            OfferedBy.mitx.name,
+            RunStatus.current.value,
+            None,
+            True,
+        ),
+    ],
+)
+def test_parse_certification(offered_by, status, enrollment_modes, has_cert):
+    """The parse_certification function should return the expected bool value"""
+    offered_by_obj = LearningResourceOfferorFactory.create(code=offered_by)
+
+    resource = LearningResourceRunFactory.create(
+        learning_resource=LearningResourceFactory.create(
+            published=True,
+            resource_type=LearningResourceType.podcast.name,
+            offered_by=offered_by_obj,
+        ),
+    ).learning_resource
+    assert resource.runs.count() == 1
+    runs = [
+        {
+            "status": status,
+            **(
+                {"enrollment_modes": enrollment_modes}
+                if enrollment_modes is not None
+                else {}
+            ),
+            **run,
+        }
+        for run in resource.runs.all().values()
+    ]
+    assert parse_certification(offered_by_obj.code, runs) == has_cert
+
+
+def test_parse_certification_handles_explicit_none_enrollment_modes():
+    """A run with enrollment_modes=None should not error and should be treated as cert-eligible for MITx."""
+    runs = [
+        {
+            "published": True,
+            "status": RunStatus.current.value,
+            "enrollment_modes": None,
+        }
+    ]
+
+    assert parse_certification(OfferedBy.mitx.name, runs) is True
+
+
+def test_strip_enrollment_modes():
+    """strip_enrollment_modes should remove enrollment_modes from all run dicts."""
+    runs = [
+        {"status": "current", "enrollment_modes": [{"mode_slug": "verified"}]},
+        {"status": "current"},
+        {"status": "current", "enrollment_modes": None},
+    ]
+    strip_enrollment_modes(runs)
+    assert all("enrollment_modes" not in run for run in runs)
+
+
+@pytest.mark.parametrize(
+    ("previous_archive", "identical"),
+    [
+        ("test_json/course-v1:MITxT+8.01.3x+3T2022_no_change.tar.gz", True),
+        ("test_json/course-v1:MITxT+8.01.3x+3T2022_minor_change.tar.gz", False),
+    ],
+)
+def test_calc_checksum(previous_archive, identical):
+    """
+    calc_checksum should be able to accurately identify identical vs different archives.
+    All 3 tar.gz files created on OSX from the same directory.  One archive has a minor
+    text change in one file, "400" to "500".
+    """
+    reference_checksum = utils.calc_checksum(
+        "test_json/course-v1:MITxT+8.01.3x+3T2022.tar.gz"
+    )
+    assert (utils.calc_checksum(previous_archive) == reference_checksum) is identical
+
+
+@pytest.mark.parametrize(
+    ("dept_name", "dept_id"), [("Biology", "7"), ("Metaphysics", None)]
+)
+def test_get_department_id_by_name(dept_name, dept_id):
+    """Test that the correct department ID (if any) is returned"""
+    assert utils.get_department_id_by_name(dept_name) == dept_id
+
+
+@pytest.mark.parametrize(
+    ("duration_str", "expected"),
+    [
+        ("1:00:00", "PT1H"),
+        ("1:30:04", "PT1H30M4S"),
+        ("00:00", "PT0S"),
+        ("00:00:00", "PT0S"),
+        ("00:01:00", "PT1M"),
+        ("01:00:00", "PT1H"),
+        ("00:00:01", "PT1S"),
+        ("02:59", "PT2M59S"),
+        ("72:59", "PT1H12M59S"),
+        ("3675", "PT1H1M15S"),
+        ("5", "PT5S"),
+        ("PT1H30M4S", "PT1H30M4S"),
+        ("", None),
+        (None, None),
+        ("bad_duration", None),
+        ("PTBarnum", None),
+    ],
+)
+def test_parse_duration(mocker, duration_str, expected):
+    """Test that parse_duration returns the expected duration"""
+    mock_warn = mocker.patch("learning_resources.etl.utils.log.warning")
+    assert utils.iso8601_duration(duration_str) == expected
+    assert mock_warn.call_count == (1 if duration_str and expected is None else 0)
+
+
+@pytest.mark.parametrize(
+    ("amount", "currency", "valid_currency"),
+    [
+        (410.52, "EUR", True),
+        (100.00, "USD", True),
+        (200.00, "YYY", False),
+    ],
+)
+def test_transform_price(amount, currency, valid_currency):
+    """Test that transform_price returns the expected price"""
+    assert utils.transform_price(Decimal(amount), currency) == {
+        "amount": amount,
+        "currency": currency if valid_currency else CURRENCY_USD,
+    }
+
+
+def test_text_from_srt_content():
+    """Test that text_from_srt_content returns expected text"""
+    srt_content = (
+        "1\n"
+        "00:00:00,000 --> 00:00:02,000\n"
+        "This is the first subtitle."
+        "\n"
+        "2\n"
+        "00:00:02,000 --> 00:00:04,000\n"
+        "This is the second subtitle."
+    )
+    assert utils.text_from_srt_content(srt_content) == (
+        "This is the first subtitle.\nThis is the second subtitle."
+    )
+
+
+def test_text_from_sjson_content():
+    """Test that text_from_sjson_content returns expected text"""
+    sjson_content = """
+        {
+            "start": [0,2],
+            "end": [2,4],
+            "text": ["This is the first subtitle.",
+                 "This is the second subtitle."
+            ]
+        }
+    """
+    assert utils.text_from_sjson_content(sjson_content) == (
+        "This is the first subtitle. This is the second subtitle."
+    )
+
+
+@pytest.mark.parametrize(
+    ("hour", "expected"), [("3", 3), (2, 2), ("", None), ("one", None)]
+)
+def test_parse_string_to_int(hour, expected):
+    """Test that the weekly hours are correctly parsed"""
+    assert parse_string_to_int(hour) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "min_weeks", "max_weeks"),
+    [
+        ("3 Days", 1, 1),  # <= 5 days == 1 week
+        ("7 Days", 2, 2),  # >7 days = 2 weeks
+        ("4 to 8 Days", 1, 2),
+        ("3-4 Weeks, no weekends", 3, 4),
+        ("5 - 6 MoNths", 20, 24),
+        ("1 WEEK", 1, 1),
+        ("1 month more or less", 4, 4),
+        ("2-3 meses", 8, 12),  # 2-3 months in Spanish
+        ("1 mes", 4, 4),  # 1 month in Spanish
+        ("1 semana", 1, 1),  # 1 week in Spanish
+        ("2 - 3 semanas", 2, 3),
+        ("Unparseable duration", None, None),
+        ("", None, None),
+        ("2 days in person+3 live webinars", 1, 1),
+        ("2 weeks in person+3 live webinars", 2, 2),
+    ],
+)
+def test_parse_resource_duration(raw_value, min_weeks, max_weeks):
+    """Test that parse_resource_duration returns the expected min/max weeks"""
+    assert utils.parse_resource_duration(raw_value) == DurationConfig(
+        duration=raw_value, min_weeks=min_weeks, max_weeks=max_weeks
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "min_hours", "max_hours"),
+    [
+        ("5 Hours", 5, 5),
+        ("3-4 Hours per Week", 3, 4),
+        ("15 - 16 Hours per Week", 15, 16),
+        ("5-8 hrs per week", 5, 8),
+        ("5 - 10", 5, 10),
+        ("5 to 10", 5, 10),
+        ("6 horas", 6, 6),
+        ("1 hour", 1, 1),
+        ("1 hora", 1, 1),
+        ("", None, None),
+    ],
+)
+def test_parse_resource_commitment(raw_value, min_hours, max_hours):
+    """Test that parse_resource_commitment returns the expected min/max hours"""
+    assert utils.parse_resource_commitment(raw_value) == CommitmentConfig(
+        commitment=raw_value, min_weekly_hours=min_hours, max_weekly_hours=max_hours
+    )
+
+
+@pytest.mark.parametrize(
+    ("uuid_string", "expected"),
+    [
+        ("550e8400-e29b-41d4-a716-446655440000", True),
+        ("123e4567e89b12d3a456426614174000", True),
+        ("not-a-uuid", False),
+        ("", False),
+        ("123", False),
+        ("550e8400-e29b-41d4-a716", False),  # too short
+        ("550e8400e29b41d4a71644665544000g", False),  # invalid character
+    ],
+)
+def test_is_valid_uuid(uuid_string, expected):
+    """Test that is_valid_uuid correctly validates UUID strings"""
+    assert utils.is_valid_uuid(uuid_string) == expected
+
+
+@pytest.mark.parametrize(
+    (
+        "etl_source",
+        "module_id",
+        "has_video_meta",
+        "expected_url_pattern",
+    ),
+    [
+        # Asset URLs
+        (
+            "mitxonline",
+            "asset-v1:test+type@asset+block@image.png",
+            False,
+            "https://mitxonline.org/asset-v1:test+type@asset+block@image.png",
+        ),
+        (
+            "mitxonline",
+            "asset-v1:test+type@asset+block@video.mp4",
+            False,
+            "https://mitxonline.org/asset-v1:test+type@asset+block@video.mp4",
+        ),
+        (
+            "mitxonline",
+            "asset-v1:test+type@asset+block@transcript.srt",
+            True,
+            "https://mitxonline.org/courses/course-v1:test_run/jump_to_id/test_video",
+        ),
+        (
+            "mitxonline",
+            "asset-v1:test+type@asset+block@transcript.srt",
+            False,
+            "https://mitxonline.org/asset-v1:test+type@asset+block@transcript.srt",
+        ),  # SRT without video meta returns asset URL
+        # Block URLs with valid UUID
+        (
+            "mitxonline",
+            "block-v1:test+type@html+block@550e8400-e29b-41d4-a716-446655440000",
+            False,
+            "https://mitxonline.org/courses/course-v1:test_run/jump_to_id/550e8400-e29b-41d4-a716-446655440000",
+        ),
+        # OLL source with run_id modification
+        (
+            "oll",
+            "block-v1:test+type@html+block@550e8400-e29b-41d4-a716-446655440000",
+            False,
+            "https://oll.org/courses/course-v1:course-v1:test_run/jump_to_id/550e8400-e29b-41d4-a716-446655440000",
+        ),
+        # Invalid cases
+        (
+            "",
+            "asset-v1:test+type@asset+block@file.txt",
+            False,
+            "None/asset-v1:test+type@asset+block@file.txt",
+        ),  # Empty etl_source returns None as root_url
+        (
+            "mitxonline",
+            "block-v1:test+type@html+block@invalid-uuid",
+            False,
+            None,
+        ),  # Invalid UUID
+        ("mitxonline", "unknown-format", False, None),  # Unknown format
+    ],
+)
+def test_get_url_from_module_id(
+    settings,
+    etl_source,
+    module_id,
+    has_video_meta,
+    expected_url_pattern,
+):
+    """Test that get_url_from_module_id generates correct URLs for different module types"""
+    # Setup settings
+    settings.CONTENT_BASE_URL_MITXONLINE = "https://mitxonline.org"
+    settings.CONTENT_BASE_URL_OLL = "https://oll.org"
+
+    run = LearningResourceRunFactory.create(
+        run_id="course-v1:test_run", learning_resource__etl_source=etl_source
+    )
+
+    # Setup metadata
+    video_srt_metadata = (
+        {
+            "asset-v1:test+type@asset+block@transcript.srt": {
+                "module_id": "block-v1:test+type@video+block@test_video"
+            }
+        }
+        if has_video_meta
+        else None
+    )
+
+    result = utils.get_url_from_module_id(module_id, run, video_srt_metadata)
+
+    if expected_url_pattern:
+        assert result == expected_url_pattern
+    else:
+        assert result is None
+
+
+def test_process_olx_path_malformed_sjson(mocker, settings):
+    """Test that process_olx_path handles malformed SJSON content gracefully"""
+    run = LearningResourceRunFactory.create(run_id="course-v1:test_run")
+    olx_path = mocker.Mock()
+    olx_path.__str__ = mocker.Mock(return_value="path/to/malformed_content.sjson")
+
+    malformed_sjson_content = """{ "start": [0,2], "end": [2,4], "text": ["Valid text", "Another valid text" }"""
+    metadata = {
+        "content_type": CONTENT_TYPE_FILE,
+        "archive_checksum": "checksum123",
+        "file_extension": ".sjson",
+        "source_path": "path/to/malformed_content.sjson",
+    }
+    mocker.patch(
+        "learning_resources.etl.utils.documents_from_olx",
+        return_value=[
+            (
+                malformed_sjson_content.encode("utf-8"),
+                metadata,
+            ),
+        ],
+    )
+    tika_output = {
+        "content": malformed_sjson_content.encode("utf-8"),
+        "metadata": metadata,
+    }
+    mocker.patch(
+        "learning_resources.etl.utils.extract_text_metadata", return_value=tika_output
+    )
+
+    script_dir = (pathlib.Path(__file__).parent.absolute()).parent.parent
+
+    with utils.unpacked_course_archive(
+        pathlib.Path(script_dir, "test_json", "exported_courses_12345.tar.gz"), run
+    ) as archive:
+        content = list(utils.transform_content_files(archive, run, overwrite=True))
+    # Since the SJSON is malformed, no content should be returned
+    assert content == []
+
+
+def test_process_olx_path_encrypted_pdf(mocker, settings, tmp_path):
+    """
+    Test that process_olx_path records encrypted PDFs as failures and skips them
+    """
+    settings.OCR_MODEL = "test_model"
+    settings.SKIP_TIKA = False
+
+    run = LearningResourceRunFactory.create()
+    olx_path = tmp_path / "course"
+    olx_path.mkdir()
+
+    # Create the file so stat() works
+    source_rel_path = "static/encrypted.pdf"
+    full_path = olx_path / source_rel_path
+    full_path.parent.mkdir(parents=True, exist_ok=True)
+    full_path.write_bytes(b"fake pdf content")
+    tika_from_buffer_mock = mocker.patch(
+        "learning_resources.etl.utils.tika_parser.from_buffer",
+    )
+
+    # Mock documents_from_olx to yield this file
+    mocker.patch(
+        "learning_resources.etl.utils.documents_from_olx",
+        return_value=[
+            (
+                b"fake pdf content",
+                {
+                    "content_type": CONTENT_TYPE_FILE,
+                    "mime_type": "application/pdf",
+                    "archive_checksum": "checksum",
+                    "file_extension": ".pdf",
+                    "source_path": source_rel_path,
+                },
+            )
+        ],
+    )
+
+    # the course has no video directory, so no transcript metadata is needed
+    mocker.patch(
+        "learning_resources.etl.utils.get_url_from_module_id",
+        return_value="http://example.com",
+    )
+    mock_log = mocker.patch("learning_resources.etl.utils.log")
+
+    # Mock PdfReader to raise FileNotDecryptedError
+    mocker.patch(
+        "learning_resources.etl.utils.PdfReader",
+        side_effect=pypdf.errors.FileNotDecryptedError,
+    )
+
+    failed = []
+    results = list(
+        utils.process_olx_path(
+            str(olx_path),
+            run,
+            overwrite=True,
+            use_ocr=True,
+            failed_source_paths=failed,
+        )
+    )
+
+    assert len(results) == 0
+    assert failed == [source_rel_path]
+    mock_log.exception.assert_called_with(
+        "Extraction failed for %s in run %s, skipping file", source_rel_path, run.id
+    )
+    tika_from_buffer_mock.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    (
+        "content",
+        "source_path",
+        "edx_module_id",
+        "video_srt_metadata",
+        "mock_xml_content",
+        "expected_title",
+    ),
+    [
+        (
+            "some content",
+            "path/to/vid.srt",
+            "asset-v1:mit+course+video+block@vid",
+            {"asset-v1:mit+course+video+block@vid": {"title": "Video Title"}},
+            None,
+            "Video Title",
+        ),
+        (
+            '<html display_name="XML Title"/>',
+            "path/to/doc.xml",
+            "block-v1:mit+course+type@xml+block@doc",
+            None,
+            None,
+            "XML Title",
+        ),
+        (
+            "<html><body>Content</body></html>",
+            "html/doc.html",
+            "block-v1:mit+course+type@html+block@doc",
+            None,
+            '<html display_name="HTML via XML Title"/>',
+            "HTML via XML Title",
+        ),
+        (
+            "<html><head><title>HTML Tag Title</title></head><body>Content</body></html>",
+            "html/doc.html",
+            "block-v1:mit+course+type@html+block@doc",
+            None,
+            None,
+            "HTML Tag Title",
+        ),
+        (
+            "<html><body>Content</body></html>",
+            "html/my-file-name.html",
+            "block-v1:mit+course+type@html+block@my-file-name",
+            None,
+            None,
+            "My File Name",
+        ),
+    ],
+)
+def test_get_title_for_content(  # noqa: PLR0913
+    tmp_path,
+    content,
+    source_path,
+    edx_module_id,
+    video_srt_metadata,
+    mock_xml_content,
+    expected_title,
+):
+    """Test get_title_for_content for various scenarios"""
+    olx_path = tmp_path / "course"
+    olx_path.mkdir()
+
+    if mock_xml_content:
+        # Create corresponding XML file
+        xml_dir = olx_path / "html"
+        xml_dir.mkdir(parents=True, exist_ok=True)
+        xml_file = xml_dir / f"{pathlib.Path(source_path).stem}.xml"
+        xml_file.write_text(mock_xml_content)
+
+    title = utils.get_title_for_content(
+        content,
+        str(olx_path),
+        source_path,
+        edx_module_id,
+        video_srt_metadata,
+    )
+
+    assert title == expected_title
+
+
+def test_extract_content_ocr_fallback_to_tika(mocker, settings, tmp_path):
+    """
+    Test that _extract_content falls back to Tika if OCR extraction returns None.
+    """
+    settings.OCR_MODEL = "test_model"
+    settings.SKIP_TIKA = False
+
+    olx_path = tmp_path / "course"
+    olx_path.mkdir()
+
+    source_rel_path = "static/test.pdf"
+    file_path = olx_path / source_rel_path
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+
+    file_path.write_bytes(b"fake pdf content")
+
+    metadata = {
+        "content_type": CONTENT_TYPE_FILE,
+        "mime_type": "application/pdf",
+        "archive_checksum": "checksum",
+        "file_extension": ".pdf",
+        "source_path": source_rel_path,
+        "title": "Tika Title",
+    }
+
+    document = b"fake pdf content"
+    mocker.patch("learning_resources.etl.utils.pdf_is_valid", return_value=True)
+    mock_should_use_ocr = mocker.patch(
+        "learning_resources.etl.utils._should_use_ocr", return_value=True
+    )
+    mock_extract_ocr = mocker.patch(
+        "learning_resources.etl.utils._extract_content_with_ocr", return_value=None
+    )
+    mock_extract_tika = mocker.patch(
+        "learning_resources.etl.utils._extract_content_with_tika",
+        return_value={"content": "tika content", "content_title": "Tika Title"},
+    )
+
+    result = utils._extract_content(  # noqa: SLF001
+        document,
+        metadata,
+        str(olx_path),
+        "test_key",
+        use_ocr=True,
+    )
+
+    mock_should_use_ocr.assert_called_once_with(
+        file_extension=".pdf", file_path=file_path, use_ocr=True
+    )
+    mock_extract_ocr.assert_called_once_with(file_path, False)  # noqa: FBT003
+    mock_extract_tika.assert_called_once_with(
+        document, "application/pdf", ".pdf", "test_key"
+    )
+
+    assert result == {"content": "tika content", "content_title": "Tika Title"}
+
+
+def test_extract_content_ocr_failure_falls_back_to_tika(
+    mocker, settings, tmp_path, caplog
+):
+    """An OCR crash (e.g. missing converter output JSON) should fall through to tika"""
+    settings.SKIP_TIKA = False
+    mocker.patch("learning_resources.etl.utils._should_use_ocr", return_value=True)
+    mocker.patch(
+        "learning_resources.etl.utils._extract_content_with_ocr",
+        side_effect=FileNotFoundError("no converter output json"),
+    )
+    mocker.patch(
+        "learning_resources.etl.utils.extract_text_metadata",
+        return_value={"content": "tika text", "metadata": {"title": "doc title"}},
+    )
+    result = utils._extract_content(  # noqa: SLF001
+        b"pdf bytes",
+        {
+            "source_path": "web_resources/7.06_Fall2025_Exam1_answers.pdf",
+            "file_extension": ".pdf",
+            "mime_type": "application/pdf",
+        },
+        str(tmp_path),
+        "test-key",
+        use_ocr=True,
+    )
+    assert result["content"] == "tika text"
+    ocr_records = [r for r in caplog.records if "OCR extraction failed" in r.message]
+    assert ocr_records
+    assert all(r.levelname == "WARNING" for r in ocr_records)
+
+
+# an extraction that raises is recorded as failed; one Tika gave nothing back
+# for is only skipped
+EXTRACTION_FAILURES = [
+    pytest.param(
+        {"side_effect": RuntimeError("converter output missing")}, True, id="raise"
+    ),
+    pytest.param({"return_value": None}, False, id="none"),
+]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(("failure", "recorded"), EXTRACTION_FAILURES)
+def test_process_olx_path_skips_failed_files(mocker, tmp_path, failure, recorded):
+    """A failed file is skipped, and recorded if it raised; other files still yield"""
+    run = LearningResourceRunFactory.create()
+    static_dir = tmp_path / "static"
+    static_dir.mkdir()
+    (static_dir / "good.html").write_text("<p>good</p>")
+    (static_dir / "bad.html").write_text("<p>bad</p>")
+    bad = mocker.Mock(**failure)
+
+    def fake_extract(document, metadata, olx_path, key, **kwargs):
+        if "bad.html" in metadata["source_path"]:
+            return bad()
+        return {"content": "text", "content_title": ""}
+
+    mocker.patch(
+        "learning_resources.etl.utils._extract_content", side_effect=fake_extract
+    )
+    failed = []
+    results = list(
+        utils.process_olx_path(
+            str(tmp_path), run, overwrite=True, failed_source_paths=failed
+        )
+    )
+    assert len(results) == 1
+    assert "good.html" in results[0]["source_path"]
+    assert [pathlib.Path(path).name for path in failed] == (
+        ["bad.html"] if recorded else []
+    )
+
+
+@pytest.mark.parametrize(
+    ("etl_source", "ingested"),
+    [(ETLSource.oll.name, True), (ETLSource.mitxonline.name, False)],
+)
+def test_process_olx_path_filters_by_the_runs_platform(
+    mocker, tmp_path, etl_source, ingested
+):
+    """Whether the about page is ingested depends on the platform the run is from"""
+    run = LearningResourceRunFactory.create(learning_resource__etl_source=etl_source)
+    olx = _reference_olx(tmp_path)
+    _write_olx(olx, "about/overview.html", "<p>about</p>")
+    mocker.patch(
+        "learning_resources.etl.utils._extract_content",
+        return_value={"content": "text", "content_title": ""},
+    )
+    paths = [
+        result["source_path"]
+        for result in utils.process_olx_path(str(olx), run, overwrite=True)
+    ]
+    assert any(path.endswith("about/overview.html") for path in paths) is ingested
+
+
+def test_extract_content_invalid_pdf_raises(mocker, settings, tmp_path):
+    """A PDF failing pdf_is_valid raises, so process_olx_path records a failure
+    instead of the old silent drop
+    """
+    settings.SKIP_TIKA = False  # _extract_content short-circuits before pdf_is_valid
+    (tmp_path / "bad.pdf").write_bytes(b"%PDF- not really")
+    mocker.patch("learning_resources.etl.utils.pdf_is_valid", return_value=False)
+
+    with pytest.raises(utils.InvalidPDFError):
+        utils._extract_content(  # noqa: SLF001
+            b"%PDF- not really",
+            {
+                "source_path": "bad.pdf",
+                "file_extension": ".pdf",
+                "mime_type": "application/pdf",
+            },
+            str(tmp_path),
+            "test-key",
+        )
+
+
+def test_documents_from_olx_reads_archive_paths(tmp_path):
+    """documents_from_olx yields exactly the archive's paths, excluded ones dropped"""
+    olx = _reference_olx(tmp_path)
+    _write_olx(
+        olx,
+        "chapter/ch.xml",
+        '<chapter><vertical url_name="v"/>'
+        '<vertical url_name="v_staff" visible_to_staff_only="true"/></chapter>',
+    )
+    _write_olx(
+        olx, "vertical/v_staff.xml", '<vertical><html url_name="h_staff"/></vertical>'
+    )
+    _write_html(olx, "h_staff", "<p>staff only</p>")
+
+    archive = OlxArchive(olx)
+    assert olx / "html/h_staff.html" in archive.excluded
+    documents = list(utils.documents_from_olx(archive))
+    assert len(documents) == len(archive.paths)
+    for (content, meta), path in zip(documents, archive.paths):
+        assert meta["source_path"].endswith(str(path.relative_to(olx)))
+        assert content == path.read_bytes()
+        assert meta["file_extension"] == path.suffix
+
+
+def test_course_units_from_archive(tmp_path):
+    """Units are built from a course tarball"""
+    olx = tmp_path / "course"
+    _write_olx(
+        olx,
+        "course.xml",
+        '<course url_name="run" org="MITx" course="1">'
+        '<chapter><sequential url_name="seq" display_name="Lecture 1">'
+        "<vertical><html><p>hi</p></html></vertical></sequential></chapter></course>",
+    )
+    tarpath = tmp_path / "course.tar.gz"
+    with tarfile.open(tarpath, "w:gz") as tar:
+        tar.add(olx, arcname="course")
+    run = LearningResourceRunFactory.create()
+
+    units = utils.course_units_from_archive(tarpath, run)
+
+    assert [unit["title"] for unit in units] == ["Lecture 1", "Course context"]
+
+
+def test_course_units_from_archive_raises_for_missing_block(tmp_path):
+    """A course whose outline names a missing block file raises"""
+    olx = tmp_path / "course"
+    _write_olx(olx, "course.xml", '<course url_name="run" org="MITx" course="1"/>')
+    tarpath = tmp_path / "course.tar.gz"
+    with tarfile.open(tarpath, "w:gz") as tar:
+        tar.add(olx, arcname="course")
+
+    with pytest.raises(ValueError):  # noqa: PT011
+        utils.course_units_from_archive(tarpath, LearningResourceRunFactory.create())
+
+
+def test_unpacked_course_archive(tmp_path):
+    """The archive is unpacked for the block and removed after it"""
+    olx = tmp_path / "course"
+    _write_olx(olx, "course.xml", '<course url_name="run" org="MITx" course="1"/>')
+    tarpath = tmp_path / "course.tar.gz"
+    with tarfile.open(tarpath, "w:gz") as tar:
+        tar.add(olx, arcname="course")
+    run = LearningResourceRunFactory.create()
+
+    with utils.unpacked_course_archive(tarpath, run) as archive:
+        assert archive.is_olx
+        assert archive.etl_source == run.learning_resource.etl_source
+
+    assert not archive.root.exists()
+
+
+def test_process_olx_path_rejects_other_file_types(tmp_path):
+    """A shared archive's file types can't be overridden"""
+    archive = OlxArchive(tmp_path)
+
+    with pytest.raises(ValueError):  # noqa: PT011
+        list(
+            utils.process_olx_path(
+                str(tmp_path),
+                LearningResourceRunFactory.create(),
+                overwrite=False,
+                valid_file_types=[".xml"],
+                archive=archive,
+            )
+        )
+
+
+def test_process_olx_path_dates_results_by_key(tmp_path, mocker):
+    """Both foo bar.pdf twins are undated; each html block takes its chapter's start"""
+    run = LearningResourceRunFactory.create(run_id="course-v1:test_run")
+    olx = _dated_olx(tmp_path)
+    for dating in ("dated", "undated"):
+        _write_olx(
+            olx,
+            f"chapter/ch_{dating}.xml",
+            f'<chapter><html url_name="h_{dating}"/></chapter>',
+        )
+    _write_html(olx, "h_dated", '<a href="/static/foo bar.pdf">f</a>')
+    _write_html(olx, "h_undated", '<a href="/static/foo_bar.pdf">f</a>')
+
+    _write_olx(olx, "static/foo bar.pdf", "pdf bytes 1")
+    _write_olx(olx, "static/foo_bar.pdf", "pdf bytes 2")
+
+    mocker.patch(
+        "learning_resources.etl.utils._extract_content",
+        return_value={"content": "text", "content_title": ""},
+    )
+    by_name = {
+        pathlib.Path(result["source_path"]).name: result
+        for result in utils.process_olx_path(str(olx), run, overwrite=True)
+    }
+    assert {
+        name: (by_name[name]["published"], by_name[name]["release_date"])
+        for name in ("foo bar.pdf", "foo_bar.pdf", "h_dated.html", "h_undated.html")
+    } == {
+        "foo bar.pdf": (True, None),
+        "foo_bar.pdf": (True, None),
+        "h_dated.html": (True, START_FUTURE),
+        "h_undated.html": (True, None),
+    }
+
+
+@pytest.mark.parametrize(("failure", "recorded"), EXTRACTION_FAILURES)
+@pytest.mark.parametrize(
+    ("block", "transition"),
+    [
+        # a row whose block is now future-dated takes the date
+        (("ch_dated", ""), (None, START_FUTURE)),
+        # a row whose block lost its date, or whose date moved, follows suit;
+        # the stale pass skips failed keys so nothing else would date it
+        (("ch_undated", ""), (START_FUTURE, None)),
+        (("ch_undated", _start(START_PAST)), (START_FUTURE, START_PAST)),
+    ],
+)
+def test_process_olx_path_dates_rows_whose_extraction_fails(  # noqa: PLR0913
+    tmp_path, mocker, failure, recorded, block, transition
+):
+    """
+    Rows are dated before extraction, so a row whose extraction fails or yields
+    nothing is still dated; published is not touched
+    """
+    chapter, start = block
+    was, expected = transition
+    run = LearningResourceRunFactory.create(run_id="course-v1:test_run")
+    olx = _dated_olx(tmp_path)
+    _write_olx(
+        olx,
+        f"chapter/{chapter}.xml",
+        f'<chapter {start}><html url_name="h"/></chapter>',
+    )
+    _write_html(olx, "h", "<p>text</p>")
+    key = get_edx_module_id("course/html/h.html", run)
+    row = ContentFileFactory.create(run=run, key=key, published=True, release_date=was)
+    mocker.patch("learning_resources.etl.utils._extract_content", **failure)
+    deindex = mocker.patch(
+        "learning_resources_search.tasks.deindex_run_content_files.delay"
+    )
+    remove = mocker.patch(
+        "vector_search.tasks.remove_unpublished_run_content_files.delay"
+    )
+
+    failed = []
+    assert (
+        list(
+            utils.process_olx_path(
+                str(olx), run, overwrite=True, failed_source_paths=failed
+            )
+        )
+        == []
+    )
+
+    assert any(path.endswith("html/h.html") for path in failed) is recorded
+    row.refresh_from_db()
+    assert (row.published, row.release_date) == (True, expected)
+    # a newly hidden row leaves the indexes now, since the post-load reindex
+    # never runs if loading fails
+    hid = expected == START_FUTURE
+    assert deindex.call_args_list == (
+        [mocker.call(run.id, unpublished_only=True)] if hid else []
+    )
+    assert remove.call_args_list == ([mocker.call(run.id)] if hid else [])
+
+
+def test_process_olx_path_tutor_problem_import_leaves_content_files_alone(
+    tmp_path, mocker
+):
+    """A tutor problem import writes TutorProblemFiles, so it reconciles no rows"""
+    run = LearningResourceRunFactory.create(run_id="course-v1:test_run")
+    _write_olx(tmp_path, "problems/set1.py", "print(1)")
+    row = ContentFileFactory.create(
+        run=run,
+        key=get_edx_module_id("problems/set1.py", run),
+        release_date=START_FUTURE,
+    )
+    mocker.patch(
+        "learning_resources.etl.utils._extract_content",
+        return_value={"content": "text", "content_title": ""},
+    )
+
+    results = list(
+        utils.process_olx_path(
+            str(tmp_path),
+            run,
+            overwrite=True,
+            valid_file_types=[".py"],
+            is_tutor_problem_file_import=True,
+        )
+    )
+
+    assert [pathlib.Path(result["source_path"]).name for result in results] == [
+        "set1.py"
+    ]
+    # reconciling would have cleared this row's date
+    row.refresh_from_db()
+    assert row.release_date == START_FUTURE
+
+
+def _key(run, name):
+    """Return the content file key of the archive path course/html/<name>.html"""
+    return get_edx_module_id(f"course/html/{name}.html", run)
+
+
+@pytest.mark.parametrize("published", [True, False])
+def test_reconcile_release_dates(published):
+    """Each row takes its key's date; missing keys, other runs and published are kept"""
+    run = LearningResourceRunFactory.create(run_id="course-v1:test_run")
+    other_run = LearningResourceRunFactory.create(run_id="course-v1:other_run")
+    rows = {
+        name: ContentFileFactory.create(
+            run=run, key=_key(run, name), published=published, release_date=was
+        )
+        for name, was in {
+            "dated_now": None,
+            "redated": START_PAST,
+            "dated_later": None,
+            "undated_now": START_FUTURE,
+            "never_dated": None,
+            "gone": START_FUTURE,
+        }.items()
+    }
+    other = ContentFileFactory.create(
+        run=other_run,
+        key=_key(other_run, "dated_now"),
+        published=published,
+        release_date=START_PAST,
+    )
+
+    hidden = utils.reconcile_release_dates(
+        run,
+        {
+            _key(run, "dated_now"): START_FUTURE,
+            _key(run, "redated"): START_FUTURE,
+            _key(run, "dated_later"): START_LATER,
+            _key(run, "undated_now"): None,
+            _key(run, "never_dated"): None,
+            # a key the run has no row for is nothing to update
+            _key(run, "absent"): START_FUTURE,
+        },
+    )
+
+    for row in (*rows.values(), other):
+        row.refresh_from_db()
+    assert {name: row.release_date for name, row in rows.items()} == {
+        "dated_now": START_FUTURE,
+        "redated": START_FUTURE,
+        "dated_later": START_LATER,
+        "undated_now": None,
+        "never_dated": None,
+        "gone": START_FUTURE,
+    }
+    assert all(row.published is published for row in rows.values())
+    assert (other.published, other.release_date) == (published, START_PAST)
+    # dated_now, redated and dated_later were visible; gone already was hidden
+    assert hidden == (3 if published else 0)
+
+
+def test_reconcile_release_dates_without_dates_clears_the_run(
+    django_assert_num_queries,
+):
+    """An archive that dates nothing leaves no dates behind, in one query"""
+    run = LearningResourceRunFactory.create(run_id="course-v1:test_run")
+    dated = ContentFileFactory.create(run=run, release_date=START_FUTURE)
+    undated = ContentFileFactory.create(run=run, release_date=None)
+
+    with django_assert_num_queries(1):
+        utils.reconcile_release_dates(run, {dated.key: None, undated.key: None})
+
+    dated.refresh_from_db()
+    undated.refresh_from_db()
+    assert (dated.release_date, undated.release_date) == (None, None)

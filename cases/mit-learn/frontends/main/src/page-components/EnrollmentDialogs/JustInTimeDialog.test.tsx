@@ -1,0 +1,721 @@
+import {
+  act,
+  renderWithProviders,
+  screen,
+  setMockResponse,
+  user,
+  waitFor,
+  within,
+} from "@/test-utils"
+import { makeRequest } from "api/test-utils"
+import {
+  urls as mitxUrls,
+  factories as mitxFactories,
+} from "api/mitxonline-test-utils"
+import type { User as MitxUser } from "@mitodl/mitxonline-api-axios/v0"
+import type { PartialDeep } from "type-fest"
+import NiceModal from "@ebay/nice-modal-react"
+import { getDescriptionFor } from "ol-test-utilities"
+import * as Sentry from "@sentry/nextjs"
+import { JustInTimeDialog } from "./JustInTimeDialog"
+
+jest.mock("@sentry/nextjs", () => ({
+  captureMessage: jest.fn(),
+  captureException: jest.fn(),
+}))
+
+const COUNTRIES = [
+  {
+    code: "US",
+    name: "United States",
+    states: [
+      { code: "US-MA", name: "Massachusetts" },
+      { code: "US-NY", name: "New York" },
+    ],
+  },
+  {
+    code: "CA",
+    name: "Canada",
+    states: [{ code: "CA-ON", name: "Ontario" }],
+  },
+  { code: "GB", name: "United Kingdom", states: [] },
+]
+
+const setup = (userOverrides: PartialDeep<MitxUser> = {}) => {
+  const mitxUser = mitxFactories.user.user({
+    legal_address: null,
+    user_profile: null,
+    compliance_missing_fields: ["city", "country", "street_address_1"],
+    ...userOverrides,
+  })
+  setMockResponse.get(mitxUrls.userMe.get(), mitxUser)
+  setMockResponse.get(mitxUrls.countries.list(), COUNTRIES)
+  setMockResponse.patch(mitxUrls.userMe.get(), null)
+  return { mitxUser }
+}
+
+const openDialog = async () => {
+  renderWithProviders(null)
+  await act(async () => {
+    NiceModal.show(JustInTimeDialog)
+  })
+  return screen.findByRole("dialog", { name: "Just a Few More Details" })
+}
+
+const textbox = (dialog: HTMLElement, name: string) =>
+  within(dialog).getByRole("textbox", { name })
+const combobox = (dialog: HTMLElement, name: string) =>
+  within(dialog).getByRole("combobox", { name })
+
+const chooseOption = async (control: HTMLElement, optionName: string) => {
+  await user.click(control)
+  await user.click(await screen.findByRole("option", { name: optionName }))
+}
+
+const patchCalls = () =>
+  jest
+    .mocked(makeRequest)
+    .mock.calls.map(([request]) => request)
+    .filter(
+      ({ method, url }) => method === "patch" && url === mitxUrls.userMe.get(),
+    )
+
+describe("JustInTimeDialog", () => {
+  test("picks up rejected fields when shown again while still mounted", async () => {
+    setup({
+      compliance_missing_fields: [],
+      legal_address: {
+        first_name: "David",
+        last_name: ".",
+        country: "GB",
+        street_address_1: "1 Main St",
+        city: "London",
+      },
+      user_profile: { year_of_birth: 1990 },
+    })
+    renderWithProviders(null)
+    // Opened for missing data first, then re-shown with rejected fields before
+    // the first instance has unmounted (e.g. during its hide transition).
+    await act(async () => {
+      NiceModal.show(JustInTimeDialog)
+    })
+    const dialog = await screen.findByRole("dialog", {
+      name: "Just a Few More Details",
+    })
+    await act(async () => {
+      NiceModal.show(JustInTimeDialog, { rejectedFields: ["last_name"] })
+    })
+
+    const lastName = textbox(dialog, "Last Name")
+    await waitFor(() =>
+      expect(getDescriptionFor(lastName)).toHaveTextContent(
+        "Please enter a valid last name.",
+      ),
+    )
+    await waitFor(() => expect(lastName).toHaveFocus())
+  })
+
+  test("retries in place, updating the highlighted fields until none are rejected", async () => {
+    setup({
+      compliance_missing_fields: [],
+      legal_address: {
+        first_name: "David",
+        last_name: ".",
+        country: "US",
+        street_address_1: "1 Main St",
+        city: "Boston",
+        state: "US-MA",
+        postal_code: "02139",
+      },
+      user_profile: { year_of_birth: 1990 },
+    })
+    const retry = jest
+      .fn()
+      .mockResolvedValueOnce(["postal_code"])
+      .mockResolvedValueOnce([])
+    renderWithProviders(null)
+    let result: Promise<unknown> = Promise.resolve()
+    await act(async () => {
+      result = NiceModal.show(JustInTimeDialog, {
+        rejectedFields: ["last_name"],
+        retry,
+      })
+    })
+    const dialog = await screen.findByRole("dialog", {
+      name: "Just a Few More Details",
+    })
+    const lastName = await waitFor(() => {
+      const input = textbox(dialog, "Last Name")
+      expect(input).toHaveValue(".")
+      return input
+    })
+    await user.clear(lastName)
+    await user.type(lastName, "Cohen")
+    await user.click(within(dialog).getByRole("button", { name: "Submit" }))
+
+    // Still rejected: the same dialog stays open on the newly rejected field.
+    const zipCode = textbox(dialog, "Zip Code")
+    await waitFor(() =>
+      expect(getDescriptionFor(zipCode)).toHaveTextContent(
+        "Please enter a valid zip code.",
+      ),
+    )
+    expect(textbox(dialog, "Last Name")).not.toHaveAccessibleDescription()
+    expect(dialog).toBeInTheDocument()
+    expect(retry).toHaveBeenCalledTimes(1)
+    expect(patchCalls()).toHaveLength(1)
+
+    await user.clear(zipCode)
+    await user.type(zipCode, "02140")
+    await user.click(within(dialog).getByRole("button", { name: "Submit" }))
+
+    await expect(result).resolves.toBe(true)
+    expect(retry).toHaveBeenCalledTimes(2)
+    expect(patchCalls()).toHaveLength(2)
+  })
+
+  test("stays busy while a retry is in flight, even after the saved profile reloads", async () => {
+    const legalAddress = {
+      first_name: "David",
+      last_name: ".",
+      country: "GB",
+      street_address_1: "1 Main St",
+      city: "London",
+    }
+    const { mitxUser } = setup({
+      compliance_missing_fields: [],
+      legal_address: legalAddress,
+      user_profile: { year_of_birth: 1990 },
+    })
+    let finishRetry: (fields: never[]) => void = () => {}
+    const retry = jest.fn(
+      () => new Promise<never[]>((resolve) => (finishRetry = resolve)),
+    )
+    renderWithProviders(null)
+    let result: Promise<unknown> = Promise.resolve()
+    await act(async () => {
+      result = NiceModal.show(JustInTimeDialog, {
+        rejectedFields: ["last_name"],
+        retry,
+      })
+    })
+    const dialog = await screen.findByRole("dialog", {
+      name: "Just a Few More Details",
+    })
+    const lastName = await waitFor(() => {
+      const input = textbox(dialog, "Last Name")
+      expect(input).toHaveValue(".")
+      return input
+    })
+    // The save refetches the profile, which now carries the new name.
+    setMockResponse.get(mitxUrls.userMe.get(), {
+      ...mitxUser,
+      legal_address: { ...mitxUser.legal_address, last_name: "Cohen" },
+    })
+    await user.clear(lastName)
+    await user.type(lastName, "Cohen")
+    await user.click(within(dialog).getByRole("button", { name: "Submit" }))
+    await waitFor(() => expect(retry).toHaveBeenCalledTimes(1))
+    await waitFor(() =>
+      expect(textbox(dialog, "Last Name")).toHaveValue("Cohen"),
+    )
+
+    const cancel = within(dialog).getByRole("button", { name: "Cancel" })
+    expect(cancel).toBeDisabled()
+    expect(
+      within(dialog).getByRole("button", { name: "Submit" }),
+    ).toBeDisabled()
+    await user.keyboard("{Escape}")
+    expect(dialog).toBeInTheDocument()
+
+    await act(async () => finishRetry([]))
+    await expect(result).resolves.toBe(true)
+  })
+
+  test("highlights the fields an enrollment was rejected on", async () => {
+    setup({
+      compliance_missing_fields: [],
+      legal_address: {
+        first_name: "David",
+        last_name: ".",
+        country: "GB",
+        street_address_1: "1 Main St",
+        city: "London",
+      },
+      user_profile: { year_of_birth: 1990 },
+    })
+    renderWithProviders(null)
+    await act(async () => {
+      NiceModal.show(JustInTimeDialog, { rejectedFields: ["last_name"] })
+    })
+    const dialog = await screen.findByRole("dialog", {
+      name: "Just a Few More Details",
+    })
+
+    expect(
+      within(dialog).getByText(
+        "We couldn't verify some of your details. Please check the highlighted fields and try again.",
+      ),
+    ).toBeInTheDocument()
+    const lastName = await waitFor(() => {
+      const input = textbox(dialog, "Last Name")
+      expect(input).toHaveValue(".")
+      return input
+    })
+    expect(getDescriptionFor(lastName)).toHaveTextContent(
+      "Please enter a valid last name.",
+    )
+    expect(textbox(dialog, "First Name")).not.toHaveAccessibleDescription()
+    await waitFor(() => expect(lastName).toHaveFocus())
+  })
+
+  test("shows a rejected postal code even for a country that doesn't collect one", async () => {
+    setup({
+      compliance_missing_fields: [],
+      legal_address: {
+        first_name: "Ada",
+        last_name: "Lovelace",
+        country: "GB",
+        street_address_1: "1 Main St",
+        city: "London",
+        postal_code: "_",
+      },
+      user_profile: { year_of_birth: 1990 },
+    })
+    renderWithProviders(null)
+    await act(async () => {
+      NiceModal.show(JustInTimeDialog, { rejectedFields: ["postal_code"] })
+    })
+    const dialog = await screen.findByRole("dialog", {
+      name: "Just a Few More Details",
+    })
+
+    const postalCode = await waitFor(() => {
+      const input = textbox(dialog, "Postal Code")
+      expect(input).toHaveValue("_")
+      return input
+    })
+    expect(getDescriptionFor(postalCode)).toHaveTextContent(
+      "Please enter a valid postal code.",
+    )
+    await waitFor(() => expect(postalCode).toHaveFocus())
+
+    // The correction is saved, not cleared like an unshown postal code.
+    await user.clear(postalCode)
+    await user.type(postalCode, "SW1A 1AA")
+    await user.click(within(dialog).getByRole("button", { name: "Submit" }))
+    await waitFor(() => expect(patchCalls()).toHaveLength(1))
+    expect(patchCalls()[0].body).toEqual(
+      expect.objectContaining({
+        legal_address: expect.objectContaining({
+          country: "GB",
+          postal_code: "SW1A 1AA",
+        }),
+      }),
+    )
+  })
+
+  test("explains a rejection on a field this country doesn't show", async () => {
+    setup({
+      compliance_missing_fields: [],
+      legal_address: {
+        first_name: "Ada",
+        last_name: "Lovelace",
+        country: "GB",
+        street_address_1: "1 Main St",
+        city: "London",
+        state: "US-MA",
+      },
+      user_profile: { year_of_birth: 1990 },
+    })
+    renderWithProviders(null)
+    await act(async () => {
+      NiceModal.show(JustInTimeDialog, { rejectedFields: ["state"] })
+    })
+    const dialog = await screen.findByRole("dialog", {
+      name: "Just a Few More Details",
+    })
+
+    expect(
+      within(dialog).getByText(
+        "We couldn't verify your address. Please review it and submit again.",
+      ),
+    ).toBeInTheDocument()
+    expect(within(dialog).queryByRole("combobox", { name: "State" })).toBeNull()
+  })
+
+  test("collects every export-compliance field plus year of birth", async () => {
+    setup()
+    const dialog = await openDialog()
+
+    // Rendered whether or not the API reported them missing, so a value that is
+    // present but wrong can still be corrected.
+    ;[
+      "First Name",
+      "Last Name",
+      "Address",
+      "Address Line 2 (optional)",
+      "City",
+    ].forEach((label) => expect(textbox(dialog, label)).toBeVisible())
+
+    expect(combobox(dialog, "Country")).toBeVisible()
+    expect(combobox(dialog, "Year of Birth")).toBeVisible()
+  })
+
+  test("prefills the fields already on file so wrong values can be corrected", async () => {
+    setup({
+      legal_address: {
+        first_name: "Ada",
+        last_name: "Lovelace",
+        country: "GB",
+        city: "London",
+      },
+      user_profile: { year_of_birth: 1988 },
+    })
+    const dialog = await openDialog()
+
+    await waitFor(() =>
+      expect(textbox(dialog, "First Name")).toHaveValue("Ada"),
+    )
+    expect(textbox(dialog, "Last Name")).toHaveValue("Lovelace")
+    expect(textbox(dialog, "City")).toHaveValue("London")
+    expect(combobox(dialog, "Country")).toHaveTextContent("United Kingdom")
+    expect(combobox(dialog, "Year of Birth")).toHaveTextContent("1988")
+    // Not on file, so still empty rather than absent.
+    expect(textbox(dialog, "Address")).toHaveValue("")
+  })
+
+  describe("country-conditional subdivision fields", () => {
+    test("State and Postal Code are absent for a country with no subdivisions", async () => {
+      setup({ legal_address: { country: "GB" } })
+      const dialog = await openDialog()
+
+      await waitFor(() =>
+        expect(combobox(dialog, "Country")).toHaveTextContent("United Kingdom"),
+      )
+      expect(
+        within(dialog).queryByRole("combobox", { name: "State/Province" }),
+      ).not.toBeInTheDocument()
+      expect(
+        within(dialog).queryByRole("textbox", { name: "Postal Code" }),
+      ).not.toBeInTheDocument()
+      expect(
+        within(dialog).queryByRole("textbox", { name: "Zip Code" }),
+      ).not.toBeInTheDocument()
+    })
+
+    test("selecting the US reveals State and a Zip Code field, and announces the new requirement", async () => {
+      // compliance_missing_fields cannot warn about these: it is computed from
+      // the country already stored, which here is none.
+      setup()
+      const dialog = await openDialog()
+
+      await chooseOption(combobox(dialog, "Country"), "United States")
+
+      const state = await within(dialog).findByRole("combobox", {
+        name: "State/Province",
+      })
+      expect(state).toBeVisible()
+      await chooseOption(state, "Massachusetts")
+      expect(state).toHaveTextContent("Massachusetts")
+
+      // US uses local terminology, not the generic "Postal Code" label.
+      expect(textbox(dialog, "Zip Code")).toBeVisible()
+      expect(
+        within(dialog).queryByRole("textbox", { name: "Postal Code" }),
+      ).not.toBeInTheDocument()
+
+      expect(
+        within(dialog).getByText(
+          "State/Province and Zip Code are required for United States.",
+        ),
+      ).toBeInTheDocument()
+    })
+
+    test("selecting Canada reveals State and a Postal Code field (not Zip Code)", async () => {
+      setup()
+      const dialog = await openDialog()
+
+      await chooseOption(combobox(dialog, "Country"), "Canada")
+
+      const state = await within(dialog).findByRole("combobox", {
+        name: "State/Province",
+      })
+      expect(state).toBeVisible()
+
+      expect(textbox(dialog, "Postal Code")).toBeVisible()
+      expect(
+        within(dialog).queryByRole("textbox", { name: "Zip Code" }),
+      ).not.toBeInTheDocument()
+
+      expect(
+        within(dialog).getByText(
+          "State/Province and Postal Code are required for Canada.",
+        ),
+      ).toBeInTheDocument()
+    })
+
+    test("switching to a country without subdivisions clears the chosen state and postal code", async () => {
+      setup()
+      const dialog = await openDialog()
+
+      await chooseOption(combobox(dialog, "Country"), "United States")
+      await chooseOption(
+        await within(dialog).findByRole("combobox", { name: "State/Province" }),
+        "Massachusetts",
+      )
+      await user.type(textbox(dialog, "Zip Code"), "02139")
+      await chooseOption(combobox(dialog, "Country"), "United Kingdom")
+
+      await waitFor(() =>
+        expect(
+          within(dialog).queryByRole("combobox", { name: "State/Province" }),
+        ).not.toBeInTheDocument(),
+      )
+      expect(
+        within(dialog).queryByRole("textbox", { name: "Zip Code" }),
+      ).not.toBeInTheDocument()
+      expect(
+        within(dialog).queryByRole("textbox", { name: "Postal Code" }),
+      ).not.toBeInTheDocument()
+
+      // Re-selecting the US must not resurrect the stale subdivision or postal code.
+      await chooseOption(combobox(dialog, "Country"), "United States")
+      const state = await within(dialog).findByRole("combobox", {
+        name: "State/Province",
+      })
+      expect(state).toHaveTextContent("Please Select")
+      expect(textbox(dialog, "Zip Code")).toHaveValue("")
+    })
+
+    test("switching between two subdivision countries clears the stale state and postal code", async () => {
+      // US -> Canada takes neither branch of the old subdivision-vs-not check
+      // (both require a subdivision), which is exactly the case that let a
+      // US state code survive into Canada's province list.
+      setup()
+      const dialog = await openDialog()
+
+      await chooseOption(combobox(dialog, "Country"), "United States")
+      await chooseOption(
+        await within(dialog).findByRole("combobox", { name: "State/Province" }),
+        "Massachusetts",
+      )
+      await user.type(textbox(dialog, "Zip Code"), "02139")
+
+      await chooseOption(combobox(dialog, "Country"), "Canada")
+
+      const state = await within(dialog).findByRole("combobox", {
+        name: "State/Province",
+      })
+      // Must not still read "Massachusetts" -- that option doesn't exist in
+      // Canada's list, which is what produced MUI's out-of-range warning.
+      expect(state).toHaveTextContent("Please Select")
+      expect(textbox(dialog, "Postal Code")).toHaveValue("")
+    })
+  })
+
+  describe("validation", () => {
+    test("blocks submission and explains each empty required field", async () => {
+      setup()
+      const dialog = await openDialog()
+
+      await user.click(within(dialog).getByRole("button", { name: "Submit" }))
+
+      const expectations: [string, string][] = [
+        ["First Name", "First name is required"],
+        ["Last Name", "Last name is required"],
+        ["Address", "Address is required"],
+        ["City", "City is required"],
+      ]
+      for (const [label, message] of expectations) {
+        const field = textbox(dialog, label)
+        expect(field).toBeInvalid()
+        expect(getDescriptionFor(field)).toHaveTextContent(message)
+      }
+      expect(getDescriptionFor(combobox(dialog, "Country"))).toHaveTextContent(
+        "Country is required",
+      )
+      expect(
+        getDescriptionFor(combobox(dialog, "Year of Birth")),
+      ).toHaveTextContent("Year of birth is required")
+
+      expect(patchCalls()).toHaveLength(0)
+    })
+
+    test("moves focus to the first field needing attention", async () => {
+      setup({
+        legal_address: { first_name: "Ada", country: "GB", city: "London" },
+      })
+      const dialog = await openDialog()
+      await waitFor(() =>
+        expect(textbox(dialog, "First Name")).toHaveValue("Ada"),
+      )
+
+      await user.click(within(dialog).getByRole("button", { name: "Submit" }))
+
+      // First Name is filled, so Last Name is the first outstanding field.
+      expect(textbox(dialog, "Last Name")).toHaveFocus()
+    })
+
+    test("whitespace does not satisfy a required field", async () => {
+      setup()
+      const dialog = await openDialog()
+
+      await user.type(textbox(dialog, "First Name"), "   ")
+      await user.click(within(dialog).getByRole("button", { name: "Submit" }))
+
+      expect(
+        getDescriptionFor(textbox(dialog, "First Name")),
+      ).toHaveTextContent("First name is required")
+      expect(patchCalls()).toHaveLength(0)
+    })
+
+    test("postal code is neither shown nor required outside the US and Canada", async () => {
+      setup({
+        legal_address: {
+          first_name: "Ada",
+          last_name: "Lovelace",
+          country: "GB",
+          street_address_1: "1 Main St",
+          city: "London",
+        },
+        user_profile: { year_of_birth: 1988 },
+      })
+      const dialog = await openDialog()
+      await waitFor(() => expect(textbox(dialog, "City")).toHaveValue("London"))
+
+      expect(
+        within(dialog).queryByRole("textbox", { name: "Postal Code" }),
+      ).not.toBeInTheDocument()
+
+      await user.click(within(dialog).getByRole("button", { name: "Submit" }))
+
+      await waitFor(() => expect(patchCalls()).toHaveLength(1))
+    })
+  })
+
+  describe("submission", () => {
+    test("saves the address and year of birth", async () => {
+      setup()
+      const dialog = await openDialog()
+
+      await user.type(textbox(dialog, "First Name"), "Ada")
+      await user.type(textbox(dialog, "Last Name"), "Lovelace")
+      await user.type(textbox(dialog, "Address"), "1 Main St")
+      await user.type(textbox(dialog, "City"), "Cambridge")
+      await chooseOption(combobox(dialog, "Country"), "United States")
+      await chooseOption(
+        await within(dialog).findByRole("combobox", { name: "State/Province" }),
+        "Massachusetts",
+      )
+      // US uses "Zip Code", not the generic "Postal Code" label.
+      await user.type(textbox(dialog, "Zip Code"), "02139")
+      await chooseOption(combobox(dialog, "Year of Birth"), "1988")
+
+      await user.click(within(dialog).getByRole("button", { name: "Submit" }))
+
+      await waitFor(() => expect(patchCalls()).toHaveLength(1))
+      expect(patchCalls()[0].body).toEqual({
+        legal_address: {
+          first_name: "Ada",
+          last_name: "Lovelace",
+          country: "US",
+          street_address_1: "1 Main St",
+          street_address_2: "",
+          city: "Cambridge",
+          state: "US-MA",
+          postal_code: "02139",
+        },
+        user_profile: { year_of_birth: 1988 },
+      })
+    }, 10000)
+
+    test("closes once saved, so the caller can resume the action", async () => {
+      setup({
+        legal_address: {
+          first_name: "Ada",
+          last_name: "Lovelace",
+          country: "GB",
+          street_address_1: "1 Main St",
+          city: "London",
+        },
+        user_profile: { year_of_birth: 1988 },
+      })
+      const dialog = await openDialog()
+      await waitFor(() => expect(textbox(dialog, "City")).toHaveValue("London"))
+
+      await user.click(within(dialog).getByRole("button", { name: "Submit" }))
+
+      await waitFor(() =>
+        expect(
+          screen.queryByRole("dialog", { name: "Just a Few More Details" }),
+        ).not.toBeInTheDocument(),
+      )
+    })
+
+    test("stays open and explains a failed save", async () => {
+      setup()
+      setMockResponse.patch(mitxUrls.userMe.get(), null, { code: 500 })
+      const dialog = await openDialog()
+
+      await user.type(textbox(dialog, "First Name"), "Ada")
+      await user.type(textbox(dialog, "Last Name"), "Lovelace")
+      await user.type(textbox(dialog, "Address"), "1 Main St")
+      await user.type(textbox(dialog, "City"), "London")
+      await chooseOption(combobox(dialog, "Country"), "United Kingdom")
+      await chooseOption(combobox(dialog, "Year of Birth"), "1988")
+
+      await user.click(within(dialog).getByRole("button", { name: "Submit" }))
+
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "There was a problem saving your details. Please try again later.",
+      )
+      // The entered values survive so the user can retry without retyping.
+      expect(textbox(dialog, "First Name")).toHaveValue("Ada")
+    }, 10000)
+
+    test("reports which fields the server rejected, never what was typed in them", async () => {
+      setup()
+      setMockResponse.patch(
+        mitxUrls.userMe.get(),
+        { errors: { legal_address: { city: ["This value is too long."] } } },
+        { code: 400 },
+      )
+      const dialog = await openDialog()
+      await user.type(textbox(dialog, "First Name"), "Ada")
+      await user.type(textbox(dialog, "Last Name"), "Lovelace")
+      await user.type(textbox(dialog, "Address"), "1 Main St")
+      await user.type(textbox(dialog, "City"), "London")
+      await chooseOption(combobox(dialog, "Country"), "United Kingdom")
+      await chooseOption(combobox(dialog, "Year of Birth"), "1988")
+
+      await user.click(within(dialog).getByRole("button", { name: "Submit" }))
+
+      await waitFor(() => expect(Sentry.captureMessage).toHaveBeenCalled())
+      const [, options] = jest.mocked(Sentry.captureMessage).mock.calls[0]
+      expect(options).toMatchObject({
+        tags: { status: "400" },
+        extra: { paths: ["errors.legal_address.city"] },
+      })
+      // The form holds a legal name and home address, so only keys may leave
+      // the browser.
+      expect(JSON.stringify(options)).not.toMatch(
+        /Ada|Lovelace|1 Main St|London|too long/,
+      )
+    }, 10000)
+
+    test("cancelling saves nothing", async () => {
+      setup()
+      const dialog = await openDialog()
+
+      await user.click(within(dialog).getByRole("button", { name: "Cancel" }))
+
+      expect(patchCalls()).toHaveLength(0)
+      await waitFor(() =>
+        expect(
+          screen.queryByRole("dialog", { name: "Just a Few More Details" }),
+        ).not.toBeInTheDocument(),
+      )
+    })
+  })
+})

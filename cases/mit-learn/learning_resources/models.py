@@ -1,0 +1,2150 @@
+"""Models for learning resources and related entities"""
+
+import uuid
+from abc import abstractmethod
+from functools import cached_property
+from typing import TYPE_CHECKING, Optional
+
+from django.conf import settings
+from django.contrib.postgres.expressions import ArraySubquery
+from django.contrib.postgres.fields import ArrayField
+from django.core.exceptions import ValidationError
+from django.db import models
+from django.db.models import (
+    CharField,
+    Count,
+    JSONField,
+    OuterRef,
+    Prefetch,
+    Q,
+)
+from django.db.models.functions import Lower
+from django.utils import timezone
+
+from learning_resources import constants
+from learning_resources.constants import (
+    WEBSITE_CONTENT_READABLE_ID_PREFIX,
+    Availability,
+    CertificationType,
+    Format,
+    LearningResourceDelivery,
+    LearningResourceRelationTypes,
+    LearningResourceType,
+    Pace,
+    PrivacyLevel,
+)
+from main.models import TimestampedModel, TimestampedModelQuerySet
+from main.utils import checksum_for_content, now_in_utc
+
+if TYPE_CHECKING:
+    from django.contrib.auth import get_user_model
+
+    User = get_user_model()
+
+
+def default_delivery():
+    """Return the default delivery as a list"""
+    return [LearningResourceDelivery.online.name]
+
+
+def default_pace():
+    """Return the default pace as a list"""
+    return [Pace.self_paced.name]
+
+
+def default_format():
+    """Return the default format as a list"""
+    return [Format.asynchronous.name]
+
+
+class LearningResourcePlatform(TimestampedModel):
+    """Platforms for all learning resources"""
+
+    code = models.CharField(max_length=12, primary_key=True)
+    name = models.CharField(max_length=256, blank=False, default="")
+    url = models.URLField(null=True, blank=True)  # noqa: DJ001
+    is_edx = models.BooleanField(default=False)
+    has_content_files = models.BooleanField(default=False)
+
+    def __str__(self):
+        return f"{self.code}: {self.name}"
+
+
+class LearningResourceTopicQuerySet(TimestampedModelQuerySet):
+    """QuerySet for LearningResourceTopic"""
+
+    def for_serialization(self):
+        """Return a queryset for serialization"""
+        return self.annotate_channel_url()
+
+    def annotate_channel_url(self):
+        """Annotate with the channel url"""
+        from channels.models import Channel
+
+        return self.annotate(
+            channel_url=(
+                Channel.objects.filter(topic_detail__topic=OuterRef("pk"))
+                .annotate_channel_url()
+                .values_list("channel_url", flat=True)[:1]
+            ),
+        )
+
+
+class LearningResourceTopic(TimestampedModel):
+    """
+    Topics for all learning resources (e.g. "History")
+    """
+
+    objects = LearningResourceTopicQuerySet.as_manager()
+
+    topic_uuid = models.UUIDField(
+        default=uuid.uuid4,
+        editable=False,
+        help_text=(
+            "An immutable ID for the topic, used if the topic needs to"
+            " be changed via migration."
+        ),
+    )
+    name = models.CharField(max_length=128)
+    parent = models.ForeignKey(
+        "LearningResourceTopic",
+        blank=True,
+        null=True,
+        on_delete=models.CASCADE,
+    )
+    icon = models.CharField(
+        max_length=128,
+        help_text="The icon to display for the topic.",
+        blank=True,
+        default="",
+    )
+
+    def __str__(self):
+        """Return the topic name."""
+        return self.name
+
+    @cached_property
+    def channel_url(self):
+        """Return the topic's channel url"""
+        topic_detail = self.channel_topic_details.first()
+
+        return topic_detail.channel.channel_url if topic_detail is not None else None
+
+    class Meta:
+        """Meta options for LearningResourceTopic"""
+
+        ordering = ["name"]
+        constraints = [models.UniqueConstraint(Lower("name"), name="unique_lower_name")]
+
+
+class LearningResourceOfferorQuerySet(TimestampedModelQuerySet):
+    """QuerySet for LearningResourceOfferor"""
+
+    def for_serialization(self):
+        """Return a queryset for serialization"""
+        return self.annotate_channel_url()
+
+    def annotate_channel_url(self):
+        """Annotate with the channel url"""
+        from channels.models import Channel
+
+        return self.annotate(
+            channel_url=(
+                Channel.objects.filter(unit_detail__unit=OuterRef("pk"))
+                .annotate_channel_url()
+                .values_list("channel_url", flat=True)[:1]
+            ),
+        )
+
+
+class LearningResourceOfferor(TimestampedModel):
+    """Represents who is offering a learning resource"""
+
+    objects = LearningResourceOfferorQuerySet.as_manager()
+
+    # Old fields
+    code = models.CharField(max_length=12, primary_key=True)
+    name = models.CharField(max_length=256, unique=True)
+    professional = models.BooleanField(default=False)
+
+    # New fields
+    offerings = ArrayField(models.CharField(max_length=128), default=list)
+    audience = ArrayField(models.CharField(max_length=128), default=list)
+    formats = ArrayField(models.CharField(max_length=128), default=list)
+    fee = ArrayField(models.CharField(max_length=128), default=list)
+    certifications = ArrayField(models.CharField(max_length=128), default=list)
+    content_types = ArrayField(models.CharField(max_length=128), default=list)
+    more_information = models.URLField(blank=True)
+    # This field name means "value proposition"
+    value_prop = models.TextField(blank=True)
+    # whether or not to show this offeror as a facet in the UI
+    display_facet = models.BooleanField(default=True)
+
+    @cached_property
+    def channel_url(self):
+        """Return the offeror's channel url"""
+        unit_detail = self.channel_unit_details.first()
+
+        return unit_detail.channel.channel_url if unit_detail is not None else None
+
+    def __str__(self):
+        return f"{self.code}: {self.name}"
+
+
+class LearningResourceTopicMapping(TimestampedModel):
+    """Stores offeror topic mappings for learning resource topics."""
+
+    topic = models.ForeignKey(
+        "LearningResourceTopic",
+        on_delete=models.CASCADE,
+        related_name="+",
+    )
+    offeror = models.ForeignKey(
+        "LearningResourceOfferor",
+        on_delete=models.CASCADE,
+        related_name="+",
+    )
+    topic_name = models.CharField(max_length=128)
+
+
+class LearningResourceImage(TimestampedModel):
+    """Represent image metadata for a learning resource"""
+
+    url = models.TextField(max_length=2048)
+    description = models.CharField(  # noqa: DJ001
+        max_length=1024, null=True, blank=True
+    )
+    alt = models.CharField(max_length=1024, null=True, blank=True)  # noqa: DJ001
+
+    def __str__(self):
+        return self.url
+
+
+class LearningResourceSchoolQuerySet(TimestampedModelQuerySet):
+    """QuerySet for LearningResourceSchool"""
+
+    def for_serialization(self):
+        """Return a queryset for serialization"""
+        return self.prefetch_related(
+            Prefetch(
+                "departments",
+                queryset=LearningResourceDepartment.objects.for_serialization(),
+            )
+        )
+
+
+class LearningResourceSchool(TimestampedModel):
+    """School data for a learning resource"""
+
+    objects = LearningResourceSchoolQuerySet.as_manager()
+
+    name = models.CharField(max_length=256, null=False, blank=False)
+    url = models.URLField()
+
+    class Meta:
+        ordering = ["id"]
+
+    def __str__(self):
+        return self.name
+
+
+class LearningResourceDepartmentQuerySet(TimestampedModelQuerySet):
+    """QuerySet for LearningResourceDepartment"""
+
+    def for_serialization(self, *, prefetch_school: bool = False):
+        """Return a queryset for serialization"""
+        qs = self.annotate_channel_url()
+
+        if prefetch_school:
+            qs = qs.prefetch_related(
+                Prefetch(
+                    "school",
+                    queryset=LearningResourceSchool.objects.for_serialization(),
+                )
+            )
+        return qs
+
+    def annotate_channel_url(self):
+        """Annotate the queryset with channel_url"""
+        from channels.models import Channel
+
+        return self.annotate(
+            channel_url=(
+                Channel.objects.filter(department_detail__department=OuterRef("pk"))
+                .annotate_channel_url()
+                .values_list("channel_url", flat=True)[:1]
+            )
+        )
+
+
+class LearningResourceDepartment(TimestampedModel):
+    """Department data for a learning resource"""
+
+    objects = LearningResourceDepartmentQuerySet.as_manager()
+
+    department_id = models.CharField(max_length=6, primary_key=True)
+    name = models.CharField(max_length=256, null=False, blank=False)
+    school = models.ForeignKey(
+        LearningResourceSchool,
+        null=True,
+        on_delete=models.SET_NULL,
+        related_name="departments",
+    )
+
+    @cached_property
+    def channel_url(self) -> str | None:
+        """Get the channel url for the department if it exists"""
+        from channels.models import Channel
+
+        channel = Channel.objects.filter(department_detail__department=self).first()
+        return channel.channel_url if channel is not None else None
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
+class LearningResourceContentTag(TimestampedModel):
+    """Represents course feature tags and contentfile types"""
+
+    name = models.CharField(max_length=128, unique=True)
+
+    def __str__(self):
+        return self.name
+
+
+class LearningResourcePrice(TimestampedModel):
+    """Represents the price of a learning resource"""
+
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    currency = models.CharField(max_length=3)
+
+    def __str__(self):
+        return f"{self.amount} {self.currency}"
+
+    class Meta:
+        ordering = ["amount"]
+
+
+class LearningResourceInstructor(TimestampedModel):
+    """
+    Instructors for learning resources
+    """
+
+    first_name = models.CharField(max_length=128, null=True, blank=True)  # noqa: DJ001
+    last_name = models.CharField(max_length=128, null=True, blank=True)  # noqa: DJ001
+    full_name = models.CharField(max_length=256, null=True, blank=True, unique=True)
+
+    class Meta:
+        ordering = ["run_relationships__position", "last_name", "first_name"]
+
+    def __str__(self):
+        return self.full_name or f"{self.first_name} {self.last_name}"
+
+
+class LearningResourceQuerySet(TimestampedModelQuerySet):
+    """QuerySet for LearningResource"""
+
+    def with_canonical_parent_ids(self):
+        """
+        Annotate each resource's URL-forming parent ids; `[]` if it has none.
+
+        A correlated subquery rather than an aggregate, so the outer query
+        needs no GROUP BY. It runs per row scanned rather than per row
+        returned, so deep pages pay for the rows they skip.
+        """
+        return self.annotate(
+            canonical_parent_ids=ArraySubquery(
+                LearningResourceRelationship.objects.filter(
+                    child=OuterRef("pk"),
+                    relation_type__in=constants.CANONICAL_PARENT_RELATION_TYPES,
+                )
+                .order_by(*constants.RELATIONSHIP_ORDERING)
+                .values("parent_id")
+            )
+        )
+
+    def for_serialization(self):
+        """Return the list of prefetches"""
+        return self.prefetch_related(
+            Prefetch(
+                "topics",
+                queryset=LearningResourceTopic.objects.for_serialization(),
+                to_attr="_topics",
+            ),
+            Prefetch("resource_prices", to_attr="_resource_prices"),
+            Prefetch(
+                "offered_by",
+                queryset=LearningResourceOfferor.objects.for_serialization(),
+            ),
+            Prefetch(
+                "departments",
+                queryset=LearningResourceDepartment.objects.for_serialization().select_related(
+                    "school"
+                ),
+            ),
+            "resource_tags",
+            Prefetch(
+                "runs",
+                queryset=LearningResourceRun.objects.public()
+                .order_by("start_date", "enrollment_start", "id")
+                .for_serialization(),
+                to_attr="_published_runs",
+            ),
+            Prefetch(
+                "parents",
+                queryset=LearningResourceRelationship.objects.filter(
+                    relation_type=LearningResourceRelationTypes.PODCAST_EPISODES.value,
+                )
+                .select_related("parent")
+                .order_by(*constants.RELATIONSHIP_ORDERING),
+                to_attr="_podcasts",
+            ),
+            Prefetch(
+                "parents",
+                queryset=LearningResourceRelationship.objects.filter(
+                    relation_type=LearningResourceRelationTypes.PLAYLIST_VIDEOS.value,
+                ).order_by(*constants.RELATIONSHIP_ORDERING),
+                to_attr="_playlists",
+            ),
+            Prefetch(
+                "children",
+                queryset=LearningResourceRelationship.objects.for_serialization(),
+                to_attr="_children",
+            ),
+            Prefetch(
+                "direct_content_files",
+                queryset=ContentFile.objects.prefetch_related(
+                    "learning_resource__course",
+                    "learning_resource__platform",
+                    "run__learning_resource__course",
+                    "run__learning_resource__platform",
+                    "content_tags",
+                    Prefetch(
+                        "learning_resource__topics",
+                        queryset=LearningResourceTopic.objects.for_serialization(),
+                    ),
+                    Prefetch(
+                        "learning_resource__offered_by",
+                        queryset=LearningResourceOfferor.objects.for_serialization(),
+                    ),
+                    Prefetch(
+                        "learning_resource__departments",
+                        queryset=LearningResourceDepartment.objects.for_serialization().select_related(
+                            "school"
+                        ),
+                    ),
+                    Prefetch(
+                        "run__learning_resource__topics",
+                        queryset=LearningResourceTopic.objects.for_serialization(),
+                    ),
+                    Prefetch(
+                        "run__learning_resource__offered_by",
+                        queryset=LearningResourceOfferor.objects.for_serialization(),
+                    ),
+                    Prefetch(
+                        "run__learning_resource__departments",
+                        queryset=LearningResourceDepartment.objects.for_serialization().select_related(
+                            "school"
+                        ),
+                    ),
+                    "direct_learning_resource__course",
+                    "direct_learning_resource__platform",
+                    Prefetch(
+                        "direct_learning_resource__topics",
+                        queryset=LearningResourceTopic.objects.for_serialization(),
+                    ),
+                    Prefetch(
+                        "direct_learning_resource__offered_by",
+                        queryset=LearningResourceOfferor.objects.for_serialization(),
+                    ),
+                    Prefetch(
+                        "direct_learning_resource__departments",
+                        queryset=LearningResourceDepartment.objects.for_serialization(
+                            prefetch_school=True
+                        ).select_related("school"),
+                    ),
+                ),
+                to_attr="_direct_content_files",
+            ),
+            *LearningResourceDetailModel.get_subclass_prefetches(),
+        ).select_related("image", "platform")
+
+    def for_search_serialization(self):
+        return self.for_serialization().prefetch_related(
+            Prefetch(
+                "parents",
+                queryset=LearningResourceRelationship.objects.filter(
+                    relation_type=LearningResourceRelationTypes.LEARNING_PATH_ITEMS.value,
+                    parent__channel__isnull=False,
+                ),
+                to_attr="_featured_learning_path_parents",
+            )
+        )
+
+
+class LearningResource(TimestampedModel):
+    """Core model for all learning resources"""
+
+    objects = LearningResourceQuerySet.as_manager()
+
+    readable_id = models.CharField(max_length=512, null=False, blank=False)
+    title = models.CharField(max_length=256)
+    description = models.TextField(null=True, blank=True)  # noqa: DJ001
+    full_description = models.TextField(null=True, blank=True)  # noqa: DJ001
+    last_modified = models.DateTimeField(null=True, blank=True)
+    published = models.BooleanField(default=True, db_index=True)
+    languages = ArrayField(models.CharField(max_length=24), null=True, blank=True)
+    url = models.URLField(null=True, max_length=2048)  # noqa: DJ001
+    image = models.ForeignKey(
+        LearningResourceImage, null=True, blank=True, on_delete=models.deletion.SET_NULL
+    )
+    platform = models.ForeignKey(
+        LearningResourcePlatform,
+        null=True,
+        blank=True,
+        on_delete=models.deletion.SET_NULL,
+    )
+    departments = models.ManyToManyField(
+        LearningResourceDepartment,
+    )
+    certification = models.BooleanField(default=False)
+    certification_type = models.CharField(
+        choices=CertificationType.as_tuple(),
+        max_length=24,
+        default=CertificationType.none.name,
+    )
+    resource_type = models.CharField(
+        max_length=24,
+        db_index=True,
+        choices=((member.name, member.value) for member in LearningResourceType),
+    )
+    resource_category = models.CharField(
+        max_length=256,
+        db_index=True,
+        help_text="The display category for this resource.",
+    )
+    topics = models.ManyToManyField(LearningResourceTopic)
+    ocw_topics = ArrayField(models.CharField(max_length=128), default=list, blank=True)
+    offered_by = models.ForeignKey(
+        LearningResourceOfferor, null=True, on_delete=models.SET_NULL
+    )
+    resource_tags = models.ManyToManyField(LearningResourceContentTag)
+    resources = models.ManyToManyField(
+        "self", through="LearningResourceRelationship", symmetrical=False, blank=True
+    )
+    etl_source = models.CharField(max_length=12, default="")
+    # Hash of the transformed source data last loaded by a warehouse sync that
+    # skips unchanged rows. Any other load clears it.
+    etl_checksum = models.CharField(max_length=32, null=True, blank=True)  # noqa: DJ001
+    professional = models.BooleanField(default=False)
+    next_start_date = models.DateTimeField(null=True, blank=True, db_index=True)
+    prices = ArrayField(
+        models.DecimalField(decimal_places=2, max_digits=12), default=list
+    )
+    resource_prices = models.ManyToManyField(LearningResourcePrice, blank=True)
+    availability = models.CharField(  # noqa: DJ001
+        max_length=24,
+        null=True,
+        choices=((member.name, member.value) for member in Availability),
+    )
+    completeness = models.FloatField(default=1.0)
+    delivery = ArrayField(
+        models.CharField(
+            max_length=24, db_index=True, choices=LearningResourceDelivery.as_tuple()
+        ),
+        default=default_delivery,
+    )
+    license_cc = models.BooleanField(default=False)
+
+    test_mode = models.BooleanField(default=False)
+
+    continuing_ed_credits = models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True
+    )
+    pace = ArrayField(
+        models.CharField(
+            max_length=24,
+            choices=Pace.as_tuple(),
+        ),
+        default=default_pace,
+    )
+    format = ArrayField(
+        models.CharField(
+            max_length=24,
+            choices=Format.as_tuple(),
+        ),
+        default=default_format,
+    )
+    location = models.CharField(max_length=256, blank=True)
+    duration = models.CharField(max_length=256, blank=True)
+    min_weeks = models.IntegerField(null=True, blank=True)
+    max_weeks = models.IntegerField(null=True, blank=True)
+    time_commitment = models.CharField(max_length=256, blank=True)
+    min_weekly_hours = models.IntegerField(null=True, blank=True)
+    max_weekly_hours = models.IntegerField(null=True, blank=True)
+    require_summaries = models.BooleanField(default=False)
+
+    view_count = models.PositiveBigIntegerField(null=True, default=None)
+
+    def __str__(self):
+        """Name the resource by its title, with the kind of resource it is and
+        the readable id to tell apart the ones that share a title -- a course
+        and its own archived copy, say.
+
+        Without this a resource reads as "LearningResource object (123)"
+        wherever Django renders one, which is every admin dropdown that points
+        at it: the whole point of searching for one is to recognise it.
+        """
+        return f"{self.title} ({self.get_resource_type_display()}: {self.readable_id})"
+
+    @property
+    def audience(self) -> str | None:
+        """Returns the audience for the learning resource"""
+        if self.platform:
+            return self.platform.audience
+        return None
+
+    @cached_property
+    def next_run(self) -> Optional["LearningResourceRun"]:
+        """Returns the next run for the learning resource"""
+        return (
+            self.runs.public()
+            .filter(start_date__gt=timezone.now())
+            .order_by("start_date")
+            .first()
+        )
+
+    @cached_property
+    def best_run(self) -> Optional["LearningResourceRun"]:
+        """Returns the most current/upcoming enrollable run for the learning resource"""
+        if hasattr(self, "_published_runs"):
+            published_runs = [
+                run
+                for run in self._published_runs
+                if run.published and not run.is_variant
+            ]
+        else:
+            published_runs = list(self.runs.public())
+
+        if not published_runs:
+            return None
+
+        now = now_in_utc()
+
+        # Find the most recent run with a currently active enrollment period
+        enrollable_runs = [
+            run
+            for run in published_runs
+            if (
+                (run.enrollment_start and run.enrollment_start <= now)
+                or (
+                    not run.enrollment_start
+                    and run.start_date
+                    and run.start_date <= now
+                )
+            )
+            and (
+                (run.enrollment_end and run.enrollment_end > now)
+                or (not run.enrollment_end and run.end_date and run.end_date > now)
+            )
+        ]
+        if enrollable_runs:
+            return min(
+                enrollable_runs,
+                key=lambda r: (
+                    r.start_date or timezone.now(),
+                    r.end_date or timezone.now(),
+                ),
+            )
+
+        # If no enrollable runs found, find the next upcoming run
+        upcoming_runs = [
+            run
+            for run in published_runs
+            if run.start_date and run.start_date >= timezone.now()
+        ]
+        if upcoming_runs:
+            return min(upcoming_runs, key=lambda r: r.start_date)
+
+        # No enrollable/upcoming runs, return run with the latest start date
+        runs_with_dates = [run for run in published_runs if run.start_date]
+        if runs_with_dates:
+            return max(runs_with_dates, key=lambda r: r.start_date)
+
+        return published_runs[0] if published_runs else None
+
+    @cached_property
+    def published_runs(self) -> list["LearningResourceRun"]:
+        """Return a list of published runs for the resource"""
+        if hasattr(self, "_published_runs"):
+            return [
+                run
+                for run in self._published_runs
+                if run.published and not run.is_variant
+            ]
+        return list(
+            self.runs.public()
+            .order_by("start_date", "enrollment_start", "id")
+            .for_serialization()
+        )
+
+    def topics_for_serialization(self):
+        """Return topics using the prefetch cache when available."""
+        if hasattr(self, "_topics"):
+            return self._topics
+        return list(self.topics.for_serialization())
+
+    def resource_prices_for_serialization(self):
+        """Return resource prices using the prefetch cache when available."""
+        if hasattr(self, "_resource_prices"):
+            return self._resource_prices
+        return list(self.resource_prices.all())
+
+    def resource_price_amounts_for_serialization(self):
+        """Return resource price amounts using the prefetch cache when available."""
+        return [price.amount for price in self.resource_prices_for_serialization()]
+
+    def children_for_serialization(self):
+        """Return children using the prefetch cache when available."""
+        if hasattr(self, "_children"):
+            return self._children
+        return list(
+            self.children.order_by("position", "id").select_related(
+                "child", "child__image"
+            )
+        )
+
+    def first_child_relationship_for_serialization(self):
+        """Return the first child relationship ordered by position."""
+        children = self.children_for_serialization()
+        return children[0] if children else None
+
+    def direct_content_files_for_serialization(self):
+        """Return direct content files using the prefetch cache when available."""
+        if hasattr(self, "_direct_content_files"):
+            return self._direct_content_files
+        return list(self.direct_content_files.for_serialization())
+
+    @cached_property
+    def views_count(self) -> int:
+        """Return the number of views for the resource."""
+        if self.view_count is not None:
+            return self.view_count
+
+        return LearningResourceViewEvent.objects.filter(learning_resource=self).count()
+
+    @cached_property
+    def in_featured_lists(self) -> int:
+        """Return the number of featured lists the resource is in"""
+        if hasattr(self, "_featured_learning_path_parents"):
+            return len(self._featured_learning_path_parents)
+        return LearningResourceRelationship.objects.filter(
+            child=self,
+            relation_type=LearningResourceRelationTypes.LEARNING_PATH_ITEMS.value,
+            parent__channel__isnull=False,
+        ).count()
+
+    @cached_property
+    def podcasts(self) -> list["LearningResourceRelationship"]:
+        """Return a list of podcasts that the resource is in"""
+        return getattr(
+            self,
+            "_podcasts",
+            self.parents.filter(
+                relation_type=LearningResourceRelationTypes.PODCAST_EPISODES.value,
+            ),
+        )
+
+    @cached_property
+    def playlists(self) -> list["LearningResourceRelationship"]:
+        """Return a list of playlists that the resource is in"""
+        return getattr(
+            self,
+            "_playlists",
+            self.parents.filter(
+                relation_type=LearningResourceRelationTypes.PLAYLIST_VIDEOS.value,
+            ),
+        )
+
+    class Meta:
+        unique_together = (("platform", "readable_id", "resource_type"),)
+        constraints = [
+            # The unique_together above spans `platform`, which resources
+            # mirrored from website content leave NULL -- and Postgres treats
+            # NULLs in a unique index as distinct, so it never rejects a
+            # duplicate of one. Two concurrent syncs of the same item would
+            # both insert, and every later sync would then fail with
+            # MultipleObjectsReturned.
+            #
+            # This partial index rejects the loser instead, which is what makes
+            # the sync's `update_or_create` safe: it catches the IntegrityError
+            # and re-reads the winner's row.
+            models.UniqueConstraint(
+                fields=["readable_id", "resource_type"],
+                condition=models.Q(
+                    readable_id__startswith=WEBSITE_CONTENT_READABLE_ID_PREFIX
+                ),
+                name="learningresource_website_content_uniq",
+            ),
+        ]
+
+
+class LearningResourceDetailQuerySet(TimestampedModelQuerySet):
+    """Base QuerySet for Learning resource detail models"""
+
+    @abstractmethod
+    def for_serialization(self):
+        """Return a QuerySet for serialization"""
+        return self
+
+
+class LearningResourceDetailModel(TimestampedModel):
+    """Base class for learning resource detail models"""
+
+    objects = LearningResourceDetailQuerySet.as_manager()
+
+    @classmethod
+    def get_subclass_prefetches(cls) -> list[Prefetch]:
+        """
+        Return the list of prefetches for all subclasses
+        """
+        return [
+            Prefetch(
+                subclass.get_learning_resource_related_name(),
+                queryset=subclass.objects.for_serialization(),
+            )
+            for subclass in cls.__subclasses__()
+        ]
+
+    @classmethod
+    def get_learning_resource_related_name(cls) -> str:
+        """Return the related name for the learning_resource field"""
+        return cls._meta.get_field("learning_resource").remote_field.get_accessor_name()
+
+    class Meta:
+        abstract = True
+
+
+class LearningResourceRunQuerySet(TimestampedModelQuerySet):
+    """QuerySet for LearningResourceRun"""
+
+    def public(self):
+        """Return published runs that should be visible to learners."""
+        return self.filter(published=True, is_variant=False)
+
+    def for_serialization(self):
+        """QuerySet for serialization"""
+        return self.select_related("image").prefetch_related(
+            "instructors", "resource_prices"
+        )
+
+
+class LearningResourceRun(TimestampedModel):
+    """
+    Model for course and program runs
+    """
+
+    objects = LearningResourceRunQuerySet.as_manager()
+
+    learning_resource = models.ForeignKey(
+        LearningResource, related_name="runs", on_delete=models.deletion.CASCADE
+    )
+    run_id = models.CharField(max_length=128, db_index=True)
+    title = models.CharField(max_length=256)
+    description = models.TextField(null=True, blank=True)  # noqa: DJ001
+    full_description = models.TextField(null=True, blank=True)  # noqa: DJ001
+    last_modified = models.DateTimeField(null=True, blank=True)
+    published = models.BooleanField(default=True, db_index=True)
+    b2b_only = models.BooleanField(default=False, db_default=False)
+    is_variant = models.BooleanField(default=False, db_index=True)
+    languages = ArrayField(models.CharField(max_length=24), null=True, blank=True)
+    url = models.URLField(null=True, max_length=2048)  # noqa: DJ001
+    image = models.ForeignKey(
+        LearningResourceImage, null=True, blank=True, on_delete=models.deletion.SET_NULL
+    )
+    level = ArrayField(
+        models.CharField(max_length=128), null=False, blank=False, default=list
+    )
+    slug = models.CharField(max_length=1024, null=True, blank=True)  # noqa: DJ001
+    semester = models.CharField(max_length=20, null=True, blank=True)  # noqa: DJ001
+    year = models.IntegerField(null=True, blank=True)
+    start_date = models.DateTimeField(null=True, blank=True)
+    end_date = models.DateTimeField(null=True, blank=True)
+    enrollment_start = models.DateTimeField(null=True, blank=True)
+    enrollment_end = models.DateTimeField(null=True, blank=True)
+    instructors = models.ManyToManyField(
+        LearningResourceInstructor,
+        blank=True,
+        related_name="runs",
+        through="learning_resources.RunInstructorRelationship",
+    )
+    prices = ArrayField(
+        models.DecimalField(decimal_places=2, max_digits=12), null=True, blank=True
+    )
+    resource_prices = models.ManyToManyField(LearningResourcePrice, blank=True)
+    checksum = models.CharField(max_length=32, null=True, blank=True)  # noqa: DJ001
+    # S3 key of the last-processed course archive (content-addressed)
+    archive_key = models.CharField(max_length=512, null=True, blank=True)  # noqa: DJ001
+    delivery = ArrayField(
+        models.CharField(
+            max_length=24, db_index=True, choices=LearningResourceDelivery.as_tuple()
+        ),
+        default=default_delivery,
+    )
+    availability = models.CharField(  # noqa: DJ001
+        max_length=24,
+        null=True,
+        choices=Availability.as_tuple(),
+    )
+    pace = ArrayField(
+        models.CharField(
+            max_length=24,
+            choices=Pace.as_tuple(),
+        ),
+        default=default_pace,
+    )
+    format = ArrayField(
+        models.CharField(
+            max_length=24,
+            choices=Format.as_tuple(),
+        ),
+        default=default_format,
+    )
+    location = CharField(max_length=256, blank=True)
+    duration = models.CharField(max_length=256, blank=True)
+    min_weeks = models.IntegerField(null=True, blank=True)
+    max_weeks = models.IntegerField(null=True, blank=True)
+    time_commitment = models.CharField(max_length=256, blank=True)
+    min_weekly_hours = models.IntegerField(null=True, blank=True)
+    max_weekly_hours = models.IntegerField(null=True, blank=True)
+
+    def __str__(self):
+        return f"LearningResourceRun platform={self.learning_resource.platform} run_id={self.run_id}"  # noqa: E501
+
+    class Meta:
+        unique_together = (("learning_resource", "run_id"),)
+
+
+class RunInstructorRelationship(TimestampedModel):
+    """Model for the relationship between a run and an instructor"""
+
+    run = models.ForeignKey(
+        LearningResourceRun,
+        on_delete=models.deletion.CASCADE,
+        related_name="instructor_relationships",
+    )
+    instructor = models.ForeignKey(
+        LearningResourceInstructor,
+        on_delete=models.deletion.CASCADE,
+        related_name="run_relationships",
+    )
+    position = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["position"]
+
+
+class CourseQuerySet(LearningResourceDetailQuerySet):
+    """QuerySet for Course"""
+
+    def for_serialization(self):
+        """Prefetch for serialization"""
+        return self
+
+
+class Course(LearningResourceDetailModel):
+    """Model for representing a course"""
+
+    objects = CourseQuerySet.as_manager()
+
+    learning_resource = models.OneToOneField(
+        LearningResource,
+        related_name="course",
+        on_delete=models.deletion.CASCADE,
+        primary_key=True,
+    )
+    course_numbers = JSONField(null=True, blank=True)
+
+    @property
+    def runs(self):
+        """Get the parent LearningResource runs"""
+        return self.learning_resource.runs
+
+
+class ProgramQuerySet(LearningResourceDetailQuerySet):
+    """QuerySet for Program"""
+
+    def for_serialization(self):
+        """Prefetch for serialization"""
+        return (
+            super()
+            .for_serialization()
+            .annotate(
+                course_count=Count(
+                    "learning_resource__children",
+                    filter=Q(
+                        learning_resource__children__relation_type=LearningResourceRelationTypes.PROGRAM_COURSES.value,
+                        learning_resource__children__child__published=True,
+                    ),
+                ),
+                program_count=Count(
+                    "learning_resource__children",
+                    filter=Q(
+                        learning_resource__children__relation_type=LearningResourceRelationTypes.PROGRAM_PROGRAMS.value,
+                        learning_resource__children__child__published=True,
+                    ),
+                ),
+            )
+        )
+
+
+class Program(LearningResourceDetailModel):
+    """
+    A program is essentially a list of courses.
+    There is nothing specific to programs at this point, but the relationship between
+    programs and courses may end up being Program->Courses instead of an LR-LR relationship.
+    """  # noqa: E501
+
+    objects = ProgramQuerySet.as_manager()
+
+    learning_resource = models.OneToOneField(
+        LearningResource,
+        related_name="program",
+        on_delete=models.deletion.CASCADE,
+        primary_key=True,
+    )
+
+    @property
+    def runs(self):
+        """Get the parent LearningResource runs"""
+        return self.learning_resource.runs
+
+    @property
+    def courses(self):
+        """Get the associated course resources"""
+        return self.learning_resource.children.filter(
+            relation_type=LearningResourceRelationTypes.PROGRAM_COURSES,
+        )
+
+    @property
+    def child_programs(self):
+        """Get the associated child program resources"""
+        return self.learning_resource.children.filter(
+            relation_type=LearningResourceRelationTypes.PROGRAM_PROGRAMS,
+        )
+
+    @cached_property
+    def course_count(self):
+        """Return the number of courses in the program"""
+        return self.learning_resource.children.filter(
+            relation_type=LearningResourceRelationTypes.PROGRAM_COURSES,
+            child__published=True,
+        ).count()
+
+    @cached_property
+    def program_count(self):
+        """Return the number of child programs in the program"""
+        return self.learning_resource.children.filter(
+            relation_type=LearningResourceRelationTypes.PROGRAM_PROGRAMS,
+            child__published=True,
+        ).count()
+
+
+class LearningPathQuerySet(LearningResourceDetailQuerySet):
+    """QuerySet for LearningPath"""
+
+    def for_serialization(self):
+        """Annotate item_count for serialization"""
+        return self.annotate(
+            item_count=Count(
+                "learning_resource__children",
+                filter=Q(
+                    learning_resource__children__relation_type=LearningResourceRelationTypes.LEARNING_PATH_ITEMS.value,
+                    learning_resource__children__child__published=True,
+                ),
+            )
+        )
+
+
+class LearningPath(LearningResourceDetailModel):
+    """
+    Model for representing a publishable list of  learning resources
+    The LearningResource readable_id should probably be something like an auto-generated UUID.
+    """  # noqa: E501
+
+    objects = LearningPathQuerySet.as_manager()
+
+    learning_resource = models.OneToOneField(
+        LearningResource,
+        related_name="learning_path",
+        on_delete=models.CASCADE,
+    )
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="learning_paths",
+        on_delete=models.PROTECT,
+    )
+
+    def __str__(self):
+        return f"Learning Path: {self.learning_resource.title}"
+
+    @cached_property
+    def item_count(self) -> int:
+        """Number of published resources in the learning path."""
+        return self.learning_resource.children.filter(
+            relation_type=LearningResourceRelationTypes.LEARNING_PATH_ITEMS.value,
+            child__published=True,
+        ).count()
+
+
+class LearningResourceRelationshipQuerySet(TimestampedModelQuerySet):
+    """QuerySet for LearningResourceRelationship"""
+
+    def for_serialization(self):
+        """Prefetch related objects used by API serializers"""
+        return (
+            self.select_related("child", "child__image")
+            .exclude(
+                relation_type=LearningResourceRelationTypes.LEARNING_PATH_ITEMS.value,
+                child__published=False,
+            )
+            .order_by(*constants.RELATIONSHIP_ORDERING)
+        )
+
+
+class LearningResourceRelationship(TimestampedModel):
+    """
+    LearningResourceRelationship model tracks the relationships between learning resources,
+    for example: course LR's in a program LR, all LR's included in a LearningList LR, etc.
+    """  # noqa: E501
+
+    parent = models.ForeignKey(
+        LearningResource, on_delete=models.deletion.CASCADE, related_name="children"
+    )
+    child = models.ForeignKey(
+        LearningResource, related_name="parents", on_delete=models.deletion.CASCADE
+    )
+    position = models.PositiveIntegerField(default=0)
+
+    relation_type = models.CharField(
+        max_length=256,
+        choices=LearningResourceRelationTypes.choices,
+        default=None,
+    )
+
+    objects = LearningResourceRelationshipQuerySet.as_manager()
+
+    class Meta:
+        ordering = list(constants.RELATIONSHIP_ORDERING)
+
+
+class ContentFileQuerySet(TimestampedModelQuerySet):
+    """QuerySet for ContentFile"""
+
+    def visible(self, now=None):
+        """Content files a learner can see: published, and undated or released"""
+        return self.filter(published=True).filter(
+            Q(release_date__isnull=True) | Q(release_date__lte=now or now_in_utc())
+        )
+
+    def hidden(self, now=None):
+        """Content files a learner cannot currently see: the complement of visible()"""
+        return self.filter(Q(published=False) | Q(release_date__gt=now or now_in_utc()))
+
+    def matching_youtube_videos(self, youtube_ids):
+        """
+        Content files that match these youtube ids: visible ones on a published
+        run. A video on two pages of a course has two, so these sort newest
+        first and a dict built by youtube_id keeps the lowest id, a stable match.
+        """
+        return (
+            self.filter(youtube_id__in=youtube_ids, run__published=True)
+            .visible()
+            .order_by("-id")
+        )
+
+    def for_serialization(self):
+        """Return a queryset ready for serialization"""
+        return self.select_related(
+            "run",
+            "learning_resource",
+            "direct_learning_resource",
+        ).prefetch_related(
+            "content_tags",
+            "run__learning_resource",
+            "run__learning_resource__course",
+            "run__learning_resource__platform",
+            Prefetch(
+                "run__learning_resource__topics",
+                queryset=LearningResourceTopic.objects.for_serialization(),
+            ),
+            Prefetch(
+                "run__learning_resource__offered_by",
+                queryset=LearningResourceOfferor.objects.for_serialization(),
+            ),
+            Prefetch(
+                "run__learning_resource__departments",
+                queryset=LearningResourceDepartment.objects.for_serialization(
+                    prefetch_school=True
+                ).select_related("school"),
+            ),
+            "learning_resource__course",
+            "learning_resource__platform",
+            Prefetch(
+                "learning_resource__topics",
+                queryset=LearningResourceTopic.objects.for_serialization(),
+            ),
+            Prefetch(
+                "learning_resource__offered_by",
+                queryset=LearningResourceOfferor.objects.for_serialization(),
+            ),
+            Prefetch(
+                "learning_resource__departments",
+                queryset=LearningResourceDepartment.objects.for_serialization(
+                    prefetch_school=True
+                ).select_related("school"),
+            ),
+            "direct_learning_resource__course",
+            "direct_learning_resource__platform",
+            Prefetch(
+                "direct_learning_resource__topics",
+                queryset=LearningResourceTopic.objects.for_serialization(),
+            ),
+            Prefetch(
+                "direct_learning_resource__offered_by",
+                queryset=LearningResourceOfferor.objects.for_serialization(),
+            ),
+            Prefetch(
+                "direct_learning_resource__departments",
+                queryset=LearningResourceDepartment.objects.for_serialization(
+                    prefetch_school=True
+                ).select_related("school"),
+            ),
+        )
+
+
+class TutorProblemFile(TimestampedModel):
+    """
+    Tutor Problem and Solution model
+    """
+
+    run = models.ForeignKey(
+        LearningResourceRun,
+        related_name="problem_files",
+        on_delete=models.CASCADE,
+        blank=False,
+        null=False,
+    )
+
+    problem_title = models.CharField(max_length=1024, null=True, blank=True)  # noqa: DJ001
+
+    type = models.CharField(
+        max_length=128, choices=constants.VALID_TUTOR_PROBLEM_TYPE_CHOICES
+    )
+
+    content = models.TextField(null=True, blank=True)  # noqa: DJ001
+
+    archive_checksum = models.CharField(max_length=32, null=True, blank=True)  # noqa: DJ001
+    checksum = models.CharField(max_length=32, null=True, blank=True)  # noqa: DJ001
+    source_path = models.CharField(max_length=1024, null=True, blank=True)  # noqa: DJ001
+    file_extension = models.CharField(max_length=32, null=True, blank=True)  # noqa: DJ001
+    file_name = models.CharField(max_length=256, null=True, blank=True)  # noqa: DJ001
+
+
+class ContentFile(TimestampedModel):
+    """
+    ContentFile model for LearningResourceRun files
+    """
+
+    objects = ContentFileQuerySet.as_manager()
+
+    uid = models.CharField(max_length=36, null=True, blank=True)  # noqa: DJ001
+    key = models.CharField(max_length=1024, null=True, blank=True)  # noqa: DJ001
+    run = models.ForeignKey(
+        LearningResourceRun,
+        related_name="content_files",
+        on_delete=models.CASCADE,
+        blank=True,
+        null=True,
+    )
+    direct_learning_resource = models.ForeignKey(
+        LearningResource,
+        related_name="direct_content_files",
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+    )
+    learning_resource = models.ForeignKey(
+        LearningResource,
+        related_name="resource_content_files",
+        on_delete=models.CASCADE,
+        blank=True,
+        null=True,
+    )
+    title = models.CharField(max_length=1024, null=True, blank=True)  # noqa: DJ001
+    description = models.TextField(null=True, blank=True)  # noqa: DJ001
+    image_src = models.URLField(null=True, blank=True)  # noqa: DJ001
+
+    url = models.TextField(null=True, blank=True)  # noqa: DJ001
+    file_type = models.CharField(max_length=128, null=True, blank=True)  # noqa: DJ001
+
+    content = models.TextField(null=True, blank=True)  # noqa: DJ001
+    content_title = models.CharField(  # noqa: DJ001
+        max_length=1024, null=True, blank=True
+    )
+    content_author = models.CharField(  # noqa: DJ001
+        max_length=1024, null=True, blank=True
+    )
+    content_language = models.CharField(  # noqa: DJ001
+        max_length=24, null=True, blank=True
+    )
+    content_type = models.CharField(
+        choices=constants.VALID_COURSE_CONTENT_CHOICES,
+        default=constants.CONTENT_TYPE_FILE,
+        max_length=10,
+    )
+    content_tags = models.ManyToManyField(LearningResourceContentTag)
+    published = models.BooleanField(default=True)
+    release_date = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "When the course releases this file to learners; null if the "
+            "course does not gate it."
+        ),
+    )
+    archive_checksum = models.CharField(max_length=32, null=True, blank=True)  # noqa: DJ001
+    checksum = models.CharField(max_length=32, null=True, blank=True)  # noqa: DJ001
+    source_path = models.CharField(max_length=1024, null=True, blank=True)  # noqa: DJ001
+    file_extension = models.CharField(max_length=32, null=True, blank=True)  # noqa: DJ001
+    edx_module_id = models.CharField(  # noqa: DJ001
+        max_length=1024,
+        null=True,
+        blank=True,
+        db_index=True,
+    )
+    summary = models.TextField(blank=True, default="")
+    flashcards = models.JSONField(blank=True, default=list)
+    duration = models.CharField(max_length=11, null=True, blank=True)  # noqa: DJ001
+    youtube_id = models.CharField(max_length=32, null=True, blank=True)  # noqa: DJ001
+
+    def save(self, **kwargs):
+        self.checksum = checksum_for_content(self.content)
+        super().save(**kwargs)
+
+    class Meta:
+        verbose_name = "contentfile"
+        # add constraint so that atleast run or learning_resource is defined (not both)
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(learning_resource__isnull=False, run__isnull=True)
+                    | models.Q(run__isnull=False, learning_resource__isnull=True)
+                    | models.Q(
+                        direct_learning_resource__isnull=False,
+                        learning_resource__isnull=True,
+                        run__isnull=True,
+                    )
+                ),
+                name="direct_learning_resource_run_or_resource_defined",
+                violation_error_message=(
+                    "One of learning_resource, direct_learning_resource,"
+                    " or run must be defined. "
+                    "Both learning_resource and run cannot be defined at the"
+                    " same time."
+                ),
+            ),
+            # One partial unique index per parent identity. A single index over
+            # all three nullable FKs would never reject anything, since Postgres
+            # treats NULLs as distinct. nulls_distinct=False so keyless rows on
+            # the same parent also collide instead of duplicating.
+            models.UniqueConstraint(
+                fields=["run", "key"],
+                condition=models.Q(run__isnull=False),
+                nulls_distinct=False,
+                name="contentfile_run_key_uniq",
+            ),
+            models.UniqueConstraint(
+                fields=["learning_resource", "key"],
+                condition=models.Q(learning_resource__isnull=False),
+                nulls_distinct=False,
+                name="contentfile_learning_resource_key_uniq",
+            ),
+            models.UniqueConstraint(
+                fields=["direct_learning_resource", "key"],
+                condition=models.Q(direct_learning_resource__isnull=False),
+                nulls_distinct=False,
+                name="contentfile_direct_learning_resource_key_uniq",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["release_date"],
+                condition=models.Q(published=True),
+                name="contentfile_published_date_idx",
+            ),
+        ]
+
+
+class Unit(TimestampedModel):
+    """
+    A group of a run's content files: an ordered step from the course structure
+    (edX sequential, OCW week or lecture), the course-wide context, or an
+    unordered bin of leftover files.
+    """
+
+    class Kind(models.TextChoices):
+        # an ordered step derived from the course structure
+        UNIT = "unit", "Unit"
+        # content that belongs to the course as a whole, like the syllabus
+        CONTEXT = "context", "Context"
+        # an unordered group of files used to break up the course
+        BIN = "bin", "Bin"
+
+    run = models.ForeignKey(
+        LearningResourceRun, related_name="units", on_delete=models.CASCADE
+    )
+    # edX sequential usage key, OCW nav id/path/"session-N", "context",
+    # or "bin:" followed by a page key or resource type
+    external_id = models.CharField(max_length=1024)
+    kind = models.CharField(max_length=16, choices=Kind.choices, default=Kind.UNIT)
+    title = models.CharField(max_length=1024)
+    # order within the run; null for context and bins
+    position = models.PositiveIntegerField(null=True, blank=True)
+    url = models.URLField(max_length=2048, blank=True)  # edX jump_to_id; OCW page URL
+    content_files = models.ManyToManyField(
+        ContentFile, through="UnitContentFile", related_name="units"
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["run", "external_id"], name="unique_unit_per_run"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.run_id}/{self.external_id}: {self.title}"
+
+
+class UnitContentFile(models.Model):
+    """Membership of a ContentFile in a Unit"""
+
+    class Relation(models.TextChoices):
+        CORE = "core", "Core"
+        ASSESSMENT = "assessment", "Assessment"
+        SUPPLEMENTARY = "supplementary", "Supplementary"
+        REFERENCE = "reference", "Reference"
+
+    unit = models.ForeignKey(Unit, on_delete=models.CASCADE)
+    content_file = models.ForeignKey(ContentFile, on_delete=models.CASCADE)
+    relation = models.CharField(
+        max_length=32, choices=Relation.choices, default=Relation.CORE
+    )
+    # content file order within the unit, approximate for static files, which sit
+    # after the first block that links them; null in units with no order, like
+    # the course context
+    position = models.PositiveIntegerField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["position"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["unit", "content_file"], name="unique_content_file_per_unit"
+            )
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.unit_id}/{self.content_file_id}: {self.relation} #{self.position}"
+        )
+
+
+class ResourceProfileConfiguration(TimestampedModel):
+    """
+    Admin-editable prompt and model for one stage of resource profile generation.
+
+    One row per stage. Cache keys leave the configuration out, so editing it
+    here changes stored results only when they are regenerated with overwrite.
+    """
+
+    class Stage(models.TextChoices):
+        # claims about the course as a whole, from the context unit
+        CONTEXT = "context", "Context"
+        # claims about one unit or bin
+        UNIT = "unit", "Unit"
+
+    stage = models.CharField(max_length=16, choices=Stage.choices, unique=True)
+    llm_model = models.CharField(
+        max_length=128, verbose_name="LLM Model", help_text="Any LiteLLM model name."
+    )
+    prompt = models.TextField(help_text="The system prompt for this stage.")
+    temperature = models.FloatField(
+        null=True,
+        blank=True,
+        help_text="Leave blank to use the model's default. Reasoning models"
+        " accept only that.",
+    )
+    # Blank fields aren't sent. One that is set is sent as is, and a model that
+    # doesn't take it rejects the call.
+    max_tokens = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Most tokens the model may return. Leave blank for no limit."
+        " Newer OpenAI models reject it: use max completion tokens.",
+    )
+    max_completion_tokens = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Most tokens the model may return, reasoning included. Leave"
+        " blank for no limit. Older models may reject it: use max tokens.",
+    )
+    reasoning_effort = models.CharField(  # noqa: DJ001
+        max_length=16,
+        null=True,
+        blank=True,
+        help_text="none, low, medium, high, ... Leave blank for the model's"
+        " default, and for models without reasoning, which reject it.",
+    )
+    max_file_tokens = models.PositiveIntegerField(
+        default=25000, help_text="Files longer than this are truncated."
+    )
+    input_token_budget = models.PositiveIntegerField(
+        default=100000,
+        help_text="Most file text one call may read. A unit over it is skipped.",
+    )
+
+    def __str__(self):
+        return f"ResourceProfileConfiguration for {self.stage}"
+
+
+class ClaimExtraction(TimestampedModel):
+    """
+    The validated output of one resource profile LLM call, keyed by its inputs.
+
+    Rows are a cache: before a call, its key is computed from the text of the
+    files it reads, and a row with that key is used instead of calling again.
+    The prompt and model aren't in the key, so changing them leaves rows as
+    they are until they are regenerated with overwrite.
+    Units with identical files in different runs share a row, so `unit` is the
+    unit the row was first produced for.
+    """
+
+    class Level(models.TextChoices):
+        # a unit, bin or context unit
+        UNIT = "unit", "Unit"
+
+    # sha256 of the stage's inputs
+    key = models.CharField(max_length=64, unique=True)
+    level = models.CharField(max_length=16, choices=Level.choices)
+    # stage name and when its configuration was last saved
+    extractor_version = models.CharField(max_length=32)
+    model = models.CharField(max_length=128)
+    output = models.JSONField()  # validated stage output: claims + evidence + notes
+    # the model's response as returned, before validation
+    raw_response = models.TextField(blank=True)
+    unit = models.ForeignKey(
+        Unit,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="claim_extractions",
+    )
+
+    def __str__(self):
+        return f"{self.level} {self.extractor_version} {self.key[:12]}"
+
+
+class UserList(TimestampedModel):
+    """
+    Similar in concept to a LearningPath: a list of learning resources.
+    However, UserLists are not considered LearningResources because they
+    should only be accessible to the user who created them.
+    """
+
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.deletion.CASCADE,
+        related_name="user_lists",
+    )
+    title = models.CharField(max_length=256)
+    description = models.TextField(default="", blank=True)
+    topics = models.ManyToManyField(LearningResourceTopic)
+    resources = models.ManyToManyField(
+        LearningResource, through="UserListRelationship", symmetrical=False, blank=True
+    )
+    privacy_level = models.CharField(
+        max_length=24,
+        default=PrivacyLevel.private.value,
+        choices=tuple((level.value, level.value) for level in PrivacyLevel),
+    )
+
+    def topics_for_serialization(self):
+        """Return topics using the prefetch cache when available."""
+        if hasattr(self, "_topics"):
+            return self._topics
+        return list(self.topics.for_serialization())
+
+    def first_child_relationship_for_serialization(self):
+        """Return the first child relationship ordered by position."""
+        children = getattr(self, "_children", None)
+        if children is None:
+            return self.children.order_by("position").first()
+        return children[0] if children else None
+
+    @cached_property
+    def item_count(self) -> int:
+        """Number of published resources in the list."""
+        return self.resources.filter(published=True).count()
+
+
+class UserListQuerySet(TimestampedModelQuerySet):
+    """QuerySet for UserList"""
+
+    def for_serialization(self):
+        """Prefetch related objects used by API serializers"""
+        return self.select_related("author").prefetch_related(
+            Prefetch(
+                "topics",
+                queryset=LearningResourceTopic.objects.for_serialization(),
+                to_attr="_topics",
+            ),
+            Prefetch(
+                "children",
+                queryset=UserListRelationship.objects.filter(child__published=True)
+                .select_related("child", "child__image")
+                .order_by("position"),
+                to_attr="_children",
+            ),
+        )
+
+
+UserList.add_to_class("objects", UserListQuerySet.as_manager())
+
+
+class UserListRelationshipQuerySet(TimestampedModelQuerySet):
+    """QuerySet for UserListRelationship"""
+
+    def for_serialization(self):
+        """Prefetch related objects used by API serializers"""
+        return self.select_related("parent", "parent__author").prefetch_related(
+            Prefetch(
+                "child",
+                queryset=LearningResource.objects.for_serialization(),
+            )
+        )
+
+
+class UserListRelationship(TimestampedModel):
+    """
+    UserListRelationship model tracks the resources belonging to a UserList
+    and their relative positions in the list.
+    """
+
+    parent = models.ForeignKey(
+        UserList, on_delete=models.deletion.CASCADE, related_name="children"
+    )
+    child = models.ForeignKey(
+        LearningResource, related_name="user_lists", on_delete=models.deletion.CASCADE
+    )
+    position = models.PositiveIntegerField(default=0)
+
+    objects = UserListRelationshipQuerySet.as_manager()
+
+    class Meta:
+        ordering = ["position"]
+
+
+class PodcastQuerySet(LearningResourceDetailQuerySet):
+    """QuerySet for Podcast"""
+
+    def for_serialization(self):
+        """Prefetch for serialization"""
+        return self.annotate(
+            episode_count=Count(
+                "learning_resource__children",
+                filter=Q(
+                    learning_resource__children__relation_type=LearningResourceRelationTypes.PODCAST_EPISODES.value,
+                    learning_resource__children__child__published=True,
+                ),
+            )
+        )
+
+
+class Podcast(LearningResourceDetailModel):
+    """Data model for podcasts"""
+
+    objects = PodcastQuerySet.as_manager()
+
+    learning_resource = models.OneToOneField(
+        LearningResource,
+        related_name="podcast",
+        on_delete=models.CASCADE,
+    )
+    apple_podcasts_url = models.URLField(null=True, max_length=2048)  # noqa: DJ001
+    google_podcasts_url = models.URLField(null=True, max_length=2048)  # noqa: DJ001
+    rss_url = models.URLField(null=True, max_length=2048)  # noqa: DJ001
+
+    @cached_property
+    def episode_count(self) -> int:
+        """Return the number of episodes in the podcast"""
+        return self.learning_resource.children.filter(
+            relation_type=constants.LearningResourceRelationTypes.PODCAST_EPISODES.value
+        ).count()
+
+    def __str__(self):
+        return f"Podcast {self.id}"
+
+    class Meta:
+        ordering = ("id",)
+
+
+class PodcastEpisodeQuerySet(LearningResourceDetailQuerySet):
+    """QuerySet for PodcastEpisode"""
+
+    def for_serialization(self):
+        """Prefetch for serialization"""
+        return self
+
+
+class PodcastEpisode(LearningResourceDetailModel):
+    """Data model for podcast episodes"""
+
+    objects = PodcastEpisodeQuerySet.as_manager()
+
+    learning_resource = models.OneToOneField(
+        LearningResource,
+        related_name="podcast_episode",
+        on_delete=models.CASCADE,
+    )
+
+    transcript = models.TextField(blank=True, default="")
+    audio_url = models.URLField(null=False, max_length=2048)
+    episode_link = models.URLField(null=True, max_length=2048)  # noqa: DJ001
+    duration = models.CharField(null=True, blank=True, max_length=10)  # noqa: DJ001
+    rss = models.TextField(null=True, blank=True)  # noqa: DJ001
+
+    def __str__(self):
+        return f"Podcast Episode {self.id}"
+
+    class Meta:
+        ordering = ("id",)
+
+
+class VideoChannel(TimestampedModel):
+    """Data model for video channels"""
+
+    channel_id = models.CharField(max_length=80, primary_key=True)
+    title = models.CharField(max_length=256)
+    published = models.BooleanField(default=True)
+    etl_source = models.CharField(max_length=12, default="")
+
+    def __str__(self):
+        return f"VideoChannel: {self.title} - {self.channel_id}"
+
+
+class VideoQuerySet(LearningResourceDetailQuerySet):
+    """QuerySet for Video"""
+
+    def for_serialization(self):
+        """Return queryset for serialization"""
+        return self
+
+
+class Video(LearningResourceDetailModel):
+    """Data model for video resources"""
+
+    objects = VideoQuerySet.as_manager()
+
+    learning_resource = models.OneToOneField(
+        LearningResource,
+        related_name="video",
+        on_delete=models.CASCADE,
+    )
+    duration = models.CharField(max_length=11)
+    transcript = models.TextField(blank=True, default="")
+    streaming_url = models.URLField(
+        max_length=2048,
+        blank=True,
+        default="",
+        help_text="HLS streaming URL (.m3u8) from OVS",
+    )
+    caption_urls = models.JSONField(default=list, blank=True)
+    cover_image_url = models.URLField(max_length=2048, blank=True, default="")
+
+    def __str__(self):
+        return f"Video: {self.id} - {self.learning_resource.readable_id}"
+
+
+class VideoPlaylistQuerySet(LearningResourceDetailQuerySet):
+    """QuerySet for VideoPlaylist"""
+
+    def for_serialization(self):
+        """Return queryset for serialization"""
+        return self.annotate(
+            video_count=Count(
+                "learning_resource__children",
+                filter=Q(
+                    learning_resource__children__relation_type=LearningResourceRelationTypes.PLAYLIST_VIDEOS.value,
+                    learning_resource__children__child__published=True,
+                ),
+            )
+        ).select_related(
+            "parent_learning_resource",
+            "parent_learning_resource__course",
+            "channel",
+        )
+
+
+class VideoPlaylist(LearningResourceDetailModel):
+    """
+    Video playlist model, contains videos
+    """
+
+    objects = VideoPlaylistQuerySet.as_manager()
+
+    learning_resource = models.OneToOneField(
+        LearningResource,
+        related_name="video_playlist",
+        on_delete=models.CASCADE,
+    )
+
+    channel = models.ForeignKey(
+        VideoChannel, on_delete=models.CASCADE, related_name="playlists"
+    )
+    parent_learning_resource = models.ForeignKey(
+        LearningResource,
+        on_delete=models.SET_NULL,
+        related_name="child_video_playlists",
+        null=True,
+        blank=True,
+    )
+
+    @cached_property
+    def video_count(self) -> int:
+        """Return the number of videos in the playlist"""
+        return self.learning_resource.children.filter(
+            relation_type=constants.LearningResourceRelationTypes.PLAYLIST_VIDEOS.value
+        ).count()
+
+    def __str__(self):
+        return (
+            f"Video Playlist: "
+            f"{self.learning_resource.title} - {self.learning_resource.readable_id}"
+        )
+
+
+class LearningResourceViewEvent(TimestampedModel):
+    """Stores lrd_view events, with an FK to the resource the event is for."""
+
+    learning_resource = models.ForeignKey(
+        LearningResource,
+        on_delete=models.CASCADE,
+        help_text="The learning resource for this event.",
+        editable=False,
+        related_name="views",
+    )
+    event_date = models.DateTimeField(
+        editable=False,
+        help_text="The date of the lrd_view event, as collected by PostHog.",
+    )
+    event_uuid = models.UUIDField(
+        null=True,
+        editable=False,
+        help_text=(
+            "The PostHog event UUID. Null only for rows loaded"
+            " before this field existed."
+        ),
+    )
+
+    class Meta:
+        constraints = [
+            # Conditional so the index skips the legacy NULL rows, which would
+            # otherwise cost ~105MB of index for entries nothing ever probes.
+            models.UniqueConstraint(
+                fields=["event_uuid"],
+                condition=Q(event_uuid__isnull=False),
+                name="learning_resources_lrviewevent_event_uuid_uniq",
+            )
+        ]
+
+    def __str__(self):
+        """Return a string representation of the event."""
+
+        return (
+            f"View of Learning Resource {self.learning_resource}"
+            f" ({self.learning_resource.platform} -"
+            f" {self.learning_resource.readable_id})"
+            f" on {self.event_date}"
+        )
+
+
+class ContentSummarizerConfiguration(TimestampedModel):
+    """Stores configuration for content summarizer"""
+
+    llm_model = models.CharField(
+        max_length=128, verbose_name="LLM Model", help_text="Add any OpenAI LLM model."
+    )
+    platform = models.OneToOneField(
+        LearningResourcePlatform,
+        on_delete=models.PROTECT,
+        related_name="summarizer_config",
+    )
+    allowed_content_types = ArrayField(
+        models.CharField(
+            max_length=128, choices=constants.VALID_COURSE_CONTENT_CHOICES
+        ),
+        null=True,
+        blank=True,
+        default=list,
+    )
+    allowed_extensions = ArrayField(
+        models.CharField(max_length=128, choices=constants.VALID_ALL_FILE_TYPES),
+        null=True,
+        blank=True,
+        default=list,
+    )
+    is_active = models.BooleanField(default=True)
+
+
+class CredentialMetadataConfiguration(TimestampedModel):
+    """
+    Admin-editable prompt and model for one credential metadata field.
+
+    One row per field and resource type, so the credential program can retune
+    each prompt (and pick a different model for it) without a deploy. Mirrors
+    ContentSummarizerConfiguration.
+    """
+
+    field = models.CharField(
+        max_length=32,
+        choices=constants.CredentialMetadataField.as_tuple(),
+        help_text="The metadata field this row configures.",
+    )
+    resource_type = models.CharField(
+        max_length=24,
+        default=constants.LearningResourceType.course.name,
+        choices=constants.LearningResourceType.as_tuple(),
+        help_text="The kind of resource this row's prompt is written for.",
+    )
+    llm_model = models.CharField(
+        max_length=128, verbose_name="LLM Model", help_text="Add any OpenAI LLM model."
+    )
+    prompt = models.TextField(help_text="Appended to the assembled course context.")
+    temperature = models.FloatField(default=0.0)
+    # Read only from a field generated out of course content -- criteria today.
+    # Retrieval happens once per request and is shared, so the first such field
+    # supplies the query.
+    retrieval_query = models.TextField(
+        blank=True,
+        default="",
+        help_text=(
+            "Vector search query for course content. Blank generates from the"
+            " marketing page and metadata alone. Only used for criteria,"
+            " ignored for description."
+        ),
+    )
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["field", "resource_type"],
+                name="unique_credential_metadata_configuration_field_resource_type",
+            )
+        ]
+
+    def __str__(self):
+        return (
+            f"CredentialMetadataConfiguration for {self.field} ({self.resource_type})"
+        )
+
+
+class CredentialMetadataGenerationLog(TimestampedModel):
+    """
+    Append-only record of one credential metadata generation.
+
+    Written on every call and never read on the request path: the API does not
+    cache, so this table is the only record of what was generated, from what
+    context, by which prompt and model.
+    """
+
+    learning_resource = models.ForeignKey(
+        LearningResource,
+        on_delete=models.CASCADE,
+        related_name="credential_metadata_generation_logs",
+    )
+    field = models.CharField(
+        max_length=32, choices=constants.CredentialMetadataField.as_tuple()
+    )
+
+    response = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="The structured response, or null on failure.",
+    )
+    error = models.TextField(
+        blank=True, default="", help_text="The error message, if generation failed."
+    )
+
+    # Snapshots rather than a foreign key to the configuration: prompts and
+    # models are admin-editable, and a response stored against a mutable
+    # prompt is uninterpretable after that prompt is retuned.
+    prompt_text = models.TextField()
+    llm_model = models.CharField(max_length=128)
+    temperature = models.FloatField(null=True, blank=True)
+
+    # Stored in full rather than hashed: retrieval is not reproducible, since
+    # chunks change as content is re-indexed, so a hash would tell us two runs
+    # differed without recovering what either saw. Roughly 64KB a row at a 16k
+    # budget, so defer() it in list queries.
+    context_text = models.TextField(
+        blank=True,
+        default="",
+        help_text="The full context sent to the model.",
+    )
+    context_tokens = models.PositiveIntegerField(default=0)
+    retrieved_point_ids = ArrayField(
+        models.CharField(max_length=64), default=list, blank=True
+    )
+
+    latency_ms = models.PositiveIntegerField(null=True, blank=True)
+    generated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL
+    )
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["learning_resource", "field", "-created_on"]),
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.field} generation for"
+            f" {self.learning_resource.readable_id} at {self.created_on}"
+        )
+
+
+class CredentialMetadata(TimestampedModel):
+    """
+    The credential metadata currently in force for a learning resource.
+
+    Pre-populated by a daily sweep so that a credential can be issued without
+    waiting on (or paying for) a generation, and replaced whenever the API is
+    asked to regenerate. Distinct from CredentialMetadataGenerationLog, which
+    is the append-only history of every attempt: this is the one current value.
+
+    """
+
+    learning_resource = models.OneToOneField(
+        LearningResource,
+        on_delete=models.CASCADE,
+        related_name="credential_metadata",
+    )
+    description = models.TextField(
+        blank=True,
+        default="",
+        help_text="The Open Badges 3.0 description, 1-2 sentences.",
+    )
+    # TextField, not the CharField(max_length=N) that every other ArrayField in
+    # this module wraps: nothing on the generation path truncates a bullet, and
+    # a varchar(N)[] would raise DataError mid-sweep on an unusually long one.
+    criteria = ArrayField(
+        models.TextField(),
+        default=list,
+        blank=True,
+        help_text="Open Badges 3.0 criteria, one skill per bullet.",
+    )
+
+    def __str__(self):
+        return f"Credential metadata for {self.learning_resource.readable_id}"
+
+
+class ETLSourceOwnership(TimestampedModel):
+    """
+    Names the pipeline that owns writes for an (etl_source, resource_type) pair.
+
+    A missing row means legacy (the Celery ETL). Changing ``owner`` is the
+    per-source cutover between the legacy ETL, the warehouse pull and the data
+    platform's webhook push. See learning_resources/etl/ownership.py.
+    """
+
+    class Pipeline(models.TextChoices):
+        LEGACY = "legacy", "Legacy (Celery ETL)"
+        WAREHOUSE = "warehouse", "Warehouse pull (StarRocks)"
+        WEBHOOK = "webhook", "Webhook push (data platform)"
+
+    etl_source = models.CharField(max_length=32)
+    resource_type = models.CharField(max_length=32)
+    owner = models.CharField(
+        max_length=16, choices=Pipeline.choices, default=Pipeline.LEGACY
+    )
+    shadow = models.CharField(
+        max_length=16,
+        # every pipeline but legacy, which has no single entry point to wrap
+        choices=Pipeline.choices[1:],
+        blank=True,
+        default="",
+        help_text="Pipeline that runs for this pair as a reported dry run",
+    )
+
+    class Meta:
+        unique_together = ("etl_source", "resource_type")
+        verbose_name = "ETL source ownership"
+        verbose_name_plural = "ETL source ownerships"
+
+    def __str__(self):
+        return f"{self.etl_source}/{self.resource_type}: {self.owner}"
+
+    def clean(self):
+        """
+        Reject a shadow that is also the owner, which would write, not shadow,
+        and a shadow of a pair that pipeline's shadow run does not compare,
+        which would report nothing.
+        """
+        super().clean()
+        if self.shadow and self.shadow == self.owner:
+            raise ValidationError(
+                {"shadow": "The shadow pipeline must differ from the owner."}
+            )
+        if self.shadow and not constants.shadow_compares(
+            self.etl_source, self.resource_type, self.shadow
+        ):
+            raise ValidationError(
+                {
+                    "shadow": (
+                        f"A {self.shadow} shadow run does not compare "
+                        f"{self.etl_source} {self.resource_type} resources yet."
+                    )
+                }
+            )
+
+
+class ETLShadowRun(TimestampedModel):
+    """
+    What one shadow run of a pipeline would have changed for an
+    (etl_source, resource_type) pair. See learning_resources/etl/shadow.py.
+    """
+
+    etl_source = models.CharField(max_length=32)
+    resource_type = models.CharField(max_length=32)
+    pipeline = models.CharField(
+        max_length=16, choices=ETLSourceOwnership.Pipeline.choices
+    )
+    counts = models.JSONField(default=dict)
+    details = models.JSONField(default=dict)
+    error = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-created_on"]
+        indexes = [models.Index(fields=["etl_source", "resource_type", "pipeline"])]
+        verbose_name = "ETL shadow run"
+
+    def __str__(self):
+        return (
+            f"{self.pipeline} shadow of {self.etl_source}/{self.resource_type} "
+            f"at {self.created_on:%Y-%m-%d %H:%M}"
+        )

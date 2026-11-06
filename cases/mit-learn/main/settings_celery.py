@@ -1,0 +1,328 @@
+"""
+Django settings for celery.
+"""
+
+from datetime import timedelta
+
+from celery.schedules import crontab
+from redbeat import RedBeatScheduler
+
+from main.envs import get_bool, get_int, get_string
+
+"""
+the schedule (in minutes) for the embeddings task
+the lookback window for getting items to embed
+will be a constant 60 minutes greater more than the schedule frequency
+"""
+EMBEDDING_SCHEDULE_MINUTES = get_int(name="EMBEDDING_SCHEDULE_MINUTES", default=60)
+QDRANT_EMBEDDINGS_TASK_LOOKBACK_WINDOW = EMBEDDING_SCHEDULE_MINUTES + 60
+
+# Released-content sweep: LOOKBACK without a watermark; OVERLAP re-covers a
+# failed indexing chain. Both must be at least the sweep interval.
+RELEASED_CONTENT_FILES_LOOKBACK = timedelta(days=1)
+RELEASED_CONTENT_FILES_SWEEP_OVERLAP = timedelta(hours=1)
+
+DEV_ENV = get_bool("DEV_ENV", False)  # noqa: FBT003
+USE_CELERY = True
+REDIS_URL = get_string("REDIS_URL", None)
+CELERY_BROKER_URL = get_string("CELERY_BROKER_URL", None)
+CELERY_RESULT_BACKEND = get_string("CELERY_RESULT_BACKEND", None)
+# Celery's 24h default lets reindex chord fan-outs (thousands of subtask
+# result keys) accumulate; when the result backend is the broker/cache Redis
+# (the default here) that saturates memory. Keep results only long enough for
+# chord callbacks to consume them.
+CELERY_RESULT_EXPIRES = get_int("CELERY_RESULT_EXPIRES", 60 * 60)
+CELERY_BEAT_SCHEDULER = RedBeatScheduler
+redbeat_redis_url = CELERY_BROKER_URL
+CELERY_TASK_ALWAYS_EAGER = get_bool("CELERY_TASK_ALWAYS_EAGER", False)  # noqa: FBT003
+CELERY_TASK_EAGER_PROPAGATES = get_bool(
+    "CELERY_TASK_EAGER_PROPAGATES",
+    True,  # noqa: FBT003
+)
+CELERY_WORKER_MAX_MEMORY_PER_CHILD = get_int(
+    "CELERY_WORKER_MAX_MEMORY_PER_CHILD", 250_000
+)
+CELERY_BEAT_DISABLED = get_bool("CELERY_BEAT_DISABLED", False)  # noqa: FBT003
+
+CELERY_BEAT_SCHEDULE = (
+    {}
+    if CELERY_BEAT_DISABLED
+    else {
+        "update_next-start-date-every-1-days": {
+            "task": "learning_resources.tasks.update_next_start_date_and_prices",
+            "schedule": crontab(minute=0, hour=7),  # 3:00am EST
+        },
+        "reindex-released-content-files-every-1-hours": {
+            "task": "learning_resources.tasks.reindex_released_content_files",
+            "schedule": crontab(minute=15),
+        },
+        "update-mit-climate-articles-every-1-days": {
+            "task": "learning_resources.tasks.get_mit_climate_data",
+            "schedule": crontab(minute=30, hour=5),  # 1:30am EST
+        },
+        "update-mitxonline-courses-every-6-hours": {
+            "task": "learning_resources.tasks.get_mitxonline_data",
+            "schedule": crontab(minute=0, hour="*/6"),
+        },
+        "update-mitxonline-files-every-1-day": {
+            "task": "learning_resources.tasks.import_all_mitxonline_files",
+            "schedule": crontab(minute=0, hour=7),
+        },
+        "update-podcasts": {
+            "task": "learning_resources.tasks.get_podcast_data",
+            "schedule": crontab(minute=0, hour="6,23"),  # 2am and 7pm EST
+        },
+        # 30 minutes after each podcast run, so a new episode's transcript
+        # lands shortly after the episode itself. Same pairing as
+        # update-ovs-videos / update-ovs-transcripts. overwrite defaults to
+        # False, so only episodes still missing a transcript are fetched.
+        "update-podcast-transcripts": {
+            "task": "learning_resources.tasks.get_podcast_transcripts",
+            "schedule": crontab(minute=30, hour="6,23"),  # 2:30am and 7:30pm EST
+        },
+        "update-professional-ed-resources-every-1-days": {
+            "task": "learning_resources.tasks.get_mitpe_data",
+            "schedule": crontab(minute=0, hour=21),  # 5:00pm EST
+        },
+        "update-xpro-courses-every-1-days": {
+            "task": "learning_resources.tasks.get_xpro_data",
+            "schedule": crontab(minute=0, hour=5),  # 1:00am EST
+        },
+        "update-xpro-files-every-1-day": {
+            "task": "learning_resources.tasks.import_all_xpro_files",
+            "schedule": crontab(minute=0, hour=8),
+        },
+        "update-youtube-videos": {
+            "task": "learning_resources.tasks.get_youtube_data",
+            "schedule": crontab(minute=30, hour=8),  # 4:30am EST
+        },
+        "update-ovs-videos": {
+            "task": "learning_resources.tasks.get_ovs_data",
+            "schedule": crontab(minute=0, hour=9),  # 5:00am EST
+        },
+        "update-ovs-transcripts": {
+            "task": "learning_resources.tasks.get_ovs_transcripts",
+            "schedule": crontab(minute=30, hour=9),  # 5:30am EST
+        },
+        "update_medium_mit_news": {
+            "task": "news_events.tasks.get_medium_mit_news",
+            "schedule": get_int(
+                "NEWS_EVENTS_MEDIUM_NEWS_SCHEDULE_SECONDS", 60 * 60 * 3
+            ),  # default is every 3 hours
+        },
+        "update_mitpe_events": {
+            "task": "news_events.tasks.get_mitpe_events",
+            "schedule": get_int(
+                "NEWS_EVENTS_MITPE_EVENTS_SCHEDULE_SECONDS", 60 * 60 * 3
+            ),  # default is every 3 hours
+        },
+        "update_mitpe_news": {
+            "task": "news_events.tasks.get_mitpe_news",
+            "schedule": get_int(
+                "NEWS_EVENTS_MITPE_NEWS_SCHEDULE_SECONDS", 60 * 60 * 3
+            ),  # default is every 3 hours
+        },
+        "update_sloan_courses": {
+            "task": "learning_resources.tasks.get_sloan_data",
+            "schedule": crontab(minute=30, hour=4),  # 12:30am EST
+        },
+        "update_ol_events": {
+            "task": "news_events.tasks.get_ol_events",
+            "schedule": get_int(
+                "NEWS_EVENTS_OL_EVENTS_SCHEDULE_SECONDS", 60 * 60 * 3
+            ),  # default is every 3 hours
+        },
+        "update_website_content_news": {
+            "task": "news_events.tasks.get_website_content_news",
+            "schedule": get_int(
+                # NEWS_EVENTS_WEBSITE_CONTENT_NEWS_SCHEDULE_SECONDS is the new name;
+                # fall back to the legacy NEWS_EVENTS_ARTICLES_NEWS_SCHEDULE_SECONDS
+                # so existing deployments keep their configured schedule during cutover.
+                "NEWS_EVENTS_WEBSITE_CONTENT_NEWS_SCHEDULE_SECONDS",
+                get_int("NEWS_EVENTS_ARTICLES_NEWS_SCHEDULE_SECONDS", 60 * 60 * 1),
+            ),  # default is every 1 hour
+        },
+        "sync_canvas_courses-every-1-weeks": {
+            "task": "learning_resources.tasks.sync_canvas_courses",
+            "schedule": crontab(
+                minute=0, hour=5, day_of_week=0
+            ),  # 12:00 PM EST on Sundays
+            "kwargs": {"canvas_course_ids": None, "overwrite": False},
+        },
+        "update_posthog_events": {
+            "task": "learning_resources.tasks.get_learning_resource_views",
+            "schedule": get_int(
+                "NEWS_EVENTS_OL_EVENTS_SCHEDULE_SECONDS", 60 * 60 * 3
+            ),  # default is every 3 hours
+        },
+        "send-subscription-emails-every-1-days": {
+            "task": "learning_resources_search.tasks.send_subscription_emails",
+            "schedule": crontab(minute=30, hour=18),  # 2:30pm EST
+            "kwargs": {
+                "period": "daily",
+                "subscription_type": "channel_subscription_type",
+            },
+        },
+        "send-search-subscription-emails-every-1-days": {
+            "task": "learning_resources_search.tasks.send_subscription_emails",
+            "schedule": crontab(minute=0, hour=19),  # 3:00pm EST
+            "kwargs": {
+                "period": "daily",
+                "subscription_type": "search_subscription_type",
+            },
+        },
+        "update-search-featured-ranks-1-days": {
+            "task": "learning_resources_search.tasks.update_featured_rank",
+            "schedule": crontab(minute=30, hour=7),  # 3:30am EST
+        },
+        "delete-old-task-jobs-every-1-days": {
+            "task": "main.tasks.delete_old_task_jobs",
+            "schedule": crontab(minute=0, hour=8),  # 4:00am EST
+        },
+        "clear-views-cache": {
+            "task": "main.tasks.clear_views_cache",
+            # This, not REDIS_VIEW_CACHE_DURATION, is the effective lifetime of
+            # a cached view response: it bounds how stale ETL and search index
+            # changes can look to users. Lengthen it for more cache hits and
+            # less rendering load, shorten it for fresher responses.
+            "schedule": get_int(
+                "CLEAR_VIEWS_CACHE_SCHEDULE_SECONDS", 60 * 60
+            ),  # default is every hour
+        },
+        "scrape-marketing-pages-every-1-days": {
+            "task": "learning_resources.tasks.scrape_marketing_pages",
+            "schedule": get_int(
+                "SCRAPE_MARKETING_PAGES_SCHEDULE_SECONDS", 60 * 60 * 12
+            ),  # default is every 12 hours
+        },
+        "daily_embed_new_learning_resources": {
+            "task": "vector_search.tasks.embed_new_learning_resources",
+            "schedule": get_int(
+                "EMBED_NEW_RESOURCES_SCHEDULE_SECONDS", 60 * EMBEDDING_SCHEDULE_MINUTES
+            ),  # default is every 30 minutes
+        },
+        "daily_embed_new_content_files": {
+            "task": "vector_search.tasks.embed_new_content_files",
+            "schedule": get_int(
+                "EMBED_NEW_CONTENT_FILES_SCHEDULE_SECONDS",
+                60 * EMBEDDING_SCHEDULE_MINUTES,
+            ),  # default is every 30 minutes
+        },
+        "daily_topic_embeddings_sync": {
+            "task": "vector_search.tasks.sync_topics",
+            "schedule": crontab(minute=0, hour="6,18,23"),  # 2am 2pm and 7pm EST
+        },
+        "daily_tune_qdrant_collections": {
+            "task": "vector_search.tasks.tune_qdrant_collections",
+            "schedule": crontab(minute=0, hour=10),  # once per day
+        },
+        "weekly_check_missing_embeddings": {
+            "task": "vector_search.tasks.embeddings_healthcheck",
+            "schedule": crontab(
+                minute=0, hour=6, day_of_week=6
+            ),  # 2:00am EST on Friday
+        },
+        "cleanup-deleted-content-files-every-1-days": {
+            "task": "learning_resources.tasks.cleanup_deleted_content_files",
+            "schedule": crontab(
+                minute=0, hour=4
+            ),  # 04:00 UTC (midnight ET during DST, 11pm ET during standard time)
+        },
+        "generate-credential-metadata-every-1-days": {
+            "task": "learning_resources.tasks.generate_all_credential_metadata",
+            "schedule": crontab(minute=0, hour=11),  # 7:00am EDT / 6:00am EST
+            # Gaps only. An overwriting sweep regenerates the whole MITx
+            # Online catalogue at full LLM cost every day; the non-overwriting
+            # one queues nothing once the catalogue is filled.
+            "kwargs": {"overwrite": False},
+        },
+    }
+)
+
+# MicroMasters/MITx Online program certificate sync (StarRocks-backed — see
+# learning_resources.lib.warehouse.BaseWarehouseETLTask), replacing the
+# Hightouch sync into external.programcertificate (mitodl/hq#12954).
+# Doesn't participate in the cutover-switch mechanism below: Hightouch runs
+# externally, not as an MIT Learn Celery task, so there's no legacy beat
+# entry here to retire once validated.
+if (
+    not CELERY_BEAT_DISABLED
+    and get_string("STARROCKS_HOST", None)
+    and get_string("STARROCKS_USER", None)
+):
+    CELERY_BEAT_SCHEDULE.update(
+        {
+            "warehouse-sync-program-certificates-every-1-days": {
+                "task": "profiles.tasks.SyncProgramCertificatesTask",
+                "schedule": crontab(minute=0, hour=9),  # 5:00am EDT / 4:00am EST
+                "kwargs": {"full_refresh": True},
+            },
+            # No-ops until ETLSourceOwnership names the warehouse for their
+            # pairs. Once a day, after 10:00 UTC, because the data platform
+            # builds the views once a day starting at 06:00 UTC. update-podcasts
+            # runs at 06:00 and 23:00 UTC with update-podcast-transcripts 30
+            # minutes after each, so once podcasts are flipped the transcript
+            # job runs about 13.5 hours after the load.
+            "warehouse-sync-podcasts-every-1-days": {
+                "task": "learning_resources.tasks.SyncPodcastsTask",
+                "schedule": crontab(minute=0, hour=10),
+                "kwargs": {"full_refresh": True},
+            },
+            "warehouse-sync-youtube-every-1-days": {
+                "task": "learning_resources.tasks.SyncYouTubeTask",
+                "schedule": crontab(minute=30, hour=10),
+                "kwargs": {"full_refresh": True},
+            },
+            # Programs look their courses up, so they follow the courses.
+            "warehouse-sync-xpro-courses-every-1-days": {
+                "task": "learning_resources.tasks.SyncXproCoursesTask",
+                "schedule": crontab(minute=0, hour=11),
+                "kwargs": {"full_refresh": True},
+            },
+            "warehouse-sync-xpro-programs-every-1-days": {
+                "task": "learning_resources.tasks.SyncXproProgramsTask",
+                "schedule": crontab(minute=30, hour=11),
+                "kwargs": {"full_refresh": True},
+            },
+            # 12:30, not 12:00, which update-mitxonline-courses-every-6-hours
+            # takes. The legacy task runs every 6 hours; the views change once a
+            # day.
+            "warehouse-sync-mitxonline-courses-every-1-days": {
+                "task": "learning_resources.tasks.SyncMITxOnlineCoursesTask",
+                "schedule": crontab(minute=30, hour=12),
+                "kwargs": {"full_refresh": True},
+            },
+            "warehouse-sync-mitxonline-programs-every-1-days": {
+                "task": "learning_resources.tasks.SyncMITxOnlineProgramsTask",
+                "schedule": crontab(minute=0, hour=13),
+                "kwargs": {"full_refresh": True},
+            },
+            "warehouse-sync-ocw-courses-every-1-days": {
+                "task": "learning_resources.tasks.SyncOCWCoursesTask",
+                "schedule": crontab(minute=0, hour=12),
+                "kwargs": {"full_refresh": True},
+            },
+        }
+    )
+
+# Per-source cutover between the legacy Celery ETL, the warehouse pull and the
+# data platform's webhook push is not configured here. Every pipeline stays
+# scheduled and checks ETLSourceOwnership when it runs, so only the owner of an
+# (etl_source, resource_type) writes it. Flip the row in Django admin to cut a
+# source over or back. See learning_resources/etl/ownership.py.
+
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TIMEZONE = "UTC"
+CELERY_TASK_SEND_SENT_EVENT = True
+# Expire orphaned per-consumer event queues so celeryev traffic does not
+# accumulate unbounded in Redis when an event consumer (Flower, `celery events`,
+# or a worker started with -E) disconnects without deregistering.
+CELERY_EVENT_QUEUE_EXPIRES = get_int("CELERY_EVENT_QUEUE_EXPIRES", 60)
+CELERY_EVENT_QUEUE_TTL = get_int("CELERY_EVENT_QUEUE_TTL", 5)
+CELERY_RATE_LIMIT = get_string("CELERY_DEFAULT_RATE_LIMIT", "600/m")
+CELERY_SEARCH_RATE_LIMIT = get_string("CELERY_SEARCH_RATE_LIMIT", CELERY_RATE_LIMIT)
+CELERY_VECTOR_SEARCH_RATE_LIMIT = get_string(
+    "CELERY_VECTOR_SEARCH_RATE_LIMIT", CELERY_RATE_LIMIT
+)

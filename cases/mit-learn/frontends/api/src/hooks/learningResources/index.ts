@@ -1,0 +1,247 @@
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useInfiniteQuery,
+  useQueryClient,
+} from "@tanstack/react-query"
+import { learningResourcesApi } from "../../clients"
+import type {
+  LearningResourcesApiLearningResourcesListRequest as LRListRequest,
+  TopicsApiTopicsListRequest as TopicsListRequest,
+  LearningResourcesSearchApiLearningResourcesSearchRetrieveRequest as LRSearchRequest,
+  OfferorsApiOfferorsListRequest,
+  PlatformsApiPlatformsListRequest,
+  FeaturedApiFeaturedListRequest as FeaturedListParams,
+  LearningResourcesApiLearningResourcesUserlistsPartialUpdateRequest,
+  LearningResourcesApiLearningResourcesLearningPathsPartialUpdateRequest,
+  LearningResourcesApiLearningResourcesItemsListRequest as ItemsListRequest,
+  LearningResource,
+} from "../../generated/v1"
+// import learningResources from "./keyFactory"
+import {
+  learningResourceQueries,
+  offerorQueries,
+  topicQueries,
+  schoolQueries,
+  platformsQueries,
+  learningResourceKeys,
+  videoPlaylistQueries,
+  podcastEpisodeQueries,
+} from "./queries"
+import { userlistKeys } from "../userLists/queries"
+import { learningPathKeys } from "../learningPaths/queries"
+import { useCallback } from "react"
+
+const useLearningResourcesList = (
+  params: LRListRequest = {},
+  opts?: { enabled?: boolean },
+) => {
+  return useQuery({
+    ...learningResourceQueries.list(params),
+    ...opts,
+  })
+}
+
+const useLearningResourceDetailSetCache = (
+  resource: LearningResource | null | undefined,
+) => {
+  const queryClient = useQueryClient()
+  const onClick = useCallback(() => {
+    if (resource) {
+      queryClient.setQueryData(
+        learningResourceQueries.detail(resource.id).queryKey,
+        resource,
+      )
+    }
+  }, [resource, queryClient])
+  return onClick
+}
+
+const useLearningResourcesDetail = (id: number) => {
+  return useQuery(learningResourceQueries.detail(id))
+}
+
+const useLearningResourceByReadableId = (
+  readableId: string,
+  opts?: { enabled?: boolean },
+) =>
+  useQuery({
+    ...learningResourceQueries.list({ readable_id: [readableId], limit: 1 }),
+    select: (data) => data.results[0] ?? null,
+    ...opts,
+  })
+
+const useLearningResourcesBulkList = (ids: number[]) => {
+  const queryClient = useQueryClient()
+
+  return useQuery({
+    ...learningResourceQueries.list({ resource_id: ids }),
+    enabled: ids.length > 0,
+
+    select: (data) => {
+      const resources = data.results
+
+      resources.forEach((resource) => {
+        queryClient.setQueryData(
+          learningResourceKeys.detail(resource.id),
+          resource,
+        )
+      })
+
+      return resources
+    },
+  })
+}
+
+const useFeaturedLearningResourcesList = (params: FeaturedListParams = {}) => {
+  return useQuery(learningResourceQueries.featured(params))
+}
+
+const useLearningResourceTopic = (id: number, opts?: { enabled?: boolean }) => {
+  return useQuery({
+    ...topicQueries.detail(id),
+    ...opts,
+  })
+}
+
+const useLearningResourceTopics = (
+  params: TopicsListRequest = {},
+  opts?: { enabled?: boolean },
+) => {
+  return useQuery({
+    ...topicQueries.list(params),
+    ...opts,
+  })
+}
+
+const useLearningResourcesSearch = (
+  params: LRSearchRequest,
+  opts?: {
+    keepPreviousData?: boolean
+  },
+) => {
+  return useQuery({
+    ...learningResourceQueries.search(params),
+    placeholderData: opts?.keepPreviousData ? keepPreviousData : undefined,
+  })
+}
+
+const useLearningResourceSetUserListRelationships = () => {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (
+      params: LearningResourcesApiLearningResourcesUserlistsPartialUpdateRequest,
+    ) => learningResourcesApi.learningResourcesUserlistsPartialUpdate(params),
+    onSettled: () => {
+      /**
+       * We need to invalidate:
+       * - membership check
+       * - list of user lists (count has changed)
+       * - userlist detail annd listing for any lists we modified
+       *
+       * That's a lot. Let's just invalidate root.
+       * Additionally, the lists we've removed from the resource are not easily available.
+       */
+      queryClient.invalidateQueries({ queryKey: userlistKeys.root })
+    },
+  })
+}
+
+const useLearningResourceSetLearningPathRelationships = () => {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (
+      params: LearningResourcesApiLearningResourcesLearningPathsPartialUpdateRequest,
+    ) =>
+      learningResourcesApi.learningResourcesLearningPathsPartialUpdate(params),
+    onSettled: () => {
+      /**
+       * We need to invalidate:
+       * - membership check
+       * - list of user lists (count has changed)
+       * - userlist detail annd listing for any lists we modified
+       *
+       * That's a lot. Let's just invalidate root.
+       * Additionally, the lists we've removed from the resource are not easily available.
+       */
+      queryClient.invalidateQueries({ queryKey: learningPathKeys.root })
+      queryClient.invalidateQueries({
+        queryKey: learningResourceKeys.featuredRoot(),
+      })
+    },
+  })
+}
+
+const useOfferorsList = (
+  params: OfferorsApiOfferorsListRequest = {},
+  opts?: { enabled?: boolean },
+) => {
+  return useQuery({
+    ...offerorQueries.list(params),
+    ...opts,
+  })
+}
+
+const usePlatformsList = (
+  params: PlatformsApiPlatformsListRequest = {},
+  opts?: { enabled?: boolean },
+) => {
+  return useQuery({
+    ...platformsQueries.list(params),
+    ...opts,
+  })
+}
+
+const useSchoolsList = () => {
+  return useQuery(schoolQueries.list())
+}
+
+const useSimilarLearningResources = (
+  id: number,
+  opts?: { enabled?: boolean },
+) => {
+  return useQuery({
+    ...learningResourceQueries.similar(id),
+    ...opts,
+  })
+}
+
+const useInfiniteLearningResourceItems = (
+  id: number,
+  params: Omit<ItemsListRequest, "offset">,
+  opts?: { enabled?: boolean },
+) => {
+  return useInfiniteQuery({
+    ...learningResourceQueries.infiniteItems(id, params),
+    ...opts,
+  })
+}
+
+export {
+  useLearningResourcesList,
+  useFeaturedLearningResourcesList,
+  useLearningResourcesDetail,
+  useLearningResourceByReadableId,
+  useLearningResourcesBulkList,
+  useLearningResourceDetailSetCache,
+  useLearningResourceTopic,
+  useLearningResourceTopics,
+  useLearningResourcesSearch,
+  useLearningResourceSetUserListRelationships,
+  useLearningResourceSetLearningPathRelationships,
+  useOfferorsList,
+  usePlatformsList,
+  useSchoolsList,
+  useSimilarLearningResources,
+  useInfiniteLearningResourceItems,
+  learningResourceQueries,
+  offerorQueries,
+  schoolQueries,
+  platformsQueries,
+  topicQueries,
+  learningResourceKeys,
+  videoPlaylistQueries,
+  podcastEpisodeQueries,
+  LearningResource,
+}

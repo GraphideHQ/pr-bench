@@ -1,0 +1,687 @@
+import { faker } from "@faker-js/faker/locale/en"
+import { mergeOverrides, type PartialFactory } from "ol-test-utilities"
+import * as u from "api/test-utils"
+import * as mitxonline from "api/mitxonline-test-utils"
+import { urls, factories } from "api/mitxonline-test-utils"
+import { setMockResponse } from "../../../test-utils"
+import moment from "moment"
+import {
+  ContractPage,
+  OrganizationPage,
+  User,
+  UserContractPage,
+  LanguageEnum,
+} from "@mitodl/mitxonline-api-axios/v0"
+import {
+  CourseWithCourseRunsSerializerV2,
+  V2Program,
+  V2ProgramDetail,
+} from "@mitodl/mitxonline-api-axios/v2"
+import {
+  CourseRunEnrollmentV3,
+  V3UserProgramEnrollment,
+} from "@mitodl/mitxonline-api-axios/v3"
+import { getIdsFromReqTree } from "@/common/mitxonline"
+
+const makeCourses = factories.courses.courses
+const makeProgram = factories.programs.program
+const makeProgramCollection = factories.programs.programCollection
+const makeCourseEnrollment = factories.enrollment.courseEnrollment
+const makeGrade = factories.enrollment.grade
+const makeContract = factories.contracts.contract
+
+/**
+ * Mock the per-learner price quote the certificate upsell fetches for every
+ * purchasable product on the given courses. Required in any suite that opens
+ * CourseEnrollmentDialog on an upgradable run, or the unmocked request fails
+ * the test. Quotes default to list price with no discount; re-register one to
+ * exercise a discount.
+ *
+ * Takes whole courses, variadically, because that is what these suites hold.
+ * ProductPages/test-utils/userPricing.ts has the per-run and per-program forms
+ * the InfoBox suites want; the names are kept distinct so the two do not read
+ * as the same helper.
+ */
+const setupCoursePricing = (
+  ...courses: CourseWithCourseRunsSerializerV2[]
+): void => {
+  courses.forEach((course) =>
+    (course.courseruns ?? []).forEach((run) =>
+      (run.products ?? []).forEach((product) =>
+        setMockResponse.get(
+          urls.products.userPricingDetail(product.id),
+          factories.products.userPricing({
+            id: product.id,
+            price: product.price,
+          }),
+        ),
+      ),
+    ),
+  )
+}
+
+/**
+ * Mock the order history that enrollment cards fetch to decide whether to show a
+ * "Receipt" item. Required in any suite rendering an enrollment card, whatever
+ * its mode — a refunded order leaves the learner auditing and still has a
+ * receipt — or the unmocked request fails the test. Defaults to an empty history
+ * (no receipt); pass `runId`/`programId` to make one resolve.
+ */
+const setupOrderHistory = ({
+  runId,
+  programId,
+  orderId = faker.number.int({ min: 1 }),
+}: {
+  runId?: number
+  programId?: number
+  orderId?: number
+} = {}) => {
+  const lines = []
+  if (runId !== undefined) {
+    lines.push(
+      factories.orders.line({
+        product: factories.orders.product({
+          purchasable_object: {
+            id: runId,
+            title: "Some Run",
+            course: { id: faker.number.int(), title: "Some Course" },
+          },
+        }),
+      }),
+    )
+  }
+  if (programId !== undefined) {
+    lines.push(
+      factories.orders.line({
+        product: factories.orders.product({
+          purchasable_object: {
+            id: programId,
+            title: "Some Program",
+            readable_id: "program-v1:MITxT+SysEng",
+          },
+        }),
+      }),
+    )
+  }
+
+  setMockResponse.get(
+    urls.orders.historyList({ limit: 100 }),
+    factories.orders.orderHistoryList(
+      lines.length > 0
+        ? [
+            factories.orders.orderHistory({
+              id: orderId,
+              state: "fulfilled",
+              lines,
+            }),
+          ]
+        : [],
+    ),
+  )
+
+  return { orderId }
+}
+
+/**
+ * Mock the program certificates a program card fetches to decide whether to show
+ * a "Program Letter" item. Only requested when the `program-letters` flag is on,
+ * so this is required in any suite that renders a program card with feature
+ * flags mocked true. Defaults to no certificates (no letter link); pass
+ * `mitxonlineProgramIds` to give those programs one.
+ */
+const setupProgramCertificates = ({
+  mitxonlineProgramIds = [],
+}: { mitxonlineProgramIds?: number[] } = {}) => {
+  setMockResponse.get(
+    u.urls.programCertificates.list(),
+    mitxonlineProgramIds.map((id) =>
+      u.factories.programCertificates.programCertificate({
+        mitxonline_program_id: id,
+      }),
+    ),
+  )
+}
+
+const dashboardCourse: PartialFactory<CourseWithCourseRunsSerializerV2> = (
+  ...overrides
+) => {
+  // Use the existing factory that creates proper CourseWithCourseRunsSerializerV2 objects
+  const course = factories.courses.course()
+  return mergeOverrides<CourseWithCourseRunsSerializerV2>(course, ...overrides)
+}
+
+const dashboardProgram: PartialFactory<V2Program> = (...overrides) => {
+  // Use the existing factory that creates proper V2Program objects
+  const program = makeProgram()
+  return mergeOverrides<V2Program>(program, ...overrides)
+}
+
+const setupEnrollments = (includeExpired: boolean) => {
+  const completed = [
+    makeCourseEnrollment({
+      b2b_contract_id: null, // Personal enrollment, not B2B
+      run: { title: "C Course Ended" },
+      grades: [makeGrade({ passed: true })],
+    }),
+  ]
+  const expired = includeExpired
+    ? [
+        makeCourseEnrollment({
+          b2b_contract_id: null, // Personal enrollment, not B2B
+          run: {
+            title: "A Course Ended",
+            end_date: faker.date.past().toISOString(),
+          },
+        }),
+        makeCourseEnrollment({
+          b2b_contract_id: null, // Personal enrollment, not B2B
+          run: {
+            title: "B Course Ended",
+            end_date: faker.date.past().toISOString(),
+          },
+        }),
+      ]
+    : []
+  const started = [
+    makeCourseEnrollment({
+      b2b_contract_id: null, // Personal enrollment, not B2B
+      run: {
+        title: "A Course Started",
+        start_date: faker.date.past().toISOString(),
+      },
+    }),
+    makeCourseEnrollment({
+      b2b_contract_id: null, // Personal enrollment, not B2B
+      run: {
+        title: "B Course Started",
+        start_date: faker.date.past().toISOString(),
+      },
+    }),
+  ]
+  const notStarted = [
+    makeCourseEnrollment({
+      b2b_contract_id: null, // Personal enrollment, not B2B
+      run: {
+        start_date: moment().add(1, "day").toISOString(), // Sooner first
+      },
+    }),
+    makeCourseEnrollment({
+      b2b_contract_id: null, // Personal enrollment, not B2B
+      run: {
+        start_date: moment().add(5, "day").toISOString(), // Later second
+      },
+    }),
+  ]
+  const enrollments = faker.helpers.shuffle([
+    ...expired,
+    ...completed,
+    ...started,
+    ...notStarted,
+  ])
+  return {
+    enrollments: enrollments,
+    completed: completed,
+    expired: expired,
+    started: started,
+    notStarted: notStarted,
+  }
+}
+
+const setupProgramsAndCourses = () => {
+  const user = u.factories.user.user()
+  const orgX = factories.organizations.organization({ name: "Org X" })
+
+  const contract = makeContract({
+    organization: orgX.id,
+    name: "Org X Contract",
+    programs: [], // Will be set after creating programs
+  })
+
+  const coursesA = makeCourses({ count: 4 })
+  const coursesB = makeCourses({ count: 3 })
+
+  // Add contract IDs to course runs
+  coursesA.results = coursesA.results.map((course) => ({
+    ...course,
+    courseruns: course.courseruns.map((run) => ({
+      ...run,
+      b2b_contract: contract.id,
+      is_enrollable: true,
+    })),
+  }))
+  coursesB.results = coursesB.results.map((course) => ({
+    ...course,
+    courseruns: course.courseruns.map((run) => ({
+      ...run,
+      b2b_contract: contract.id,
+      is_enrollable: true,
+    })),
+  }))
+
+  const programA = makeProgram({
+    courses: coursesA.results.map((c) => c.id),
+  })
+  const programB = makeProgram({
+    courses: coursesB.results.map((c) => c.id),
+  })
+
+  // Now set the programs on the contract
+  contract.programs = [programA.id, programB.id]
+
+  orgX.contracts = [contract]
+  const mitxOnlineUser = factories.user.user({ b2b_organizations: [orgX] })
+  setMockResponse.get(u.urls.userMe.get(), user)
+  setMockResponse.get(urls.userMe.get(), mitxOnlineUser)
+
+  const programCollection = makeProgramCollection({
+    title: "Program Collection",
+    programs: [],
+  })
+
+  setMockResponse.get(urls.programs.programsList({ org_id: orgX.id }), {
+    results: [programA, programB],
+  })
+  setMockResponse.get(
+    urls.programs.programsList({
+      org_id: orgX.id,
+      contract_id: contract.id,
+      page_size: 30,
+    }),
+    {
+      results: [programA, programB],
+    },
+  )
+  setMockResponse.get(urls.programCollections.programCollectionsList(), {
+    results: [programCollection],
+  })
+  setMockResponse.get(
+    urls.programs.programsList({ id: [programA.id], org_id: orgX.id }),
+    { results: [programA] },
+  )
+  setMockResponse.get(
+    urls.programs.programsList({ id: [programB.id], org_id: orgX.id }),
+    { results: [programB] },
+  )
+  setMockResponse.get(
+    urls.courses.coursesList({
+      org_id: orgX.id,
+      contract_id: contract.id,
+      page_size: 200,
+    }),
+    {
+      results: [...coursesA.results, ...coursesB.results],
+    },
+  )
+  setMockResponse.get(
+    urls.courses.coursesList({
+      id: programA.courses,
+      contract_id: contract.id,
+      page_size: 30,
+    }),
+    {
+      results: coursesA.results,
+    },
+  )
+  setMockResponse.get(
+    urls.courses.coursesList({
+      id: programB.courses,
+      contract_id: contract.id,
+      page_size: 30,
+    }),
+    {
+      results: coursesB.results,
+    },
+  )
+
+  return {
+    orgX,
+    user,
+    mitxOnlineUser,
+    programA,
+    programB,
+    programCollection,
+    coursesA: coursesA.results,
+    coursesB: coursesB.results,
+  }
+}
+
+/**
+ * Test utility to create enrollments for contract-scoped runs
+ */
+const createEnrollmentsForContractRuns = (
+  courses: CourseWithCourseRunsSerializerV2[],
+  contractIds: number[],
+): CourseRunEnrollmentV3[] => {
+  return courses.flatMap((course) =>
+    course.courseruns
+      .filter(
+        (run) => run.b2b_contract && contractIds.includes(run.b2b_contract),
+      )
+      .map((run) => ({
+        ...factories.enrollment.courseEnrollment({
+          run: {
+            id: run.id,
+            course: {
+              id: course.id,
+              title: course.title,
+            },
+            title: run.title,
+          },
+        }),
+        b2b_contract_id: run.b2b_contract ?? null,
+        b2b_organization_id: null, // Will be set by individual tests as needed
+      })),
+  )
+}
+
+/**
+ * Helper function to set up organization, user, and related data
+ */
+function setupOrgAndUser() {
+  const user = u.urls.userMe.get()
+  const orgX = factories.organizations.organization({ name: "Test Org" })
+  const mitxOnlineUser = factories.user.user({
+    b2b_organizations: [
+      {
+        ...orgX,
+        slug: `org-${orgX.slug}`,
+      },
+    ],
+  })
+
+  return { orgX, user, mitxOnlineUser }
+}
+
+/**
+ * Helper function to set up all necessary API mocks for organization dashboard
+ */
+function setupOrgDashboardMocks(
+  org: OrganizationPage,
+  user: string,
+  mitxOnlineUser: User,
+  programs: V2Program[],
+  courses: CourseWithCourseRunsSerializerV2[],
+  contracts: ContractPage[],
+) {
+  // Basic user setup
+  setMockResponse.get(u.urls.userMe.get(), user)
+  setMockResponse.get(mitxonline.urls.userMe.get(), mitxOnlineUser)
+
+  // Empty defaults
+  setMockResponse.get(
+    mitxonline.urls.programEnrollments.enrollmentsListV3(),
+    [],
+  )
+  setMockResponse.get(
+    mitxonline.urls.programCollections.programCollectionsList(),
+    { results: [] },
+  )
+
+  // Program and course data
+  setMockResponse.get(
+    mitxonline.urls.programs.programsList({ org_id: org.id }),
+    { results: programs },
+  )
+
+  // Mock programs query with contract filter
+  if (contracts.length > 0) {
+    setMockResponse.get(
+      mitxonline.urls.programs.programsList({
+        org_id: org.id,
+        contract_id: contracts[0].id,
+        page_size: 30,
+      }),
+      { results: programs },
+    )
+
+    // Mock courses query with contract filter for program validation
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        org_id: org.id,
+        contract_id: contracts[0].id,
+        page_size: 200,
+      }),
+      { results: courses },
+    )
+  }
+
+  programs.forEach((program) => {
+    if (contracts.length > 0) {
+      setMockResponse.get(
+        mitxonline.urls.courses.coursesList({
+          id: program.courses,
+          contract_id: contracts[0].id,
+          page_size: 30,
+        }),
+        { results: courses },
+      )
+    }
+  })
+}
+
+/**
+ * Test utility to create B2B contracts for testing
+ */
+const createTestContracts = (
+  orgId: number,
+  count: number = 1,
+  programs: number[] = [],
+): UserContractPage[] =>
+  Array.from({ length: count }, () =>
+    makeContract({ organization: orgId, programs }),
+  )
+
+/**
+ * Test utility to create courses with contract-scoped course runs
+ */
+const createCoursesWithContractRuns = (contracts: ContractPage[]) => {
+  const contractIds = contracts.map((c) => c.id)
+
+  return factories.courses.courses({ count: 3 }).results.map((course) => {
+    const contractRun = {
+      ...course.courseruns[0],
+      id: faker.number.int(),
+      b2b_contract: contractIds[0], // Associated with org contract
+      is_enrollable: true,
+      start_date: faker.date.future().toISOString(),
+      end_date: faker.date.future().toISOString(),
+      title: `${course.title} - Org Contract Run`,
+    }
+    const otherOrgRun = {
+      ...course.courseruns[0],
+      id: faker.number.int(),
+      b2b_contract: faker.number.int(), // Different contract ID
+      is_enrollable: true,
+      start_date: faker.date.past().toISOString(),
+      end_date: faker.date.past().toISOString(),
+      title: `${course.title} - Other Org Run`,
+    }
+    const generalRun = {
+      ...course.courseruns[0],
+      id: faker.number.int(),
+      b2b_contract: null,
+      is_enrollable: true,
+      start_date: faker.date.future().toISOString(),
+      end_date: faker.date.future().toISOString(),
+      title: `${course.title} - General Run`,
+    }
+
+    return {
+      ...course,
+      next_run_id: contractRun.id,
+      language_options: [
+        {
+          id: contractRun.id,
+          courseware_id: contractRun.courseware_id,
+          courseware_url: contractRun.courseware_url ?? "",
+          language: LanguageEnum.En,
+          title: contractRun.title,
+          run_tag: contractRun.run_tag,
+        },
+      ],
+      courseruns: [contractRun, otherOrgRun, generalRun],
+    }
+  })
+}
+
+type BuildProgramScenarioInput = {
+  programId: number
+  program: V2ProgramDetail
+  programCourses?: CourseWithCourseRunsSerializerV2[]
+  courseEnrollments?: CourseRunEnrollmentV3[]
+  programEnrollments?: V3UserProgramEnrollment[]
+  requiredPrograms?: V2ProgramDetail[]
+  requiredProgramCourses?: CourseWithCourseRunsSerializerV2[]
+}
+
+type BuildProgramScenarioResult = {
+  entities: {
+    programId: number
+    program: V2ProgramDetail
+    programCourses: CourseWithCourseRunsSerializerV2[]
+    courseEnrollments: CourseRunEnrollmentV3[]
+    programEnrollments: V3UserProgramEnrollment[]
+    requiredPrograms: V2ProgramDetail[]
+    requiredProgramCourses: CourseWithCourseRunsSerializerV2[]
+  }
+  mockAll: () => void
+}
+
+/**
+ * Thin entities-in mock-wirer for `useProgramDashboardData` renderHook tests.
+ *
+ * Tests build the scenario-specific entities (programs, courses, enrollments,
+ * req_tree shape) and pass them in; this builder only wires the standard
+ * `setMockResponse` calls that match the hook's 6 queries exactly (same
+ * query keys, params, page_size, enabled gating). The returned `mockAll()`
+ * also mocks the mitxonline user identity endpoint that the test harness needs.
+ *
+ * Tests may add/override raw `setMockResponse` after `mockAll()` for edge cases.
+ *
+ * Builder owns INFRA ONLY — scenario shape (req_tree, languages, enrollment→run
+ * mapping) lives in each test.
+ */
+const buildProgramScenario = (
+  input: BuildProgramScenarioInput,
+): BuildProgramScenarioResult => {
+  const {
+    programId,
+    program,
+    programCourses = [],
+    courseEnrollments = [],
+    programEnrollments = [],
+    requiredPrograms = [],
+    requiredProgramCourses = [],
+  } = input
+
+  const entities = {
+    programId,
+    program,
+    programCourses,
+    courseEnrollments,
+    programEnrollments,
+    requiredPrograms,
+    requiredProgramCourses,
+  }
+
+  const mockAll = () => {
+    // Infra: identity endpoint needed by the test harness
+    const mitxOnlineUser = factories.user.user()
+    setMockResponse.get(urls.userMe.get(), mitxOnlineUser)
+
+    // Query 1: course-run enrollments list
+    setMockResponse.get(urls.enrollment.enrollmentsListV3(), courseEnrollments)
+
+    // Query 2: program detail
+    setMockResponse.get(urls.programs.programDetail(programId), program)
+
+    // Query 3: program enrollments list
+    setMockResponse.get(
+      urls.programEnrollments.enrollmentsListV3(),
+      programEnrollments,
+    )
+
+    // Query 4: program courses
+    // enabled: !!program && program.courses.length > 0 && enrolledInProgram
+    // Always mock it; tests that need enabled=false just won't call it.
+    if (program.courses && program.courses.length > 0) {
+      setMockResponse.get(
+        urls.courses.coursesList({
+          id: program.courses,
+          page_size: program.courses.length || undefined,
+        }),
+        {
+          count: programCourses.length,
+          next: null,
+          previous: null,
+          results: programCourses,
+        },
+      )
+    }
+
+    // Query 5: required programs list
+    // enabled: Boolean(enrolledInProgram && requiredProgramIds.length > 0)
+    // Mirrors useProgramDashboardData.ts requiredProgramIds useMemo exactly:
+    //   [...new Set(getIdsFromReqTree(program.req_tree).programIds)]
+    // If that changes, mock query keys drift and these scenarios silently fail.
+    const requiredProgramIds = program.req_tree
+      ? [...new Set(getIdsFromReqTree(program.req_tree).programIds)]
+      : []
+    if (requiredProgramIds.length > 0) {
+      setMockResponse.get(
+        urls.programs.programsList({
+          id: requiredProgramIds,
+          page_size: requiredProgramIds.length || undefined,
+        }),
+        {
+          count: requiredPrograms.length,
+          next: null,
+          previous: null,
+          results: requiredPrograms,
+        },
+      )
+    }
+
+    // Query 6: required-program courses (nested-program course children)
+    // enabled: Boolean(enrolledInProgram && requiredProgramCourseIds.length > 0)
+    // Must mirror useProgramDashboardData.ts requiredProgramCourseIds useMemo exactly — same drift risk.
+    const uniqueIds = new Set<number>()
+    requiredPrograms.forEach((p) => {
+      p.courses?.forEach((courseId) => uniqueIds.add(courseId))
+    })
+    const requiredProgramCourseIds = [...uniqueIds]
+
+    if (requiredProgramCourseIds.length > 0) {
+      setMockResponse.get(
+        urls.courses.coursesList({
+          id: requiredProgramCourseIds,
+          page_size: requiredProgramCourseIds.length || undefined,
+        }),
+        {
+          count: requiredProgramCourses.length,
+          next: null,
+          previous: null,
+          results: requiredProgramCourses,
+        },
+      )
+    }
+  }
+
+  return { entities, mockAll }
+}
+
+export {
+  setupCoursePricing,
+  dashboardCourse,
+  dashboardProgram,
+  setupOrderHistory,
+  setupProgramCertificates,
+  setupEnrollments,
+  setupProgramsAndCourses,
+  setupOrgAndUser,
+  setupOrgDashboardMocks,
+  createTestContracts,
+  createCoursesWithContractRuns,
+  createEnrollmentsForContractRuns,
+  buildProgramScenario,
+}

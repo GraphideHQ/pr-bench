@@ -1,0 +1,1218 @@
+"""Utils for learning resources"""
+
+import logging
+import re
+import unicodedata
+from collections import defaultdict
+from functools import cache
+from shutil import which
+from typing import TYPE_CHECKING
+from urllib.parse import quote, urlencode
+
+import html2text
+import rapidjson
+import yaml
+from botocore.exceptions import ClientError
+from django.conf import settings
+from django.contrib.auth.models import Group
+from django.db import transaction
+from django.db.models import Prefetch, Q
+from retry import retry
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+
+from learning_resources.constants import (
+    GROUP_STAFF_LISTS_EDITORS,
+    LearningResourceRelationTypes,
+    LearningResourceType,
+    PlatformType,
+    semester_mapping,
+)
+from learning_resources.etl.constants import MARKETING_PAGE_FILE_TYPE
+from learning_resources.hooks import get_plugin_manager
+from learning_resources.models import (
+    ContentFile,
+    LearningResource,
+    LearningResourceDepartment,
+    LearningResourceOfferor,
+    LearningResourceRelationship,
+    LearningResourceRun,
+    LearningResourceTopic,
+    LearningResourceTopicMapping,
+    UserListRelationship,
+)
+from main.azure_openai import strip_azure_prefix
+from main.utils import frontend_absolute_url, generate_filepath
+
+log = logging.getLogger()
+
+
+# edX block types that never have content
+NO_CONTENT_BLOCK_TYPES = (
+    "discussion",
+    "openassessment",
+    "poll",
+    "survey",
+    "drag-and-drop-v2",
+    "lti_consumer",
+    "done",
+    "completion",
+    "edx_sga",
+    "recap",
+    "ubcpi",
+    "qualtricssurvey",
+)
+
+VALID_EDX_MODULE_ID_REGEX = re.compile(
+    r"(?:block-v1|asset-v1):.+\+type@"
+    rf"(?!(?:{'|'.join(map(re.escape, NO_CONTENT_BLOCK_TYPES))})\+block@)"
+    r".*\+block@.+",
+    re.IGNORECASE,
+)
+
+LOGGED_BLOCK_TYPES = ("problem", "problemset", "video", "html")
+LOGGED_TRANSCRIPT_EXTENSIONS = (".srt", ".vtt")
+
+
+def is_valid_edx_module_id(edx_module_id):
+    """
+    Return whether this id could reference indexable contentfiles.
+
+    Edge whitespace is ignored (stored ids never have any); internal
+    whitespace is preserved - Canvas run-ids contain spaces.
+    """
+    return bool(VALID_EDX_MODULE_ID_REGEX.fullmatch((edx_module_id or "").strip()))
+
+
+def filter_valid_edx_module_ids(edx_module_ids):
+    """
+    Return only ids that could reference content-bearing courseware,
+    trimmed of edge whitespace so downstream exact-match lookups hit.
+    """
+    stripped = ((eid or "").strip() for eid in edx_module_ids)
+    return [eid for eid in stripped if is_valid_edx_module_id(eid)]
+
+
+def is_loggable_missing_content_id(edx_module_id):
+    """Missing-contentfile logs are limited to block types bots depend on."""
+    edx_module_id = (edx_module_id or "").strip()
+    if not is_valid_edx_module_id(edx_module_id):
+        return False
+    id_lower = edx_module_id.lower()
+    if id_lower.startswith("asset-v1:"):
+        return id_lower.endswith(LOGGED_TRANSCRIPT_EXTENSIONS)
+    return any(f"+type@{t}+block@" in id_lower for t in LOGGED_BLOCK_TYPES)
+
+
+def log_missing_content_file(identifier, *, reason, source):
+    """
+    Log that a request referenced an edx_module_id with no backing ContentFile.
+
+    Only important block types (problem, video, html, .srt/.vtt transcripts) are
+    logged; everything else (and malformed ids) is silently ignored to keep the
+    Sentry signal meaningful.
+
+    reason: "not_in_db" (no ContentFile row) or "not_in_index" (row exists but
+    not embedded in Qdrant). LoggingIntegration forwards the error to Sentry,
+    which groups by the stable message template and applies its own rate limiting.
+    """
+    if not is_loggable_missing_content_id(identifier):
+        return
+    log.error(
+        "Missing ContentFile (%s) for edx_module_id=%s [source=%s]",
+        reason,
+        identifier,
+        source,
+    )
+
+
+def present_edx_module_ids(edx_module_ids):
+    """Return the subset of edx_module_ids that have a ContentFile row."""
+    return set(
+        ContentFile.objects.filter(edx_module_id__in=edx_module_ids).values_list(
+            "edx_module_id", flat=True
+        )
+    )
+
+
+if TYPE_CHECKING:
+    from django.contrib.auth import get_user_model
+
+    User = get_user_model()
+
+
+def user_list_image_upload_uri(instance, filename):
+    """
+    upload_to handler for user-created UserList image
+    """
+    return generate_filepath(
+        filename, instance.author.username, instance.title, "user_list"
+    )
+
+
+def staff_list_image_upload_uri(instance, filename):
+    """
+    upload_to handler for user-created UserList image
+    """
+    return generate_filepath(filename, "staff_list", instance.title, "")
+
+
+# NOTE: this is unused, but a migration references it, so we'll leave it until we decide to squash migrations or something  # noqa: E501
+def program_image_upload_uri(instance, filename):
+    """
+    upload_to handler for Program image
+    """
+    return generate_filepath(filename, instance.title, "", "program")
+
+
+def get_year_and_semester(course_run):
+    """
+    Parse year and semester out of course run key. If course run key cannot be parsed attempt to get year from start.
+
+    Args:
+        course_run (dict): The JSON object representing the particular course run
+
+    Returns:
+        tuple (str, str): year, semester
+
+    """  # noqa: E501
+    year = course_run.get("year")
+    semester = course_run.get("semester")
+
+    if year == "":
+        year = None
+
+    if semester == "":
+        semester = None
+
+    if not semester and not year:
+        match = re.search(
+            "[1|2|3]T[0-9]{4}", course_run.get("key")
+        )  # e.g. "3T2019" -> Semester "3", Year "2019"
+        if match:
+            year = int(match.group(0)[-4:])
+            semester = semester_mapping.get(match.group(0)[-6:-4])
+            return year, semester
+        match = re.search(
+            "([0-9]{4})_(Spring|Summer|Fall|Winter)", course_run.get("key")
+        )
+        if match:
+            year = int(match.group(1))
+            semester = match.group(2)
+        else:
+            semester = None
+            year = course_run.get("start")[:4] if course_run.get("start") else None
+    return year, semester
+
+
+@retry(
+    ClientError, tries=settings.MAX_S3_GET_ITERATIONS, delay=1, backoff=2, jitter=(1, 5)
+)
+def get_s3_object_and_read(obj):
+    """
+    Attempts to read S3 data, and tries again up to MAX_S3_GET_ITERATIONS if it encounters an error.
+    This helps to prevent read timeout errors from stopping sync.
+
+    Args:
+        obj (s3.ObjectSummary): The S3 ObjectSummary we are trying to read
+
+    Returns:
+        bytes: The contents of a json file read from S3
+    """  # noqa: D401, E501
+    return obj.get()["Body"].read()
+
+
+def safe_load_json(json_string, json_file_key):
+    """
+    Loads the passed string as a JSON object with exception handing and logging.
+    Some OCW JSON content may be malformed.
+
+    Args:
+        json_string (str): The JSON contents as a string
+        json_file_key (str or bytes): file ID for the JSON file
+
+    Returns:
+        JSON (dict): the JSON contents as JSON
+    """  # noqa: D401
+    try:
+        return rapidjson.loads(json_string)
+    except rapidjson.JSONDecodeError:
+        log.exception("%s has a corrupted JSON", json_file_key)
+        return {}
+
+
+def parse_instructors(staff):
+    """
+    Parses staff/instructors users including their full name, salutation etc
+
+    Args:
+        array (dict): staff/instructors
+
+    Returns:
+        array (dict): parsed instructors
+    """  # noqa: D401
+    instructors = []
+    for person in staff:
+        instructor = {
+            "first_name": person.get("given_name", person.get("first_name")),
+            "last_name": person.get("family_name", person.get("last_name")),
+            "full_name": person.get("title"),
+        }
+
+        if person.get("salutation"):
+            if instructor.get("full_name") and (
+                not instructor.get("full_name").startswith(person.get("salutation"))
+            ):
+                instructor["full_name"] = "{salutation} {full_name}".format(
+                    salutation=person.get("salutation").strip(),
+                    full_name=instructor.get("full_name"),
+                )
+            elif instructor.get("last_name"):
+                instructor["full_name"] = "{salutation} {full_name}".format(
+                    salutation=person.get("salutation").strip(),
+                    full_name=" ".join(
+                        [
+                            part
+                            for part in [
+                                person.get("first_name"),
+                                person.get("middle_initial"),
+                                person.get("last_name"),
+                            ]
+                            if part
+                        ]
+                    ),
+                )
+        elif not instructor.get("full_name"):
+            instructor["full_name"] = "{full_name}".format(
+                full_name=" ".join(
+                    [
+                        part
+                        for part in [
+                            person.get("first_name"),
+                            person.get("middle_initial"),
+                            person.get("last_name"),
+                        ]
+                        if part
+                    ]
+                )
+            )
+
+        instructors.append(instructor)
+
+    return instructors
+
+
+def update_editor_group(user: "User", is_editor: False):
+    """Assign or unassign user to staff list editors group"""
+    group, _ = Group.objects.get_or_create(name=GROUP_STAFF_LISTS_EDITORS)
+    if is_editor:
+        user.groups.add(group)
+    else:
+        user.groups.remove(group)
+
+
+def get_ocw_topics(topics_collection):
+    """
+    Extracts OCW topics and subtopics and returns a unique list of them
+
+    Args:
+        topics_collection (dict): The JSON object representing the topic
+
+    Returns:
+        list of str: list of topics
+    """  # noqa: D401
+    topics = []
+
+    for topic_object in topics_collection:
+        if topic_object["ocw_feature"]:
+            topics.append(topic_object["ocw_feature"])
+        if topic_object["ocw_subfeature"]:
+            topics.append(topic_object["ocw_subfeature"])
+        if topic_object["ocw_speciality"]:
+            topics.append(topic_object["ocw_speciality"])
+
+    return list(set(topics))
+
+
+def resource_upserted_actions(
+    resource: LearningResource, percolate, generate_embeddings
+):
+    """
+    Trigger plugins when a LearningResource is created or updated
+    """
+    pm = get_plugin_manager()
+    hook = pm.hook
+    hook.resource_upserted(
+        resource=resource, percolate=percolate, generate_embeddings=generate_embeddings
+    )
+
+
+def resource_unpublished_actions(resource: LearningResource):
+    """
+    Unpublish a resource's direct content files (e.g. marketing pages) and
+    trigger plugins when a LearningResource is removed/unpublished
+    """
+    if not resource.test_mode:
+        resource.resource_content_files.filter(published=True).update(published=False)
+    pm = get_plugin_manager()
+    hook = pm.hook
+    hook.resource_unpublished(resource=resource)
+
+
+def similar_topics_action(resource: LearningResource) -> dict:
+    """
+    Trigger plugin to get similar topics for a resource
+    """
+    pm = get_plugin_manager()
+    hook = pm.hook
+    topics = hook.resource_similar_topics(resource=resource)
+    # The plugin returns the list wrapped in another list for some reason
+    return topics[0] if topics else []
+
+
+def resource_delete_actions(resource: LearningResource):
+    """
+    Trigger plugin to handle learning resource deletion
+    """
+    pm = get_plugin_manager()
+    hook = pm.hook
+    hook.resource_before_delete(resource=resource)
+    resource.delete()
+
+
+def bulk_resources_unpublished_actions(resource_ids: list[int], resource_type: str):
+    """
+    Unpublish the resources' direct content files (e.g. marketing pages) and
+    trigger plugins when LearningResources are removed/unpublished
+    """
+    ContentFile.objects.filter(
+        learning_resource_id__in=resource_ids,
+        learning_resource__test_mode=False,
+        published=True,
+    ).update(published=False)
+    pm = get_plugin_manager()
+    hook = pm.hook
+    hook.bulk_resources_unpublished(
+        resource_ids=resource_ids, resource_type=resource_type
+    )
+
+
+def content_files_loaded_actions(run: LearningResourceRun):
+    """
+    Trigger plugins when content files are loaded for a LearningResourceRun.
+
+    Args:
+        run: the LearningResourceRun whose content files were loaded
+    """
+    pm = get_plugin_manager()
+    hook = pm.hook
+    hook.content_files_loaded(run=run)
+
+
+def resource_run_unpublished_actions(run: LearningResourceRun):
+    """
+    Trigger plugins when a LearningResourceRun is removed/unpublished
+    """
+    pm = get_plugin_manager()
+    hook = pm.hook
+    hook.resource_run_unpublished(run=run)
+
+
+def resource_run_delete_actions(run: LearningResourceRun):
+    """
+    Trigger plugin to handle learning resource run deletion
+    """
+    pm = get_plugin_manager()
+    hook = pm.hook
+    hook.resource_run_delete(run=run)
+
+
+def topic_upserted_actions(topic: LearningResourceTopic, *, overwrite: bool = False):
+    """
+    Trigger plugins when a LearningResourceTopic is created or updated
+    """
+    pm = get_plugin_manager()
+    hook = pm.hook
+    hook.topic_upserted(topic=topic, overwrite=overwrite)
+
+
+def topic_delete_actions(topic: LearningResourceTopic):
+    """
+    Trigger plugin function to delete a LearningResourceTopic
+    """
+    pm = get_plugin_manager()
+    hook = pm.hook
+    hook.topic_delete(topic=topic)
+
+
+def department_upserted_actions(
+    department: LearningResourceDepartment, *, overwrite: bool = False
+):
+    """
+    Trigger plugins when a LearningResourceDepartment is created or updated
+    """
+    pm = get_plugin_manager()
+    hook = pm.hook
+    hook.department_upserted(department=department, overwrite=overwrite)
+
+
+def department_delete_actions(department: LearningResourceDepartment):
+    """
+    Trigger plugin function to delete a LearningResourceDepartment
+    """
+    pm = get_plugin_manager()
+    hook = pm.hook
+    hook.department_delete(department=department)
+
+
+def offeror_upserted_actions(
+    offeror: LearningResourceOfferor, *, overwrite: bool = False
+):
+    """
+    Trigger plugins when a LearningResourceOfferor is created or updated
+    """
+    pm = get_plugin_manager()
+    hook = pm.hook
+    hook.offeror_upserted(offeror=offeror, overwrite=overwrite)
+
+
+def offeror_delete_actions(offeror: LearningResourceOfferor):
+    """
+    Trigger plugin function to delete a LearningResourceOfferor
+    """
+    pm = get_plugin_manager()
+    hook = pm.hook
+    hook.offeror_delete(offeror=offeror)
+
+
+def _walk_topic_map(topics: list, parent: LearningResourceTopic | None = None) -> None:
+    """
+    Walk the topic map provided and create topic records accordingly.
+
+    This will recursively walk through the topics list and create/update topic
+    records as appropriate. The topic records are stored in this format:
+    - name - the name of the topic
+    - id - the UUID for the topic
+    - icon - the icon we should display for the topic (a Remixicon, generally)
+    - mappings - mappings for topics found in offeror data
+    - children - child topics (records in this same format)
+    - parent - specific parent for the topic
+    A more detailed definition of this is in data/README-topics.md.
+
+    Args:
+    - topics (list of dict): the topics to process
+    - parent (None or LearningResourceTopic): the parent topic (for inner loops)
+    Returns:
+    - None
+    """
+
+    for topic in topics:
+        defaults = {
+            "parent": parent,
+            "name": topic["name"],
+            "icon": topic["icon"] or "",
+        }
+
+        if not parent and "parent" in topic:
+            # Topic specifies a parent, so let's try to grab it.
+            try:
+                defaults["parent"] = LearningResourceTopic.objects.filter(
+                    topic_uuid=topic["parent"]
+                ).get()
+            except LearningResourceTopic.DoesNotExist:
+                log.warning(
+                    (
+                        "_walk_topic_map: topic %s specified a parent %s but"
+                        " the parent did not exist"
+                    ),
+                    topic["name"],
+                    topic["parent"],
+                )
+
+        if topic["id"]:
+            defaults["topic_uuid"] = topic["id"]
+
+        lr_topic, created = LearningResourceTopic.objects.filter(
+            Q(name=topic["name"]) | Q(topic_uuid=topic["id"])
+        ).update_or_create(defaults=defaults)
+
+        log.debug("%s topic %s", "Created" if created else "Updated", lr_topic.name)
+
+        LearningResourceTopicMapping.objects.filter(topic=lr_topic).all().delete()
+
+        if topic["mappings"] and len(topic["mappings"]) > 0:
+            for offeror_code in topic["mappings"]:
+                offeror = LearningResourceOfferor.objects.filter(
+                    code=offeror_code
+                ).first()
+
+                if offeror:
+                    for mapping in topic["mappings"][offeror_code]:
+                        log.debug(
+                            "Created mapping for %s from %s to %s",
+                            offeror_code,
+                            mapping,
+                            lr_topic.name,
+                        )
+                        LearningResourceTopicMapping.objects.create(
+                            topic=lr_topic, offeror=offeror, topic_name=mapping
+                        )
+
+        topic_upserted_actions(lr_topic)
+
+        if "children" in topic and topic["children"] and len(topic["children"]) > 0:
+            _walk_topic_map(topic["children"], lr_topic)
+
+
+def _walk_lr_topic_parents(
+    learning_resource: LearningResource,
+    topic: LearningResourceTopic,
+) -> None:
+    """Walk the topic list and add parents as necessary."""
+
+    learning_resource.topics.add(topic)
+
+    if topic.parent:
+        _walk_lr_topic_parents(learning_resource, topic.parent)
+
+
+@transaction.atomic()
+def add_parent_topics_to_learning_resource(resource):
+    """Add the parent topics to the learning resource"""
+
+    for topic in resource.topics.all():
+        if topic.parent:
+            _walk_lr_topic_parents(resource, topic.parent)
+
+
+def transfer_list_resources(  # noqa: PLR0913
+    from_resource_type: str,
+    to_resource_type: str,
+    matching_field: str,
+    from_source: str,
+    to_source: str,
+    *,
+    delete_unpublished: bool = False,
+) -> tuple[int, int]:
+    """
+    Migrate unpublished learningpath/userlist resources that have
+    been replaced with new resource objects.
+
+    Args:
+        resource_type (str): the resource type
+        matching_field (str): the unique field to match identical resources
+        from_source (str): the ETL source of unpublished resources
+        to_source (str): the ETL source of published resources
+        delete_unpublished (bool): whether to delete the unpublished resources
+
+    Returns:
+        tuple[int, int]: the number of unpublished and matching published resources
+    """
+    unpublished_resources = LearningResource.objects.filter(
+        resource_type=from_resource_type, published=False, etl_source=from_source
+    )
+    unpublished_count = 0
+    published_count = 0
+    for resource in unpublished_resources:
+        unpublished_count += 1
+        unique_value = getattr(resource, matching_field)
+        published_replacement = LearningResource.objects.filter(
+            **{matching_field: unique_value},
+            resource_type=to_resource_type,
+            published=True,
+            etl_source=to_source,
+        ).first()
+        if published_replacement is not None:
+            published_count += 1
+            LearningResourceRelationship.objects.filter(
+                relation_type=LearningResourceRelationTypes.LEARNING_PATH_ITEMS.value,
+                child=resource,
+            ).update(child=published_replacement)
+            UserListRelationship.objects.filter(child=resource).update(
+                child=published_replacement
+            )
+    if delete_unpublished:
+        unpublished_resources.delete()
+    return unpublished_count, published_count
+
+
+def dump_topics_to_yaml(topic_id: int | None = None):
+    """
+    Dump the topic data to a yaml file.
+
+    Args:
+    * topic_id (int or None): the topic to dump, or None for all.
+    Returns:
+    * str: the yaml document
+    """
+
+    def _dump_subtopic_to_yaml(topic: LearningResourceTopic):
+        """Dump subtopic data to yaml recursively."""
+
+        yaml_ready_data = {
+            "id": str(topic.topic_uuid),
+            "name": topic.name,
+            "icon": topic.icon,
+            "mappings": {},
+            "children": [],
+            "parent": str(topic.parent.topic_uuid) if topic.parent else None,
+        }
+
+        for mapping in LearningResourceTopicMapping.objects.filter(topic=topic).all():
+            if mapping.offeror.code not in yaml_ready_data["mappings"]:
+                yaml_ready_data["mappings"][mapping.offeror.code] = []
+
+            yaml_ready_data["mappings"][mapping.offeror.code].append(mapping.topic_name)
+
+        for child in LearningResourceTopic.objects.filter(parent=topic).all():
+            yaml_ready_data["children"].append(_dump_subtopic_to_yaml(child))
+
+        return yaml_ready_data
+
+    if topic_id:
+        parent_topics = [LearningResourceTopic.objects.get(pk=topic_id)]
+    else:
+        parent_topics = LearningResourceTopic.objects.filter(parent__isnull=True).all()
+
+    root_level_topics = {
+        "topics": [_dump_subtopic_to_yaml(topic) for topic in parent_topics]
+    }
+
+    return yaml.dump(root_level_topics)
+
+
+def html_to_markdown(html):
+    htmlformatter = html2text.HTML2Text()
+    htmlformatter.body_width = 0
+    return htmlformatter.handle(html)
+
+
+def strip_markdown_images(markdown):
+    """Strip image markup from markdown, keeping alt text if present.
+
+    ![alt text](url) → "alt text"
+    ![](url)         → removed entirely
+
+    Note: Alt text containing literal ']' characters is not supported.
+    """
+    return re.sub(r"!\[([^\]]*)\]\([^)]*\)", lambda m: m.group(1), markdown)
+
+
+@cache
+def get_web_driver():
+    service = webdriver.ChromeService(executable_path=which("chromedriver"))
+    chrome_options = Options()
+    chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument("--disable-features=site-per-process")
+    chrome_options.add_argument("--incognito")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+
+    return webdriver.Chrome(service=service, options=chrome_options)
+
+
+def json_to_markdown(obj, indent=0):
+    """
+    Recursively converts a JSON object into a readable
+    Markdown format with proper lists and tables.
+    """
+    markdown = ""
+    indent_str = " " * (indent * 2)
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if value is not None:
+                markdown += f"\n{indent_str}**{key.replace('_', ' ').title()}**\n\n"
+                markdown += json_to_markdown(value, indent + 1)
+    elif isinstance(obj, list):
+        if all(
+            isinstance(item, dict) for item in obj
+        ):  # Check if it's a list of dictionaries
+            keys = sorted(
+                {k for item in obj for k in item}
+            )  # Collect and sort all keys
+            # Create table header
+            markdown += f"| {' | '.join(keys)} |\n"
+            markdown += f"| {' | '.join(['---'] * len(keys))} |\n"
+            # Create table rows
+            for item in obj:
+                row = [
+                    str(item.get(k, "N/A"))
+                    .replace("[", "")
+                    .replace("]", "")
+                    .replace("{", "")
+                    .replace("}", "")
+                    for k in keys
+                ]
+                markdown += f"| {' | '.join(row)} |\n"
+        else:
+            for item in obj:
+                markdown += (
+                    f"{indent_str}- {json_to_markdown(item, indent + 1).strip()}\n"
+                )
+    elif obj is None:
+        markdown += f"{indent_str}N/A\n\n"
+    else:
+        markdown += f"{indent_str}{obj}\n\n"
+    return markdown
+
+
+# tiktoken has no encoding for non-OpenAI models, and the LLM model is
+# admin-configurable, so fall back to OpenAI's current encoding rather than
+# raising. Token counts are then approximate, which is fine for the only thing
+# they are used for: keeping a prompt inside a context window.
+FALLBACK_ENCODING_NAME = "o200k_base"
+
+
+def token_encoding(model: str = "gpt-4o"):
+    """Return the tiktoken encoding for a model, or a default one."""
+    import tiktoken
+
+    try:
+        return tiktoken.encoding_for_model(strip_azure_prefix(model))
+    except KeyError:
+        return tiktoken.get_encoding(
+            settings.LITELLM_TOKEN_ENCODING_NAME or FALLBACK_ENCODING_NAME
+        )
+
+
+def count_tokens(text: str, model: str = "gpt-4o") -> int:
+    """Count the tokens in text for a given model."""
+    return len(token_encoding(model).encode(text))
+
+
+def truncate_to_tokens(text: str, max_tokens: int, model: str = "gpt-4o") -> str:
+    """
+    Truncate text to a maximum number of tokens for a given model.
+    """
+    encoding = token_encoding(model)
+    tokens = encoding.encode(text)
+    if len(tokens) <= max_tokens:
+        return text
+    return encoding.decode(tokens[:max_tokens])
+
+
+def sanitize_llm_text(text: str) -> str:
+    """Replace characters Postgres can't store: NUL and lone surrogates."""
+    return text.replace("\x00", "").encode("utf-8", errors="replace").decode("utf-8")
+
+
+def build_resource_summary_dict(resource):
+    """Build a base summary dict for a learning resource.
+
+    Shared helper used by both utils and serializers to avoid duplicating
+    the field-extraction logic.
+    """
+    return {
+        "title": resource.title,
+        "readable_id": resource.readable_id,
+        "description": resource.description or "",
+        "resource_type": resource.resource_type,
+        "topics": [t.name for t in resource.topics.all()],
+    }
+
+
+# Bound the program marketing-page content assembled from child courses so it
+# stays a reasonable embedding input. A program page previously concatenated
+# every child-course content-file summary and ballooned to 23MB in prod,
+# overflowing the embedding API's per-request token limit.
+PROGRAM_CHILDREN_CONTENT_MAX_CHARS = 1_000_000
+
+PROGRAM_CHILDREN_CONTENT_MARKER = "## Program Contents"
+
+
+def _course_ids_by_program(relationships, course_type):
+    """Map program id -> reachable published course ids (direct + via subprograms)."""
+    result = defaultdict(set)
+    for rel in relationships:
+        if rel.child.resource_type == course_type:
+            result[rel.parent_id].add(rel.child_id)
+        else:
+            result[rel.parent_id].update(
+                sub_rel.child_id
+                for sub_rel in getattr(rel.child, "program_children", [])
+                if sub_rel.child.resource_type == course_type
+            )
+    return result
+
+
+def reachable_published_course_ids(program_ids):
+    """Map program id -> set of reachable published (or test-mode) child-course ids.
+
+    Includes courses reached directly and courses reached through child
+    programs. Read-only and id-level only (loads no content).
+    """
+    program_ids = list(program_ids)
+    if not program_ids:
+        return {}
+    program_relation_types = [
+        LearningResourceRelationTypes.PROGRAM_COURSES,
+        LearningResourceRelationTypes.PROGRAM_PROGRAMS,
+    ]
+    child_visibility = Q(child__published=True) | Q(child__test_mode=True)
+    relationships = list(
+        LearningResourceRelationship.objects.filter(
+            parent_id__in=program_ids,
+            relation_type__in=program_relation_types,
+        )
+        .filter(child_visibility)
+        .select_related("child")
+        .prefetch_related(
+            Prefetch(
+                "child__children",
+                queryset=LearningResourceRelationship.objects.filter(
+                    relation_type__in=program_relation_types,
+                )
+                .filter(child_visibility)
+                .select_related("child"),
+                to_attr="program_children",
+            ),
+        )
+    )
+    return _course_ids_by_program(relationships, LearningResourceType.course.name)
+
+
+def programs_needing_children_heal(program_ids):
+    """Return the subset of the given program ids whose marketing page lacks a
+    children section but whose children content is now available.
+
+    A program qualifies only when it has a reachable published (or test-mode)
+    child course with a non-empty marketing page, which guarantees re-scraping
+    will populate the section and prevents childless programs from being
+    re-scraped every run. Read-only and id-level only.
+    """
+    program_ids = list(program_ids)
+    if not program_ids:
+        return set()
+    candidate_ids = set(
+        ContentFile.objects.filter(
+            learning_resource_id__in=program_ids,
+            file_type=MARKETING_PAGE_FILE_TYPE,
+        )
+        .exclude(content__contains=PROGRAM_CHILDREN_CONTENT_MARKER)
+        .values_list("learning_resource_id", flat=True)
+    )
+    if not candidate_ids:
+        return set()
+    reachable = reachable_published_course_ids(candidate_ids)
+    all_course_ids = set().union(*reachable.values())
+    course_ids_with_pages = set(
+        ContentFile.objects.filter(
+            learning_resource_id__in=all_course_ids,
+            file_type=MARKETING_PAGE_FILE_TYPE,
+            published=True,
+        )
+        .exclude(content="")
+        .values_list("learning_resource_id", flat=True)
+    )
+    return {
+        program_id
+        for program_id, course_ids in reachable.items()
+        if course_ids & course_ids_with_pages
+    }
+
+
+def build_program_children_content(learning_resource):
+    """Build markdown content describing a program's children.
+
+    Delegates to the bulk version for a single resource.
+    """
+    result = build_program_children_content_bulk([learning_resource])
+    return result.get(learning_resource.id, "")
+
+
+def build_program_children_content_bulk(program_resources):
+    """Build program children markdown for many program resources in bulk.
+
+    For each program, concatenates the marketing-page content of its published
+    (or test-mode) child courses, including courses reached through child
+    programs. Returns a dict keyed by learning_resource id. Non-program
+    resources are ignored.
+    """
+    programs = [
+        resource
+        for resource in program_resources
+        if resource.resource_type == LearningResourceType.program.name
+    ]
+    if not programs:
+        return {}
+
+    program_ids = [program.id for program in programs]
+    course_ids_by_program = reachable_published_course_ids(program_ids)
+    all_course_ids = set().union(*course_ids_by_program.values())
+
+    # One marketing-page content file per course (published), fetched in bulk
+    marketing_by_course = {}
+    if all_course_ids:
+        marketing_qs = (
+            ContentFile.objects.filter(
+                learning_resource_id__in=all_course_ids,
+                file_type=MARKETING_PAGE_FILE_TYPE,
+                published=True,
+            )
+            .exclude(content="")
+            .order_by("learning_resource_id", "id")
+            .values_list("learning_resource_id", "learning_resource__title", "content")
+        )
+        for lr_id, title, content in marketing_qs:
+            marketing_by_course.setdefault(lr_id, (title, content))
+
+    content_by_program_id = {}
+    for program in programs:
+        sections = []
+        for course_id in sorted(course_ids_by_program.get(program.id, set())):
+            page = marketing_by_course.get(course_id)
+            if page:
+                title, content = page
+                sections.append(f"### {title}\n\n{content}")
+        if not sections:
+            content_by_program_id[program.id] = ""
+            continue
+        body = "\n\n".join([f"\n\n{PROGRAM_CHILDREN_CONTENT_MARKER}\n", *sections])
+        content_by_program_id[program.id] = body[:PROGRAM_CHILDREN_CONTENT_MAX_CHARS]
+
+    return content_by_program_id
+
+
+# --- Learn URLs -------------------------------------------------------------
+#
+# A resource's location within Learn. Ported from the frontend so the backend is
+# the single source of truth for these URLs (previously `frontends/main/src/
+# common/slugs.ts` and `common/urls.ts` derived them independently, and the
+# email digests derived them a third way).
+
+SLUG_MAX_LENGTH = 60
+
+# Path segments are mandatory, so a title that slugifies to nothing still needs
+# a segment.
+BLANK_SLUG_PATH_SEGMENT = "resource"
+
+# Characters that are legal, unescaped, in a path segment: ! $ & ' ( ) * + , ; = : @ ~
+# `quote` never escapes A-Za-z0-9_.-~ , so together these are exactly the set
+# the frontend's `encodePathSegment` leaves alone. MITx Online readable_ids
+# depend on it — `course-v1:MITxT+14.100x` must not become
+# `course-v1%3AMITxT%2B14.100x`.
+PATH_SEGMENT_SAFE_CHARS = "!$&'()*+,;=:@~"
+
+
+def slugify_title(title: str) -> str:
+    """
+    Derive a cosmetic URL slug from a resource title.
+
+    The slug is NEVER used for lookup; the numeric id is authoritative. Returns
+    "" when the title yields no ascii letters, which callers handle per surface:
+    path segments substitute BLANK_SLUG_PATH_SEGMENT, the drawer omits its
+    `resource_title` param.
+
+    The output charset is [a-z0-9-], and the frontend's `[slug]` pages depend on
+    that: they compare a path built from this slug against Next's
+    already-decoded route params, so a slug carrying a percent-encodable
+    character would redirect to a different spelling of itself and loop.
+
+    NOT interchangeable with django.utils.text.slugify, which deletes
+    punctuation instead of converting it to "-", applies no length limit, and
+    has no "no ascii letters" rule. Those diverge on ~30% of current titles.
+
+    Args:
+        title (str): the resource title
+
+    Returns:
+        str: the slug, or "" if the title yields no ascii letters
+    """
+    normalized = unicodedata.normalize("NFKD", title or "")
+    without_marks = "".join(
+        char for char in normalized if unicodedata.category(char) != "Mn"
+    )
+    slug = re.sub(r"[^a-z0-9]+", "-", without_marks.lower()).strip("-")
+
+    if len(slug) > SLUG_MAX_LENGTH:
+        slug = slug[:SLUG_MAX_LENGTH]
+        # Back off to the last separator so the slug ends on a whole word.
+        last_dash = slug.rfind("-")
+        if last_dash != -1:
+            slug = slug[:last_dash]
+        slug = slug.rstrip("-")
+
+    return slug if re.search(r"[a-z]", slug) else ""
+
+
+def path_slug(title: str) -> str:
+    """
+    Slug for use as a mandatory path segment.
+
+    Args:
+        title (str): the resource title
+
+    Returns:
+        str: the slug, or BLANK_SLUG_PATH_SEGMENT if the title yields no slug
+    """
+    return slugify_title(title) or BLANK_SLUG_PATH_SEGMENT
+
+
+def encode_path_segment(segment: str) -> str:
+    """
+    Percent-encode a path segment, leaving characters that are legal unescaped.
+
+    Args:
+        segment (str): the raw path segment
+
+    Returns:
+        str: the encoded segment
+    """
+    return quote(str(segment), safe=PATH_SEGMENT_SAFE_CHARS)
+
+
+def resource_drawer_path(resource_id: int, title: str) -> str:
+    """
+    Path opening a resource's drawer over the search page.
+
+    `resource` is authoritative; `resource_title` is cosmetic and omitted when
+    blank rather than emitted empty.
+
+    Args:
+        resource_id (int): the resource id
+        title (str): the resource title
+
+    Returns:
+        str: the drawer path
+    """
+    params = [("resource", str(resource_id))]
+    slug = slugify_title(title)
+    if slug:
+        params.append(("resource_title", slug))
+    return f"/search?{urlencode(params)}"
+
+
+def _dedicated_page_path(  # noqa: PLR0911, PLR0913
+    *,
+    resource_type: str,
+    resource_id: int,
+    title: str,
+    readable_id: str | None,
+    resource_category: str | None,
+    platform_code: str | None,
+    parent_id: int | None,
+) -> str | None:
+    """
+    Path of a resource's own page on Learn, or None if it has no such page.
+
+    Args:
+        resource_type (str): LearningResourceType name
+        resource_id (int): the resource id
+        title (str): the resource title
+        readable_id (str or None): the resource's readable id
+        resource_category (str or None): distinguishes the two program shapes
+        platform_code (str or None): LearningResourcePlatform code
+        parent_id (int or None): canonical parent, for videos and episodes
+
+    Returns:
+        str or None: the path, or None when the resource has no dedicated page
+    """
+    slug = path_slug(title)
+
+    if resource_type == LearningResourceType.video.name:
+        base = f"/video/{resource_id}/{slug}"
+        # A video with playlists redirects bare -> playlists[0], so address it
+        # by its canonical parent.
+        return f"{base}?playlist={parent_id}" if parent_id else base
+
+    if resource_type == LearningResourceType.video_playlist.name:
+        return f"/video-playlist/{resource_id}/{slug}"
+
+    if resource_type == LearningResourceType.podcast.name:
+        return f"/podcast/{resource_id}/{slug}"
+
+    if resource_type == LearningResourceType.podcast_episode.name:
+        # An episode's URL is scoped by its parent podcast; without one there is
+        # no page to link to (the page itself 404s that case).
+        if not parent_id:
+            return None
+        return f"/podcast/{parent_id}/podcast_episode/{resource_id}/{slug}"
+
+    # Course and program pages exist only for MITx Online, and only where
+    # MITx Online has published a product page. `published` already implies
+    # that: the ETL leaves a course or program unpublished when its `page_url`
+    # is absent, so anything the API serves has one.
+    if platform_code == PlatformType.mitxonline.name and readable_id:
+        encoded_id = encode_path_segment(readable_id)
+        if resource_type == LearningResourceType.course.name:
+            return f"/courses/{encoded_id}"
+        if resource_type == LearningResourceType.program.name:
+            # A program presented as a course upstream (display_mode="course",
+            # stored as resource_category) lives under /courses/p/.
+            if resource_category == LearningResourceType.course.value:
+                return f"/courses/p/{encoded_id}"
+            return f"/programs/{encoded_id}"
+
+    return None
+
+
+def learn_url(  # noqa: PLR0913
+    *,
+    resource_type: str,
+    resource_id: int,
+    title: str,
+    readable_id: str | None = None,
+    resource_category: str | None = None,
+    platform_code: str | None = None,
+    parent_id: int | None = None,
+) -> str:
+    """
+    Absolute URL of a resource's location within Learn.
+
+    The resource's own page where it has one, else the drawer over the search
+    page. Never None: the drawer is always available, so every resource has a
+    location and consumers need no fallback of their own.
+
+    Args:
+        resource_type (str): LearningResourceType name
+        resource_id (int): the resource id
+        title (str): the resource title
+        readable_id (str or None): the resource's readable id
+        resource_category (str or None): distinguishes the two program shapes
+        platform_code (str or None): LearningResourcePlatform code
+        parent_id (int or None): canonical parent, for videos and episodes
+
+    Returns:
+        str: the absolute URL
+    """
+    path = _dedicated_page_path(
+        resource_type=resource_type,
+        resource_id=resource_id,
+        title=title,
+        readable_id=readable_id,
+        resource_category=resource_category,
+        platform_code=platform_code,
+        parent_id=parent_id,
+    ) or resource_drawer_path(resource_id, title)
+    return frontend_absolute_url(path)
+
+
+def learn_url_for_resource(resource: LearningResource, parent_ids: list[int]) -> str:
+    """
+    Absolute Learn URL for a resource instance.
+
+    Attribute access only — the caller supplies `parent_ids`, because the
+    serializers reach them differently (the summary endpoint annotates
+    `canonical_parent_ids`; the detail serializers use the `podcasts` /
+    `playlists` properties). Both are ordered by RELATIONSHIP_ORDERING, so
+    either way `parent_ids[0]` is the same parent.
+
+    Args:
+        resource (LearningResource): the resource
+        parent_ids (list of int): the resource's URL-forming parent ids
+
+    Returns:
+        str: the absolute URL
+    """
+    return learn_url(
+        resource_type=resource.resource_type,
+        resource_id=resource.id,
+        title=resource.title,
+        readable_id=resource.readable_id,
+        resource_category=resource.resource_category,
+        # `code` is the platform's primary key, so this needs no join.
+        platform_code=resource.platform_id,
+        parent_id=parent_ids[0] if parent_ids else None,
+    )

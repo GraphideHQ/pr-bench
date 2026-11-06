@@ -1,0 +1,3356 @@
+"""
+Test tasks
+"""
+
+from datetime import timedelta
+from unittest.mock import ANY
+
+import pytest
+from decorator import contextmanager
+from django.core.cache import caches
+from django.db import DatabaseError
+from django.utils import timezone
+from kombu.exceptions import OperationalError as BrokerError
+from moto import mock_aws
+from safedelete.config import HARD_DELETE
+
+from learning_resources import factories, models, tasks
+from learning_resources.conftest import OCW_TEST_PREFIX, setup_s3, setup_s3_ocw
+from learning_resources.constants import (
+    CredentialMetadataField,
+    LearningResourceType,
+    PlatformType,
+)
+from learning_resources.credentials import CredentialMetadata
+from learning_resources.etl.constants import MARKETING_PAGE_FILE_TYPE, ETLSource
+from learning_resources.etl.exceptions import ExtractException
+from learning_resources.etl.ownership import CONTENT_FILE, TRANSCRIPT
+from learning_resources.factories import (
+    ContentFileFactory,
+    CredentialMetadataConfigurationFactory,
+    CredentialMetadataFactory,
+    ETLSourceOwnershipFactory,
+    LearningPathFactory,
+    LearningResourceFactory,
+    LearningResourcePlatformFactory,
+    LearningResourceRunFactory,
+)
+from learning_resources.models import (
+    ContentFile,
+    ETLShadowRun,
+    ETLSourceOwnership,
+    LearningResource,
+    VideoChannel,
+)
+from learning_resources.tasks import (
+    cleanup_deleted_content_files,
+    get_ocw_data,
+    get_youtube_channel_data,
+    get_youtube_data,
+    get_youtube_playlist_data,
+    get_youtube_transcripts,
+    marketing_page_for_resources,
+    scrape_marketing_pages,
+    sync_canvas_courses,
+    unpublish_removed_canvas_courses,
+    update_next_start_date_and_prices,
+    update_ocw_learning_material_resources,
+)
+from main.celery import app
+from main.utils import now_in_utc
+
+pytestmark = pytest.mark.django_db
+# pylint:disable=redefined-outer-name,unused-argument,too-many-arguments
+
+
+@contextmanager
+def does_not_raise():
+    """
+    Mock expression that does not raise an error
+    """
+    yield
+
+
+@pytest.fixture
+def mock_logger(mocker):
+    """
+    Mock log exception
+    """
+    return mocker.patch("learning_resources.api.log.exception")
+
+
+def test_get_mitxonline_data(mocker):
+    """Verify that the get_mitxonline_data invokes the MITx Online ETL pipeline"""
+    mock_pipelines = mocker.patch("learning_resources.tasks.pipelines")
+    tasks.get_mitxonline_data.delay()
+    mock_pipelines.mitxonline_programs_etl.assert_called_once_with()
+    mock_pipelines.mitxonline_courses_etl.assert_called_once_with()
+
+
+def test_get_oll_data(mocker):
+    """Verify that the get_oll_data invokes the OLL ETL pipeline"""
+    mock_pipelines = mocker.patch("learning_resources.tasks.pipelines")
+    tasks.get_oll_data.delay()
+    mock_pipelines.oll_etl.assert_called_once_with(None)
+
+
+def test_get_mitpe_data(mocker):
+    """Verify that the get_mitpe_data task invokes the Professional Ed pipeline"""
+    mock_pipelines = mocker.patch("learning_resources.tasks.pipelines")
+    mock_pipelines.mitpe_etl.return_value = (
+        LearningResourceFactory.create_batch(2),
+        LearningResourceFactory.create_batch(1),
+    )
+    task = tasks.get_mitpe_data.delay()
+    mock_pipelines.mitpe_etl.assert_called_once_with()
+    assert task.result == 3
+
+
+def test_get_xpro_data(mocker):
+    """Verify that the get_xpro_data invokes the xPro ETL pipeline"""
+    mock_pipelines = mocker.patch("learning_resources.tasks.pipelines")
+    tasks.get_xpro_data.delay()
+    mock_pipelines.xpro_programs_etl.assert_called_once_with()
+    mock_pipelines.xpro_courses_etl.assert_called_once_with()
+
+
+@mock_aws
+def test_import_all_mitxonline_files(settings, mocker, mocked_celery):
+    """import_all_mitxonline_files should be replaced with get_content_tasks"""
+    setup_s3(settings)
+    get_content_tasks_mock = mocker.patch(
+        "learning_resources.tasks.get_content_tasks", autospec=True
+    )
+
+    with pytest.raises(mocked_celery.replace_exception_class):
+        tasks.import_all_mitxonline_files.delay(
+            chunk_size=3, overwrite=True, learning_resource_ids=None
+        )
+    get_content_tasks_mock.assert_called_once_with(
+        PlatformType.mitxonline.name,
+        chunk_size=3,
+        overwrite=True,
+        overwrite_units=False,
+        learning_resource_ids=None,
+    )
+
+
+@mock_aws
+def test_import_all_xpro_files(settings, mocker, mocked_celery):
+    """import_all_xpro_files should start chunked tasks with correct bucket, platform"""
+    setup_s3(settings)
+    get_content_tasks_mock = mocker.patch(
+        "learning_resources.tasks.get_content_tasks", autospec=True
+    )
+    with pytest.raises(mocked_celery.replace_exception_class):
+        tasks.import_all_xpro_files.delay(chunk_size=3, learning_resource_ids=[1])
+    get_content_tasks_mock.assert_called_once_with(
+        PlatformType.xpro.name,
+        chunk_size=3,
+        overwrite=False,
+        overwrite_units=False,
+        learning_resource_ids=[1],
+    )
+
+
+@mock_aws
+def test_import_all_oll_files(settings, mocker, mocked_celery):
+    """import_all_oll_files should start chunked tasks with correct bucket, platform"""
+    setup_s3(settings)
+    get_content_tasks_mock = mocker.patch(
+        "learning_resources.tasks.get_content_tasks", autospec=True
+    )
+    with pytest.raises(mocked_celery.replace_exception_class):
+        tasks.import_all_oll_files.delay(chunk_size=4)
+    get_content_tasks_mock.assert_called_once_with(
+        ETLSource.oll.name,
+        chunk_size=4,
+        overwrite=False,
+        overwrite_units=False,
+        learning_resource_ids=None,
+    )
+
+
+@mock_aws
+def test_import_content_files(settings, mocker, mocked_celery):
+    """import_content_files should be replaced with get_content_tasks for any source"""
+    setup_s3(settings)
+    get_content_tasks_mock = mocker.patch(
+        "learning_resources.tasks.get_content_tasks", autospec=True
+    )
+    with pytest.raises(mocked_celery.replace_exception_class):
+        tasks.import_content_files.delay(
+            ETLSource.mitxonline.name,
+            chunk_size=5,
+            overwrite=True,
+            overwrite_units=True,
+            learning_resource_ids=[42],
+        )
+    get_content_tasks_mock.assert_called_once_with(
+        ETLSource.mitxonline.name,
+        chunk_size=5,
+        overwrite=True,
+        overwrite_units=True,
+        learning_resource_ids=[42],
+    )
+
+
+@mock_aws
+@pytest.mark.parametrize("with_learning_resource_ids", [True, False])
+def test_get_content_tasks(
+    settings,
+    mocker,
+    mocked_celery,
+    mock_course_archive_bucket,
+    with_learning_resource_ids,
+):
+    """Test that get_content_tasks calls get_content_files with the correct args"""
+    mock_get_content_files = mocker.patch(
+        "learning_resources.tasks.get_content_files.si"
+    )
+    mocker.patch(
+        "learning_resources.tasks.get_most_recent_course_archives",
+        return_value=["foo.tar.gz"],
+    )
+    setup_s3(settings)
+    settings.LEARNING_COURSE_ITERATOR_CHUNK_SIZE = 2
+    etl_source = ETLSource.xpro.name
+    platform = PlatformType.xpro.name
+    courses = factories.CourseFactory.create_batch(
+        3, etl_source=etl_source, platform=platform
+    )
+    if with_learning_resource_ids:
+        learning_resource_ids = sorted(
+            [
+                courses[0].learning_resource_id,
+                courses[1].learning_resource_id,
+            ],
+            reverse=True,
+        )
+    else:
+        learning_resource_ids = None
+    tasks.get_content_tasks(
+        etl_source,
+        overwrite=True,
+        learning_resource_ids=learning_resource_ids,
+    )
+    assert mocked_celery.group.call_count == 1
+    assert (
+        models.LearningResource.objects.filter(
+            published=True,
+            resource_type=LearningResourceType.course.name,
+            etl_source=etl_source,
+            platform__code=platform,
+        )
+        .order_by("id")
+        .values_list("id", flat=True)
+    ).count() == 3
+    if with_learning_resource_ids:
+        assert mock_get_content_files.call_count == 1
+        mock_get_content_files.assert_any_call(
+            [learning_resource_ids[0], learning_resource_ids[1]],
+            etl_source,
+            ["foo.tar.gz"],
+            overwrite=True,
+            overwrite_units=False,
+        )
+    else:
+        assert mock_get_content_files.call_count == 2
+        mock_get_content_files.assert_any_call(
+            ANY, etl_source, ["foo.tar.gz"], overwrite=True, overwrite_units=False
+        )
+
+
+@mock_aws
+@pytest.mark.parametrize("test_mode", [True, False])
+def test_get_content_tasks_test_mode(
+    settings, mocker, mocked_celery, mock_course_archive_bucket, test_mode
+):
+    """Test that if a resource is marked as in test_mode, it's contentfiles are fetched"""
+    mock_get_content_files = mocker.patch(
+        "learning_resources.tasks.get_content_files.si"
+    )
+
+    mocker.patch(
+        "learning_resources.tasks.get_most_recent_course_archives",
+        return_value=["foo.tar.gz"],
+    )
+    setup_s3(settings)
+    settings.LEARNING_COURSE_ITERATOR_CHUNK_SIZE = 10
+    etl_source = ETLSource.xpro.name
+    platform = PlatformType.xpro.name
+    courses = factories.CourseFactory.create_batch(
+        3,
+        etl_source=etl_source,
+        platform=platform,
+    )
+    learning_resource_ids = []
+    for course in courses:
+        resource = course.learning_resource
+        resource.published = False
+        resource.test_mode = test_mode
+        resource.save()
+
+        learning_resource_ids.append(resource.id)
+
+    tasks.get_content_tasks(
+        etl_source,
+        overwrite=True,
+    )
+    assert mocked_celery.group.call_count == 1
+    if test_mode:
+        assert sorted(mock_get_content_files.mock_calls[0].args[0]) == sorted(
+            learning_resource_ids
+        )
+    else:
+        mock_get_content_files.assert_not_called()
+
+
+def test_get_content_files(mocker, mock_course_archive_bucket):
+    """Test that get_content_files calls sync_edx_course_files with expected parameters"""
+    mock_sync_edx_course_files = mocker.patch(
+        "learning_resources.tasks.sync_edx_course_files"
+    )
+    mocker.patch(
+        "learning_resources.tasks.get_bucket_by_name",
+        return_value=mock_course_archive_bucket.bucket,
+    )
+    tasks.get_content_files(
+        [1, 2], ETLSource.xpro.value, ["foo.tar.gz"], overwrite_units=True
+    )
+    mock_sync_edx_course_files.assert_called_once_with(
+        ETLSource.xpro.value,
+        [1, 2],
+        ["foo.tar.gz"],
+        overwrite=False,
+        overwrite_units=True,
+    )
+
+
+def test_get_content_files_missing_settings(mocker, settings):
+    """Test that get_content_files does nothing without required settings"""
+    mock_sync_edx_course_files = mocker.patch(
+        "learning_resources.tasks.sync_edx_course_files"
+    )
+    mock_log = mocker.patch("learning_resources.tasks.log.warning")
+    settings.COURSE_ARCHIVE_BUCKET_NAME = None
+    source = ETLSource.xpro.value
+    tasks.get_content_files([1, 2], source, ["foo.tar.gz"])
+    mock_sync_edx_course_files.assert_not_called()
+    mock_log.assert_called_once_with("Required settings missing for %s files", source)
+
+
+def test_get_podcast_data(mocker):
+    """Verify that get_podcast_data invokes the podcast ETL pipeline with expected params"""
+    mock_pipelines = mocker.patch("learning_resources.tasks.pipelines")
+    tasks.get_podcast_data.delay()
+    mock_pipelines.podcast_etl.assert_called_once()
+
+
+@mock_aws
+@pytest.mark.parametrize(
+    ("force_overwrite", "skip_content_files"), [(True, False), (False, True)]
+)
+@pytest.mark.parametrize(
+    "url_substring",
+    [
+        None,
+        "16-01-unified-engineering-i-ii-iii-iv-fall-2005-spring-2006",
+        "not-a-match",
+    ],
+)
+def test_get_ocw_data(  # noqa: PLR0913
+    settings, mocker, mocked_celery, force_overwrite, skip_content_files, url_substring
+):
+    """Test get_ocw_data task"""
+    setup_s3_ocw(settings)
+    get_ocw_courses_mock = mocker.patch(
+        "learning_resources.tasks.get_ocw_courses", autospec=True
+    )
+
+    if url_substring == "not-a-match":
+        error_expectation = does_not_raise()
+    else:
+        error_expectation = pytest.raises(mocked_celery.replace_exception_class)
+
+    with error_expectation:
+        tasks.get_ocw_data.delay(
+            force_overwrite=force_overwrite,
+            course_url_substring=url_substring,
+            skip_content_files=skip_content_files,
+        )
+
+    if url_substring == "not-a-match":
+        assert mocked_celery.group.call_count == 0
+    else:
+        assert mocked_celery.group.call_count == 1
+        get_ocw_courses_mock.si.assert_called_once_with(
+            url_paths=[OCW_TEST_PREFIX],
+            force_overwrite=force_overwrite,
+            skip_content_files=skip_content_files,
+            utc_start_timestamp=None,
+        )
+
+
+def test_get_ocw_data_no_settings(settings, mocker):
+    """Test get_ocw_data task without required settings"""
+    settings.OCW_LIVE_BUCKET = None
+    mock_log = mocker.patch("learning_resources.tasks.log.warning")
+    get_ocw_data()
+    mock_log.assert_called_once_with("Required settings missing for get_ocw_data")
+
+
+@mock_aws
+@pytest.mark.parametrize("timestamp", [None, "2020-12-15T00:00:00Z"])
+@pytest.mark.parametrize("overwrite", [True, False])
+def test_get_ocw_courses(settings, mocker, mocked_celery, timestamp, overwrite):
+    """
+    Test get_ocw_courses
+    """
+    setup_s3_ocw(settings)
+    mocker.patch("learning_resources.etl.loaders.resource_upserted_actions")
+    mocker.patch("learning_resources.etl.pipelines.loaders.load_content_files")
+    mocker.patch("learning_resources.etl.ocw.transform_content_files")
+    tasks.get_ocw_courses.delay(
+        url_paths=[OCW_TEST_PREFIX],
+        force_overwrite=overwrite,
+        skip_content_files=False,
+        utc_start_timestamp=timestamp,
+    )
+
+    assert models.LearningResource.objects.count() == 1
+    assert models.Course.objects.count() == 1
+    assert models.LearningResourceInstructor.objects.count() == 10
+
+    course_resource = models.Course.objects.first().learning_resource
+    assert course_resource.title == "Unified Engineering I, II, III, & IV"
+    assert course_resource.readable_id == "16.01+fall_2005"
+    assert course_resource.runs.count() == 1
+    assert course_resource.runs.first().run_id == "97db384ef34009a64df7cb86cf701979"
+    assert (
+        course_resource.runs.first().slug
+        == "courses/16-01-unified-engineering-i-ii-iii-iv-fall-2005-spring-2006"
+    )
+
+
+@pytest.fixture
+def youtube_settings(settings):
+    """Configure youtube ETL settings"""
+    settings.YOUTUBE_CONFIG_URL = "http://test.youtube/config.yaml"
+    settings.YOUTUBE_DEVELOPER_KEY = "key"
+    return settings
+
+
+def _channel_config(channel_id, **kwargs):
+    """Build a youtube channel config"""
+    return {"channel_id": channel_id, "offered_by": "ocw", **kwargs}
+
+
+def _playlist_data(playlist_id):
+    """Build the raw youtube api data for a playlist"""
+    return {
+        "id": playlist_id,
+        "snippet": {
+            "title": f"Playlist {playlist_id}",
+            "thumbnails": {"high": {"url": f"http://img/{playlist_id}.jpg"}},
+        },
+    }
+
+
+@pytest.mark.parametrize("channel_ids", [["channel1"], None])
+def test_get_youtube_data(mocker, youtube_settings, channel_ids):
+    """get_youtube_data should queue one task per configured channel"""
+    channel_configs = [_channel_config("channel1"), _channel_config("channel2")]
+    mock_configs = mocker.patch(
+        "learning_resources.tasks.youtube.get_youtube_channel_configs",
+        autospec=True,
+        return_value=channel_configs,
+    )
+    mock_unpublish = mocker.patch(
+        "learning_resources.tasks.loaders.unpublish_removed_youtube_channels",
+        autospec=True,
+    )
+    mock_channel_task = mocker.patch(
+        "learning_resources.tasks.get_youtube_channel_data", autospec=True
+    )
+
+    assert get_youtube_data.delay(channel_ids=channel_ids).get() == 2
+
+    mock_configs.assert_called_once_with(channel_ids=channel_ids)
+    assert [
+        call.args[0] for call in mock_channel_task.delay.call_args_list
+    ] == channel_configs
+
+    if channel_ids:
+        # a run filtered to specific channels doesn't know the full channel set,
+        # so it must not unpublish the channels it wasn't asked about
+        mock_unpublish.assert_not_called()
+    else:
+        mock_unpublish.assert_called_once_with(["channel1", "channel2"])
+
+
+def test_get_youtube_data_without_configs_does_not_unpublish(mocker, youtube_settings):
+    """An empty channel config should be treated as a failure, not as "no channels\""""
+    mocker.patch(
+        "learning_resources.tasks.youtube.get_youtube_channel_configs",
+        autospec=True,
+        return_value=[],
+    )
+    mock_unpublish = mocker.patch(
+        "learning_resources.tasks.loaders.unpublish_removed_youtube_channels",
+        autospec=True,
+    )
+    mock_channel_task = mocker.patch(
+        "learning_resources.tasks.get_youtube_channel_data", autospec=True
+    )
+
+    assert get_youtube_data.delay().get() == 0
+
+    mock_unpublish.assert_not_called()
+    mock_channel_task.delay.assert_not_called()
+
+
+@pytest.mark.parametrize("setting", ["YOUTUBE_CONFIG_URL", "YOUTUBE_DEVELOPER_KEY"])
+def test_get_youtube_data_missing_settings(mocker, youtube_settings, setting):
+    """A missing youtube setting should stop the run before any extraction"""
+    setattr(youtube_settings, setting, None)
+    mock_configs = mocker.patch(
+        "learning_resources.tasks.youtube.get_youtube_channel_configs", autospec=True
+    )
+    mock_unpublish = mocker.patch(
+        "learning_resources.tasks.loaders.unpublish_removed_youtube_channels",
+        autospec=True,
+    )
+
+    assert get_youtube_data.delay().get() == 0
+
+    mock_configs.assert_not_called()
+    mock_unpublish.assert_not_called()
+
+
+def test_get_youtube_channel_data(mocker, youtube_settings):
+    """A channel task should load the channel and queue a task per playlist"""
+    mocker.patch("learning_resources.tasks.youtube.get_youtube_client", autospec=True)
+    mocker.patch(
+        "learning_resources.tasks.youtube.extract_channel",
+        autospec=True,
+        return_value={"id": "channel1", "snippet": {"title": "Channel 1"}},
+    )
+    playlists = [_playlist_data("playlist1"), _playlist_data("playlist2")]
+    mocker.patch(
+        "learning_resources.tasks.youtube.extract_playlist_metadata",
+        autospec=True,
+        return_value=iter([(playlists[0], True), (playlists[1], False)]),
+    )
+    mock_unpublish = mocker.patch(
+        "learning_resources.tasks.loaders.unpublish_removed_playlists", autospec=True
+    )
+    mock_playlist_task = mocker.patch(
+        "learning_resources.tasks.get_youtube_playlist_data", autospec=True
+    )
+
+    get_youtube_channel_data.delay(_channel_config("channel1"))
+
+    video_channel = models.VideoChannel.objects.get(channel_id="channel1")
+    assert video_channel.title == "Channel 1"
+    assert video_channel.published is True
+    assert video_channel.etl_source == ETLSource.youtube.name
+
+    # the full playlist listing is resolved before anything is unpublished
+    mock_unpublish.assert_called_once_with(video_channel, ["playlist1", "playlist2"])
+
+    assert [
+        (call.args, call.kwargs) for call in mock_playlist_task.delay.call_args_list
+    ] == [
+        (("channel1", playlists[0], "ocw"), {"create_videos": True}),
+        (("channel1", playlists[1], "ocw"), {"create_videos": False}),
+    ]
+
+
+def test_get_youtube_channel_data_missing_from_youtube(mocker, youtube_settings):
+    """A channel youtube no longer returns should be left alone"""
+    mocker.patch("learning_resources.tasks.youtube.get_youtube_client", autospec=True)
+    mocker.patch(
+        "learning_resources.tasks.youtube.extract_channel",
+        autospec=True,
+        return_value=None,
+    )
+    mock_unpublish = mocker.patch(
+        "learning_resources.tasks.loaders.unpublish_removed_playlists", autospec=True
+    )
+    mock_playlist_task = mocker.patch(
+        "learning_resources.tasks.get_youtube_playlist_data", autospec=True
+    )
+
+    get_youtube_channel_data.delay(_channel_config("channel1"))
+
+    assert models.VideoChannel.objects.count() == 0
+    mock_unpublish.assert_not_called()
+    mock_playlist_task.delay.assert_not_called()
+
+
+def test_get_youtube_channel_data_extract_error_keeps_playlists(
+    mocker, youtube_settings
+):
+    """A failed playlist listing must not unpublish the channel's playlists"""
+    mocker.patch("learning_resources.tasks.youtube.get_youtube_client", autospec=True)
+    mocker.patch(
+        "learning_resources.tasks.youtube.extract_channel",
+        autospec=True,
+        return_value={"id": "channel1", "snippet": {"title": "Channel 1"}},
+    )
+    mocker.patch(
+        "learning_resources.tasks.youtube.extract_playlist_metadata",
+        autospec=True,
+        side_effect=ExtractException("boom"),
+    )
+    mock_unpublish = mocker.patch(
+        "learning_resources.tasks.loaders.unpublish_removed_playlists", autospec=True
+    )
+
+    with pytest.raises(ExtractException):
+        get_youtube_channel_data.delay(_channel_config("channel1"))
+
+    mock_unpublish.assert_not_called()
+
+
+def test_get_youtube_playlist_data(mocker, youtube_settings):
+    """A playlist task should transform and load only its own playlist"""
+    video_channel = factories.VideoChannelFactory.create(channel_id="channel1")
+    mocker.patch("learning_resources.tasks.youtube.get_youtube_client", autospec=True)
+    mock_videos = mocker.patch(
+        "learning_resources.tasks.youtube.extract_playlist_items", autospec=True
+    )
+    mock_load_playlist = mocker.patch(
+        "learning_resources.tasks.loaders.load_playlist", autospec=True
+    )
+
+    get_youtube_playlist_data.delay(
+        "channel1", _playlist_data("playlist1"), "ocw", create_videos=True
+    )
+
+    mock_videos.assert_called_once_with(ANY, "playlist1")
+    loaded_channel, playlist_data = mock_load_playlist.call_args.args
+    assert loaded_channel == video_channel
+    assert playlist_data["playlist_id"] == "playlist1"
+    assert playlist_data["create_videos"] is True
+    assert playlist_data["offered_by"] == {"code": "ocw"}
+
+
+def test_get_youtube_playlist_data_without_channel(mocker, youtube_settings):
+    """A playlist whose channel vanished mid-run should be skipped, not crash"""
+    mocker.patch("learning_resources.tasks.youtube.get_youtube_client", autospec=True)
+    mock_load_playlist = mocker.patch(
+        "learning_resources.tasks.loaders.load_playlist", autospec=True
+    )
+
+    get_youtube_playlist_data.delay(
+        "channel1", _playlist_data("playlist1"), "ocw", create_videos=True
+    )
+
+    mock_load_playlist.assert_not_called()
+
+
+def _warehouse_owns_youtube():
+    """Hand both YouTube resource types to the warehouse pipeline"""
+    for resource_type in (
+        LearningResourceType.video_playlist.name,
+        LearningResourceType.video.name,
+    ):
+        ETLSourceOwnershipFactory.create(
+            etl_source=ETLSource.youtube.name,
+            resource_type=resource_type,
+            owner=ETLSourceOwnership.Pipeline.WAREHOUSE,
+        )
+
+
+def test_get_youtube_data_skips_when_legacy_does_not_own_youtube(
+    mocker, youtube_settings
+):
+    """The fan-out queues nothing for a source the legacy ETL does not own"""
+    _warehouse_owns_youtube()
+    mock_configs = mocker.patch(
+        "learning_resources.tasks.youtube.get_youtube_channel_configs", autospec=True
+    )
+    mock_channel_task = mocker.patch(
+        "learning_resources.tasks.get_youtube_channel_data", autospec=True
+    )
+
+    assert get_youtube_data.delay().get() == 0
+
+    mock_configs.assert_not_called()
+    mock_channel_task.delay.assert_not_called()
+
+
+def test_get_youtube_channel_data_skips_when_ownership_changed(
+    mocker, youtube_settings
+):
+    """A channel task queued before the cutover writes nothing after it"""
+    _warehouse_owns_youtube()
+    mocker.patch("learning_resources.tasks.youtube.get_youtube_client", autospec=True)
+    mock_extract = mocker.patch(
+        "learning_resources.tasks.youtube.extract_channel",
+        autospec=True,
+        return_value={"id": "channel1", "snippet": {"title": "Channel 1"}},
+    )
+    mocker.patch(
+        "learning_resources.tasks.youtube.extract_playlist_metadata",
+        autospec=True,
+        return_value=iter([(_playlist_data("playlist1"), True)]),
+    )
+    mock_unpublish = mocker.patch(
+        "learning_resources.tasks.loaders.unpublish_removed_playlists", autospec=True
+    )
+    mock_playlist_task = mocker.patch(
+        "learning_resources.tasks.get_youtube_playlist_data", autospec=True
+    )
+
+    get_youtube_channel_data.delay(_channel_config("channel1"))
+
+    mock_extract.assert_not_called()
+    assert models.VideoChannel.objects.count() == 0
+    mock_unpublish.assert_not_called()
+    mock_playlist_task.delay.assert_not_called()
+
+
+def test_get_youtube_playlist_data_skips_when_ownership_changed(
+    mocker, youtube_settings
+):
+    """A playlist task queued before the cutover writes nothing after it"""
+    factories.VideoChannelFactory.create(channel_id="channel1")
+    _warehouse_owns_youtube()
+    mocker.patch("learning_resources.tasks.youtube.get_youtube_client", autospec=True)
+    mock_videos = mocker.patch(
+        "learning_resources.tasks.youtube.extract_playlist_items", autospec=True
+    )
+    mock_load_playlist = mocker.patch(
+        "learning_resources.tasks.loaders.load_playlist", autospec=True
+    )
+
+    get_youtube_playlist_data.delay(
+        "channel1", _playlist_data("playlist1"), "ocw", create_videos=True
+    )
+
+    mock_videos.assert_not_called()
+    mock_load_playlist.assert_not_called()
+
+
+def test_get_youtube_transcripts(mocker):
+    """Verify that get_youtube_transcripts invokes correct course_catalog.etl.youtube functions"""
+
+    mock_etl_youtube = mocker.patch("learning_resources.tasks.youtube")
+
+    get_youtube_transcripts(created_after=None, created_minutes=2000, overwrite=True)
+
+    mock_etl_youtube.get_youtube_videos_for_transcripts_job.assert_called_once_with(
+        created_after=None, created_minutes=2000, overwrite=True
+    )
+
+    mock_etl_youtube.get_youtube_transcripts.assert_called_once_with(
+        mock_etl_youtube.get_youtube_videos_for_transcripts_job.return_value
+    )
+
+
+def test_get_ovs_data(mocker):
+    """Verify that get_ovs_data invokes the OVS ETL pipeline"""
+    mock_pipelines = mocker.patch("learning_resources.tasks.pipelines")
+    mock_pipelines.ovs_etl.return_value = iter([])
+    tasks.get_ovs_data.delay()
+    mock_pipelines.ovs_etl.assert_called_once()
+
+
+def test_get_ovs_transcripts(mocker):
+    """Verify that get_ovs_transcripts invokes correct OVS ETL functions"""
+
+    mock_etl_ovs = mocker.patch("learning_resources.tasks.ovs")
+
+    tasks.get_ovs_transcripts(overwrite=True)
+
+    mock_etl_ovs.get_ovs_videos_for_transcripts_job.assert_called_once_with(
+        overwrite=True
+    )
+
+    mock_etl_ovs.get_ovs_transcripts.assert_called_once_with(
+        mock_etl_ovs.get_ovs_videos_for_transcripts_job.return_value
+    )
+
+
+@pytest.mark.parametrize("published", [True, False])
+def test_update_next_start_date(mocker, published):
+    learning_resource = LearningResourceFactory.create(
+        next_start_date=(timezone.now() - timedelta(10)),
+        published=published,
+    )
+    LearningResourceFactory.create(next_start_date=(timezone.now() + timedelta(1)))
+
+    mock_load_next_start_date = mocker.patch(
+        "learning_resources.tasks.load_run_dependent_values"
+    )
+    mock_upsert_index = mocker.patch(
+        "learning_resources.tasks.resource_upserted_actions"
+    )
+    update_next_start_date_and_prices()
+    mock_load_next_start_date.assert_called_once_with(learning_resource)
+    if published:
+        mock_upsert_index.assert_called_once_with(
+            learning_resource, percolate=False, generate_embeddings=True
+        )
+    else:
+        mock_upsert_index.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("chunk_size", "overwrite", "ids"),
+    [
+        (None, False, []),  # Default params
+        (10, True, [1, 2, 3]),  # Custom params
+        (5, False, [42, 99]),  # Another variation
+    ],
+)
+def test_summarize_unprocessed_content(
+    mocker, mocked_celery, chunk_size, overwrite, ids
+):
+    """Test that summarize_unprocessed_content calls the correct methods"""
+    summarize_content_files_task_mock = mocker.patch(
+        "learning_resources.tasks.summarize_content_files_task", autospec=True
+    )
+    get_unprocessed_content_file_ids_mock = mocker.patch(
+        "learning_resources.content_summarizer.ContentSummarizer.get_unprocessed_content_file_ids",
+        autospec=True,
+        return_value=ids,
+    )
+    error_expectation = pytest.raises(mocked_celery.replace_exception_class)
+    with error_expectation:
+        tasks.summarize_unprocessed_content.delay(
+            unprocessed_content_ids=ids, overwrite=overwrite
+        )
+
+    assert mocked_celery.group.call_count == 1
+    if ids:
+        summarize_content_files_task_mock.si.assert_called_once_with(
+            content_file_ids=ids, overwrite=overwrite
+        )
+    assert get_unprocessed_content_file_ids_mock.call_count == 0 if ids else 1
+
+
+@pytest.mark.django_db
+def test_marketing_page_for_resources_with_webdriver(mocker, settings):
+    """Test that marketing_page_for_resources uses WebDriver to fetch content"""
+
+    settings.EMBEDDINGS_EXTERNAL_FETCH_USE_WEBDRIVER = True
+
+    course = models.LearningResource.objects.create(
+        title="Test Course",
+        url="https://example.com/course",
+        resource_type="course",
+        published=True,
+    )
+
+    html_content = "<html><body><h1>Test Course</h1><p>Course content</p></body></html>"
+    mock_fetch_page = mocker.patch(
+        "learning_resources.site_scrapers.base_scraper.BaseScraper.fetch_page",
+        return_value=html_content,
+    )
+
+    markdown_content = "# Test Course\n\nCourse content"
+    mock_html_to_markdown = mocker.patch(
+        "learning_resources.tasks.html_to_markdown", return_value=markdown_content
+    )
+
+    mock_generate_embeddings = mocker.patch("vector_search.tasks.generate_embeddings")
+    mock_upsert_content_file = mocker.patch(
+        "learning_resources_search.tasks.upsert_content_file"
+    )
+
+    marketing_page_for_resources([course.id])
+
+    mock_fetch_page.assert_called_once_with(course.url)
+    mock_html_to_markdown.assert_called_once_with(html_content)
+
+    # Verify that a content file was created
+    content_file = models.ContentFile.objects.get(
+        learning_resource=course, file_type=MARKETING_PAGE_FILE_TYPE
+    )
+    assert content_file.key == course.url
+    assert content_file.url == course.url
+    assert content_file.content == markdown_content
+    assert content_file.file_extension == ".md"
+
+    # Verify embeddings were triggered
+    mock_generate_embeddings.delay.assert_called_once_with(
+        [content_file.id], "content_file", overwrite=True
+    )
+
+    # Verify the search index upsert was triggered
+    mock_upsert_content_file.delay.assert_called_once_with(content_file.id)
+
+
+@pytest.mark.django_db
+def test_marketing_page_for_resources_isolates_scrape_failures(mocker):
+    """A single resource's scrape failure must not fail the whole chunk.
+
+    When course and program tasks are chained, a chunk that raises poisons the
+    chord header and the program group never runs, so per-resource failures are
+    logged and skipped rather than propagated.
+    """
+    bad_course = models.LearningResource.objects.create(
+        title="Bad Course",
+        url="https://example.com/bad-course",
+        resource_type="course",
+        published=True,
+    )
+    good_course = models.LearningResource.objects.create(
+        title="Good Course",
+        url="https://example.com/good-course",
+        resource_type="course",
+        published=True,
+    )
+
+    good_scraper = mocker.Mock()
+    good_scraper.scrape.return_value = "<html><body><p>ok</p></body></html>"
+
+    def fake_scraper_for_site(url):
+        if url == bad_course.url:
+            msg = "scraper boom"
+            raise RuntimeError(msg)
+        return good_scraper
+
+    mocker.patch(
+        "learning_resources.tasks.scraper_for_site",
+        side_effect=fake_scraper_for_site,
+    )
+    mocker.patch("learning_resources.tasks.html_to_markdown", return_value="ok")
+    mock_generate_embeddings = mocker.patch("vector_search.tasks.generate_embeddings")
+    mock_upsert_content_file = mocker.patch(
+        "learning_resources_search.tasks.upsert_content_file"
+    )
+
+    # Must not raise despite the bad course failing
+    marketing_page_for_resources([bad_course.id, good_course.id])
+
+    assert not models.ContentFile.objects.filter(learning_resource=bad_course).exists()
+    good_cf = models.ContentFile.objects.get(
+        learning_resource=good_course, file_type=MARKETING_PAGE_FILE_TYPE
+    )
+    mock_generate_embeddings.delay.assert_called_once_with(
+        [good_cf.id], "content_file", overwrite=True
+    )
+    mock_upsert_content_file.delay.assert_called_once_with(good_cf.id)
+
+
+@pytest.mark.django_db
+def test_marketing_page_for_program_appends_children(mocker, settings):
+    """Test that marketing_page_for_resources appends program children content"""
+
+    settings.EMBEDDINGS_EXTERNAL_FETCH_USE_WEBDRIVER = True
+
+    program = models.LearningResource.objects.create(
+        title="Test Program",
+        url="https://example.com/program",
+        resource_type="program",
+        published=True,
+    )
+    models.Program.objects.create(learning_resource=program)
+
+    child_course = models.LearningResource.objects.create(
+        title="Child Course",
+        url="https://example.com/child-course",
+        resource_type="course",
+        description="A child course description",
+        published=True,
+    )
+    models.LearningResourceRelationship.objects.create(
+        parent=program,
+        child=child_course,
+        relation_type="PROGRAM_COURSES",
+        position=0,
+    )
+    models.ContentFile.objects.create(
+        learning_resource=child_course,
+        file_type=MARKETING_PAGE_FILE_TYPE,
+        file_extension=".md",
+        key="mktg-child-course",
+        content="Child Course marketing copy",
+        published=True,
+    )
+
+    html_content = "<html><body><h1>Test Program</h1><p>Program info</p></body></html>"
+    mocker.patch(
+        "learning_resources.site_scrapers.base_scraper.BaseScraper.fetch_page",
+        return_value=html_content,
+    )
+
+    markdown_content = "# Test Program\n\nProgram info"
+    mocker.patch(
+        "learning_resources.tasks.html_to_markdown", return_value=markdown_content
+    )
+
+    mock_generate_embeddings = mocker.patch("vector_search.tasks.generate_embeddings")
+    mock_upsert_content_file = mocker.patch(
+        "learning_resources_search.tasks.upsert_content_file"
+    )
+
+    marketing_page_for_resources([program.id])
+
+    content_file = models.ContentFile.objects.get(
+        learning_resource=program, file_type=MARKETING_PAGE_FILE_TYPE
+    )
+    assert content_file.content.startswith(markdown_content)
+    assert "## Program Contents" in content_file.content
+    assert "Child Course" in content_file.content
+
+    # Verify embeddings were triggered
+    mock_generate_embeddings.delay.assert_called_once_with(
+        [content_file.id], "content_file", overwrite=True
+    )
+
+    # Program marketing pages should be upserted to the search index as well
+    mock_upsert_content_file.delay.assert_called_once_with(content_file.id)
+
+
+@pytest.mark.django_db
+def test_marketing_page_for_non_program_skips_children_content(mocker, settings):
+    """Non-program resources should not invoke program children aggregation."""
+    settings.EMBEDDINGS_EXTERNAL_FETCH_USE_WEBDRIVER = True
+
+    course = models.LearningResource.objects.create(
+        title="Test Course",
+        url="https://example.com/course-no-children",
+        resource_type="course",
+        published=True,
+    )
+
+    html_content = "<html><body><h1>Test Course</h1><p>Course content</p></body></html>"
+    mocker.patch(
+        "learning_resources.site_scrapers.base_scraper.BaseScraper.fetch_page",
+        return_value=html_content,
+    )
+    markdown_content = "# Test Course\n\nCourse content"
+    mocker.patch(
+        "learning_resources.tasks.html_to_markdown", return_value=markdown_content
+    )
+
+    children_content_mock = mocker.patch(
+        "learning_resources.tasks.build_program_children_content_bulk",
+        return_value={},
+    )
+    mock_generate_embeddings = mocker.patch("vector_search.tasks.generate_embeddings")
+    mocker.patch("learning_resources_search.tasks.upsert_content_file")
+
+    marketing_page_for_resources([course.id])
+
+    children_content_mock.assert_not_called()
+
+    content_file = models.ContentFile.objects.get(
+        learning_resource=course, file_type=MARKETING_PAGE_FILE_TYPE
+    )
+    assert content_file.content == markdown_content
+    mock_generate_embeddings.delay.assert_called_once_with(
+        [content_file.id], "content_file", overwrite=True
+    )
+
+
+@pytest.mark.django_db
+def test_marketing_page_for_resources_sets_key_and_url(mocker):
+    """The marketing page ContentFile gets its key/url set at create time"""
+    course = models.LearningResource.objects.create(
+        title="Test Course",
+        url="https://example.com/course",
+        resource_type="course",
+        published=True,
+    )
+
+    scraper = mocker.Mock()
+    scraper.scrape.return_value = "<html><body><p>content</p></body></html>"
+    mocker.patch("learning_resources.tasks.scraper_for_site", return_value=scraper)
+    mocker.patch("learning_resources.tasks.html_to_markdown", return_value="content")
+    mocker.patch("vector_search.tasks.generate_embeddings")
+    mocker.patch("learning_resources_search.tasks.upsert_content_file")
+
+    marketing_page_for_resources([course.id])
+
+    content_file = models.ContentFile.objects.get(
+        learning_resource=course, file_type=MARKETING_PAGE_FILE_TYPE
+    )
+    assert content_file.key == course.url
+    assert content_file.url == course.url
+
+
+@pytest.mark.django_db
+def test_marketing_page_for_resources_updates_existing_on_url_change(mocker):
+    """A resource whose url changed should update its existing marketing
+    ContentFile in place, not create a second one.
+
+    The update_or_create lookup is (learning_resource, file_type) - it must
+    not include key, or a changed url would miss the existing row.
+    """
+    course = models.LearningResource.objects.create(
+        title="Test Course",
+        url="https://example.com/course-new-url",
+        resource_type="course",
+        published=True,
+    )
+    old_url = "https://example.com/course-old-url"
+    existing = ContentFileFactory.create(
+        learning_resource=course,
+        file_type=MARKETING_PAGE_FILE_TYPE,
+        key=old_url,
+        url=old_url,
+        file_extension=".md",
+    )
+
+    scraper = mocker.Mock()
+    scraper.scrape.return_value = "<html><body><p>content</p></body></html>"
+    mocker.patch("learning_resources.tasks.scraper_for_site", return_value=scraper)
+    mocker.patch("learning_resources.tasks.html_to_markdown", return_value="content")
+    mocker.patch("vector_search.tasks.generate_embeddings")
+    mocker.patch("learning_resources_search.tasks.upsert_content_file")
+
+    marketing_page_for_resources([course.id])
+
+    marketing_files = models.ContentFile.objects.filter(
+        learning_resource=course, file_type=MARKETING_PAGE_FILE_TYPE
+    )
+    assert marketing_files.count() == 1
+    updated = marketing_files.get()
+    assert updated.id == existing.id
+    assert updated.key == course.url
+    assert updated.url == course.url
+
+
+@pytest.mark.django_db
+def test_scrape_marketing_pages(mocker, settings, mocked_celery):
+    """Test that scrape_marketing_pages correctly identifies resources without marketing pages"""
+
+    settings.EMBEDDINGS_EXTERNAL_FETCH_USE_WEBDRIVER = True
+    settings.QDRANT_CHUNK_SIZE = 2
+
+    course1 = models.LearningResource.objects.create(
+        title="Course 1",
+        url="https://example.com/course1",
+        resource_type="course",
+        published=True,
+    )
+    course2 = models.LearningResource.objects.create(
+        title="Course 2",
+        url="https://example.com/course2",
+        resource_type="course",
+        published=True,
+    )
+
+    course3 = models.LearningResource.objects.create(
+        title="Course 3",
+        url="https://example.com/course3",
+        resource_type="course",
+        published=True,
+    )
+    models.ContentFile.objects.create(
+        learning_resource=course3,
+        file_type=MARKETING_PAGE_FILE_TYPE,
+        key=course3.url,
+        content="Existing content",
+        file_extension=".md",
+    )
+
+    models.LearningResource.objects.create(
+        title="Unpublished Course",
+        url="https://example.com/unpublished",
+        resource_type="course",
+        published=False,
+    )
+
+    mock_group = mocker.patch("learning_resources.tasks.celery.group")
+    mock_marketing_page_task = mocker.patch(
+        "learning_resources.tasks.marketing_page_for_resources.si"
+    )
+    with pytest.raises(mocked_celery.replace_exception_class):
+        scrape_marketing_pages.delay()
+
+    # Verify that only resources without marketing pages are included
+    expected_ids = [course1.id, course2.id]
+    assert all(
+        eid in mock_marketing_page_task.mock_calls[0].args[0] for eid in expected_ids
+    )
+    mock_group.assert_called_once()
+
+
+@pytest.mark.django_db
+def test_scrape_marketing_pages_orders_courses_before_programs(
+    mocker, settings, mocked_celery
+):
+    """Courses are scraped in a group that runs before the programs group."""
+    settings.QDRANT_CHUNK_SIZE = 10
+    course = models.LearningResource.objects.create(
+        title="Course",
+        url="https://example.com/course",
+        resource_type="course",
+        published=True,
+    )
+    program = models.LearningResource.objects.create(
+        title="Program",
+        url="https://example.com/program",
+        resource_type="program",
+        published=True,
+    )
+    si_mock = mocker.patch("learning_resources.tasks.marketing_page_for_resources.si")
+    # Make each .si(...) call's return value identify which ids it was built
+    # from, so the args passed into celery.group(...) can be told apart.
+    si_mock.side_effect = lambda ids: ("si", tuple(ids))
+
+    with pytest.raises(mocked_celery.replace_exception_class):
+        scrape_marketing_pages.delay()
+
+    # A chain enforces ordering (not a single flat group).
+    assert mocked_celery.chain.called
+    # Course task built before program task; each in its own chunk here.
+    queued_ids = [call.args[0] for call in si_mock.call_args_list]
+    assert queued_ids[0] == [course.id]
+    assert [program.id] in queued_ids
+    assert queued_ids.index([course.id]) < queued_ids.index([program.id])
+
+    # Pin the guarantee to what is actually fed into celery.chain via
+    # celery.group: Python evaluates chain's positional args left-to-right,
+    # so the first group(...) call must be the course tasks and the second
+    # must be the program tasks. This fails if the two arguments to
+    # celery.chain(celery.group(...), celery.group(...)) are ever swapped.
+    assert mocked_celery.group.call_count == 2
+    first_group_tasks, second_group_tasks = (
+        call.args[0] for call in mocked_celery.group.call_args_list
+    )
+    assert first_group_tasks == [("si", (course.id,))]
+    assert second_group_tasks == [("si", (program.id,))]
+
+
+@pytest.mark.django_db
+def test_scrape_marketing_pages_queues_healable_programs(
+    mocker, settings, mocked_celery
+):
+    """A program that already has a page but is missing its children section
+    (with a child course page available) is queued for re-scrape.
+    """
+    settings.QDRANT_CHUNK_SIZE = 10
+    course = models.LearningResource.objects.create(
+        title="Course",
+        url="https://example.com/course",
+        resource_type="course",
+        published=True,
+    )
+    ContentFile.objects.create(
+        learning_resource=course,
+        file_type=MARKETING_PAGE_FILE_TYPE,
+        file_extension=".md",
+        key=course.url,
+        content="Child copy.",
+        published=True,
+    )
+    program = models.LearningResource.objects.create(
+        title="Program",
+        url="https://example.com/program",
+        resource_type="program",
+        published=True,
+    )
+    models.LearningResourceRelationship.objects.create(
+        parent=program, child=course, relation_type="PROGRAM_COURSES"
+    )
+    # Program already has a page, but WITHOUT the children marker.
+    ContentFile.objects.create(
+        learning_resource=program,
+        file_type=MARKETING_PAGE_FILE_TYPE,
+        file_extension=".md",
+        key=program.url,
+        content="Program page, no children yet.",
+        published=True,
+    )
+    si_mock = mocker.patch("learning_resources.tasks.marketing_page_for_resources.si")
+
+    with pytest.raises(mocked_celery.replace_exception_class):
+        scrape_marketing_pages.delay()
+
+    queued_ids = [i for call in si_mock.call_args_list for i in call.args[0]]
+    # Program re-queued for healing; course already has a page so it is NOT queued.
+    assert program.id in queued_ids
+    assert course.id not in queued_ids
+
+
+@pytest.fixture
+def canvas_archive_bucket(settings, mocker):
+    """Mock an S3 bucket holding one archive each for canvas folders 1 and 2"""
+    settings.CANVAS_COURSE_BUCKET_PREFIX = "canvas/"
+    mock_bucket = mocker.Mock()
+    mock_archive1 = mocker.Mock()
+    mock_archive1.key = "canvas/1/archive1.imscc"
+    mock_archive1.last_modified = now_in_utc()
+    mock_archive2 = mocker.Mock()
+    mock_archive2.key = "canvas/2/archive2.imscc"
+    mock_archive2.last_modified = now_in_utc() - timedelta(days=1)
+    mock_bucket.objects.filter.return_value = [mock_archive1, mock_archive2]
+    mocker.patch(
+        "learning_resources.tasks.get_bucket_by_name", return_value=mock_bucket
+    )
+    return mock_bucket
+
+
+@pytest.mark.parametrize("canvas_ids", [["1"], None])
+def test_sync_canvas_courses(mocker, mocked_celery, canvas_archive_bucket, canvas_ids):
+    """
+    sync_canvas_courses should queue one ingest task per archive rather than
+    importing the courses inline
+    """
+    delay_mock = mocker.patch("learning_resources.tasks.ingest_canvas_course.delay")
+    sweep_mock = mocker.patch(
+        "learning_resources.tasks.unpublish_removed_canvas_courses"
+    )
+
+    queued = sync_canvas_courses.delay(
+        canvas_course_ids=canvas_ids, overwrite=False
+    ).get()
+
+    queued_keys = [call.args[0] for call in delay_mock.call_args_list]
+    if canvas_ids:
+        # a filtered run only queues the courses it was asked for, and doesn't
+        # list every archive, so it must not sweep
+        assert queued_keys == ["canvas/1/archive1.imscc"]
+        assert sweep_mock.call_count == 0
+    else:
+        assert sorted(queued_keys) == [
+            "canvas/1/archive1.imscc",
+            "canvas/2/archive2.imscc",
+        ]
+        # the sweep is driven by the listing, and runs before the fan-out so a
+        # culled import can't hold it up
+        assert sorted(sweep_mock.call_args.args[0]) == ["1", "2"]
+    assert queued == len(queued_keys)
+    # the imports are independent tasks - nothing waits on them, so the sync
+    # must not build a group/chord just to fan out
+    assert mocked_celery.group.call_count == 0
+    assert mocked_celery.replace.call_count == 0
+
+
+def test_sync_canvas_courses_no_archives(mocker, mocked_celery, canvas_archive_bucket):
+    """
+    An empty bucket listing should queue nothing and sweep nothing, rather than
+    reading as "canvas offers no courses" and deleting the catalog
+    """
+    canvas_archive_bucket.objects.filter.return_value = []
+    delay_mock = mocker.patch("learning_resources.tasks.ingest_canvas_course.delay")
+    sweep_mock = mocker.patch(
+        "learning_resources.tasks.unpublish_removed_canvas_courses"
+    )
+
+    assert sync_canvas_courses.delay(overwrite=False).get() is None
+
+    assert delay_mock.call_count == 0
+    assert sweep_mock.call_count == 0
+    assert mocked_celery.group.call_count == 0
+    assert mocked_celery.replace.call_count == 0
+
+
+def test_unpublish_removed_canvas_courses(mocker):
+    """
+    unpublish_removed_canvas_courses should delete canvas resources whose course
+    folder is no longer in the S3 listing, matching on the readable id prefix
+    """
+    mock_unpublished_actions = mocker.patch(
+        "learning_resources.tasks.resource_unpublished_actions"
+    )
+    lr1, lr2, lr_stale = (
+        LearningResourceFactory.create(
+            readable_id=readable_id,
+            etl_source=ETLSource.canvas.name,
+            published=True,
+            test_mode=True,
+            resource_type="course",
+        )
+        # folder "1" must not match folder "12"'s course, hence the trailing "-"
+        for readable_id in ("1-COURSE1", "12-COURSE12", "3-COURSE3")
+    )
+    other_source = LearningResourceFactory.create(
+        readable_id="3-COURSE3-xpro",
+        etl_source=ETLSource.xpro.name,
+        published=True,
+        resource_type="course",
+    )
+
+    assert unpublish_removed_canvas_courses(["1", "12"]) == 1
+
+    assert not LearningResource.objects.get(id=lr_stale.id).published
+    assert LearningResource.objects.filter(id=lr1.id).exists()
+    assert LearningResource.objects.filter(id=lr2.id).exists()
+    assert LearningResource.objects.filter(id=other_source.id).exists()
+    assert mock_unpublished_actions.call_count == 1
+    # the hook skips content files on a test_mode resource, so it must be handed
+    # the resource as it is after the unpublish, not as it was before
+    unpublished = mock_unpublished_actions.call_args.args[0]
+    assert unpublished.id == lr_stale.id
+    assert unpublished.test_mode is False
+    assert unpublished.published is False
+
+
+def test_unpublish_removed_canvas_courses_none_stale(mocker):
+    """
+    A listing covering every course folder should delete nothing, without
+    unpublishing the courses it is keeping
+    """
+    mock_unpublished_actions = mocker.patch(
+        "learning_resources.tasks.resource_unpublished_actions"
+    )
+    resource = LearningResourceFactory.create(
+        readable_id="1-COURSE1",
+        etl_source=ETLSource.canvas.name,
+        published=True,
+        test_mode=True,
+        resource_type="course",
+    )
+
+    assert unpublish_removed_canvas_courses(["1"]) == 0
+
+    resource.refresh_from_db()
+    assert resource.published is True
+    assert resource.test_mode is True
+    assert mock_unpublished_actions.call_count == 0
+
+
+def test_unpublish_removed_canvas_courses_empty(mocker):
+    """
+    A listing that came back empty should leave every canvas course alone rather
+    than deleting the whole catalog
+    """
+    mocker.patch("learning_resources.tasks.resource_unpublished_actions")
+    resource = LearningResourceFactory.create(
+        readable_id="1-COURSE1",
+        etl_source=ETLSource.canvas.name,
+        published=True,
+        test_mode=True,
+        resource_type="course",
+    )
+
+    assert unpublish_removed_canvas_courses([]) == 0
+
+    resource.refresh_from_db()
+    assert resource.published is True
+    assert resource.test_mode is True
+
+
+def test_sync_canvas_courses_skips_entirely_when_not_owned(settings, mocker):
+    """
+    sync_canvas_courses should not ingest archives or unpublish/delete stale
+    courses once canvas courses are owned by another pipeline.
+    """
+    settings.CANVAS_COURSE_BUCKET_PREFIX = "canvas/"
+    ETLSourceOwnershipFactory.create(
+        etl_source=ETLSource.canvas.name,
+        resource_type=LearningResourceType.course.name,
+        owner=ETLSourceOwnership.Pipeline.WEBHOOK,
+    )
+    mocker.patch("learning_resources.tasks.resource_unpublished_actions")
+    mock_get_bucket = mocker.patch("learning_resources.tasks.get_bucket_by_name")
+    mock_ingest_course = mocker.patch("learning_resources.tasks.ingest_canvas_course")
+
+    lr_stale = LearningResourceFactory.create(
+        readable_id="course3",
+        etl_source=ETLSource.canvas.name,
+        published=True,
+        test_mode=True,
+        resource_type="course",
+    )
+
+    sync_canvas_courses(canvas_course_ids=None, overwrite=False)
+
+    mock_get_bucket.assert_not_called()
+    mock_ingest_course.assert_not_called()
+    lr_stale.refresh_from_db()
+    assert lr_stale.published is True
+
+
+@pytest.mark.parametrize(
+    ("etl_source", "archive_path", "overwrite"),
+    [
+        (
+            ETLSource.mitxonline.name,
+            "mitxonline/courses/course-v1:Test+Course+R1/abcdefghijklmnop.tar.gz",
+            False,
+        ),
+        (
+            ETLSource.xpro.name,
+            "xpro/courses/course-v1:xPRO+Test+R1/qrstuvwxyz.tar.gz",
+            True,
+        ),
+        (
+            ETLSource.oll.name,
+            "open-learning-library/courses/20220101/course-v1:OLL+Test+R1_OLL.tar.gz",
+            True,
+        ),
+    ],
+)
+def test_ingest_edx_course(mocker, etl_source, archive_path, overwrite):
+    """Test ingest_edx_course task calls sync_edx_archive with correct parameters"""
+    from learning_resources.tasks import ingest_edx_run_archive
+
+    run_id = "course-v1:Test+Course+R1"
+    mock_sync = mocker.patch("learning_resources.tasks.sync_edx_archive")
+
+    ingest_edx_run_archive(etl_source, archive_path, run_id=run_id, overwrite=overwrite)
+
+    mock_sync.assert_called_once_with(
+        etl_source, archive_path, run_id=run_id, overwrite=overwrite
+    )
+
+
+def test_update_ocw_learning_material_resources(mocker, settings):
+    """
+    Test that update_ocw_learning_material_resources calls the correct loader method
+    """
+    ocw_resource = LearningResourceFactory.create(
+        etl_source=ETLSource.ocw.name,
+        resource_type=LearningResourceType.course.name,
+        published=True,
+    )
+
+    ContentFileFactory.create_batch(
+        2,
+        run=ocw_resource.runs.first(),
+    )
+
+    content_file_ids = set(
+        ocw_resource.runs.first().content_files.values_list("id", flat=True)
+    )
+
+    mock_load_learning_materials = mocker.patch(
+        "learning_resources.tasks.load_learning_materials", autospec=True
+    )
+
+    update_ocw_learning_material_resources()
+
+    mock_load_learning_materials.assert_called_once()
+    call_args = mock_load_learning_materials.call_args[0]
+    assert call_args[0] == ocw_resource.runs.first()
+    assert set(call_args[1]) == content_file_ids
+
+
+def test_cleanup_deleted_content_files_respects_retention_window(settings):
+    """
+    cleanup_deleted_content_files should only delete soft-deleted files past
+    the retention window, only for sources in RESOURCE_FILE_ETL_SOURCES, and
+    should chunk its deletes.
+    """
+    settings.CONTENT_FILE_RETENTION_DAYS = 14
+    settings.CONTENT_FILE_CLEANUP_CHUNK_SIZE = 2
+
+    eligible_run = LearningResourceRunFactory.create(
+        published=True, learning_resource__etl_source=ETLSource.mitxonline.value
+    )
+    ineligible_run = LearningResourceRunFactory.create(
+        published=True, learning_resource__etl_source=ETLSource.youtube.value
+    )
+
+    old_cutoff = now_in_utc() - timedelta(days=15)
+    recent_cutoff = now_in_utc() - timedelta(days=1)
+
+    old_unpublished = ContentFileFactory.create_batch(
+        3, run=eligible_run, published=False
+    )
+    recent_unpublished = ContentFileFactory.create_batch(
+        1, run=eligible_run, published=False
+    )
+    # old and dated, but published: never cleaned up
+    still_published = ContentFileFactory.create_batch(
+        1, run=eligible_run, published=True, release_date=recent_cutoff
+    )
+    ineligible_old_unpublished = ContentFileFactory.create_batch(
+        2, run=ineligible_run, published=False
+    )
+
+    # Force updated_on values so this test is deterministic around the threshold.
+    ContentFile.objects.filter(
+        id__in=[
+            f.id for f in old_unpublished + ineligible_old_unpublished + still_published
+        ]
+    ).update(updated_on=old_cutoff)
+    ContentFile.objects.filter(id__in=[f.id for f in recent_unpublished]).update(
+        updated_on=recent_cutoff
+    )
+
+    result = cleanup_deleted_content_files()
+    assert result == 3
+
+    remaining_ids = set(ContentFile.objects.values_list("id", flat=True))
+    for file in old_unpublished:
+        assert file.id not in remaining_ids
+    for file in recent_unpublished + still_published + ineligible_old_unpublished:
+        assert file.id in remaining_ids
+
+
+def test_cleanup_deleted_content_files_skips_republished_rows(mocker, settings):
+    """
+    If a content file picked up in the eligible id list gets republished
+    before the chunked delete runs, it should be skipped instead of
+    hard-deleted (the delete re-applies the eligibility filter).
+    """
+    settings.CONTENT_FILE_RETENTION_DAYS = 14
+    settings.CONTENT_FILE_CLEANUP_CHUNK_SIZE = 10
+
+    run = LearningResourceRunFactory.create(
+        published=True, learning_resource__etl_source=ETLSource.mitxonline.value
+    )
+    old_cutoff = now_in_utc() - timedelta(days=15)
+    doomed = ContentFileFactory.create_batch(2, run=run, published=False)
+    survivor = ContentFileFactory.create(run=run, published=False)
+    ContentFile.objects.filter(id__in=[f.id for f in [*doomed, survivor]]).update(
+        updated_on=old_cutoff
+    )
+
+    # Wrap `list` inside the tasks module so that immediately after the
+    # eligible-id list is materialized, we flip `survivor` to published=True
+    # -- simulating a race between selection and the chunked delete. The
+    # delete's re-applied eligibility filter should still spare it.
+    real_list = list
+
+    def racy_list(iterable):
+        result = real_list(iterable)
+        ContentFile.objects.filter(id=survivor.id).update(published=True)
+        return result
+
+    mocker.patch("learning_resources.tasks.list", side_effect=racy_list, create=True)
+
+    deleted_count = cleanup_deleted_content_files()
+
+    assert deleted_count == 2
+    remaining_ids = set(ContentFile.objects.values_list("id", flat=True))
+    assert survivor.id in remaining_ids
+    for file in doomed:
+        assert file.id not in remaining_ids
+
+
+def test_cleanup_deleted_content_files_no_eligible_returns_zero(mocker, settings):
+    """cleanup_deleted_content_files should no-op and return 0 when nothing is eligible."""
+    settings.CONTENT_FILE_RETENTION_DAYS = 14
+    settings.CONTENT_FILE_CLEANUP_CHUNK_SIZE = 2
+    run = LearningResourceRunFactory.create(
+        published=True, learning_resource__etl_source=ETLSource.mitxonline.value
+    )
+    ContentFileFactory.create_batch(2, run=run, published=True)
+
+    mocker.patch("learning_resources.tasks.log.info")
+
+    deleted_count = cleanup_deleted_content_files()
+
+    assert deleted_count == 0
+
+
+def test_cleanup_deleted_content_files_returns_error_on_unexpected_exception(mocker):
+    """cleanup_deleted_content_files should return an error string for non-retry exceptions."""
+    mocker.patch(
+        "learning_resources.tasks.ContentFile.objects.filter",
+        side_effect=RuntimeError("boom"),
+    )
+
+    result = cleanup_deleted_content_files()
+
+    assert result == "cleanup_deleted_content_files threw an error"
+
+
+def test_get_podcast_transcripts(mocker):
+    """Verify that get_podcast_transcripts invokes the correct podcast ETL functions"""
+
+    mock_etl_podcast = mocker.patch("learning_resources.tasks.podcast")
+
+    tasks.get_podcast_transcripts(overwrite=True)
+
+    mock_etl_podcast.get_podcast_episodes_for_transcripts_job.assert_called_once_with(
+        overwrite=True
+    )
+    mock_etl_podcast.get_podcast_transcripts.assert_called_once_with(
+        mock_etl_podcast.get_podcast_episodes_for_transcripts_job.return_value
+    )
+
+
+@mock_aws
+def test_unpublish_all_excluded_files(
+    settings, mocker, mocked_celery, mock_course_archive_bucket
+):
+    """Only courses whose runs have content files are fanned out"""
+    mock_task = mocker.patch("learning_resources.tasks.unpublish_excluded_files.si")
+    mocker.patch(
+        "learning_resources.tasks.get_most_recent_course_archives",
+        return_value=["foo.tar.gz"],
+    )
+    setup_s3(settings)
+    etl_source = ETLSource.mitxonline.name
+    courses = factories.CourseFactory.create_batch(
+        3, etl_source=etl_source, platform=PlatformType.mitxonline.name
+    )
+    # the third course has no content files, so its archive is never downloaded
+    with_files = courses[:2]
+    for course in with_files:
+        factories.ContentFileFactory.create(
+            run=factories.LearningResourceRunFactory.create(
+                learning_resource=course.learning_resource
+            )
+        )
+    with pytest.raises(mocked_celery.replace_exception_class):
+        tasks.unpublish_all_excluded_files.delay(
+            etl_source=etl_source, chunk_size=2, learning_resource_ids=None
+        )
+    assert mock_task.call_count == 1
+    called_ids = sorted(
+        rid for call in mock_task.call_args_list for rid in call.args[0]
+    )
+    assert called_ids == sorted(c.learning_resource_id for c in with_files)
+    mock_task.assert_any_call(ANY, etl_source, ["foo.tar.gz"], dry_run=False)
+
+
+@pytest.mark.parametrize(
+    ("content_type", "is_published", "exists", "expect_sync"),
+    [
+        ("article", True, True, True),
+        # Unpublished or deleted between the hook firing and the task running.
+        ("article", False, True, False),
+        ("article", True, False, False),
+        # News is never mirrored -- it has the news feed instead.
+        ("news", True, True, False),
+    ],
+)
+def test_sync_website_content_learning_resource_guards(
+    mocker, content_type, is_published, exists, expect_sync
+):
+    """The task re-reads the item, since it may have changed since it was queued."""
+    from website_content.factories import WebsiteContentFactory
+
+    content = WebsiteContentFactory.create(
+        is_published=is_published, content_type=content_type
+    )
+    content_id = content.id
+    if not exists:
+        content.delete(force_policy=HARD_DELETE)
+
+    mock_sync = mocker.patch(
+        "learning_resources.tasks.sync_website_content_to_learning_resource"
+    )
+
+    tasks.sync_website_content_learning_resource.delay(content_id)
+
+    assert mock_sync.called is expect_sync
+
+
+def test_sync_website_content_undoes_itself_if_unpublished_meanwhile(mocker):
+    """
+    A sync that overtakes an unpublish reconciles against the row.
+
+    Unpublishing happens in the request, so it can land after this task has
+    read the item as published but before the task writes -- and there is
+    nothing queued behind it to notice. Left alone, the sync would restore a
+    published, indexed resource for content that is no longer public.
+    """
+    from learning_resources.api import (
+        sync_website_content_to_learning_resource,
+        website_content_readable_id,
+    )
+    from website_content.factories import WebsiteContentFactory
+    from website_content.models import WebsiteContent
+
+    # The search hand-off is covered in its own tests; this is about the row.
+    mocker.patch("learning_resources.api.resource_upserted_actions")
+    mocker.patch("learning_resources.api.resource_unpublished_actions")
+    content = WebsiteContentFactory.create(is_published=True, content_type="article")
+
+    def unpublish_then_sync(item):
+        """Stand in for the editor's unpublish, after the published check."""
+        WebsiteContent.objects.filter(id=item.id).update(is_published=False)
+        return sync_website_content_to_learning_resource(item)
+
+    mocker.patch(
+        "learning_resources.tasks.sync_website_content_to_learning_resource",
+        side_effect=unpublish_then_sync,
+    )
+
+    tasks.sync_website_content_learning_resource.delay(content.id)
+
+    resource = LearningResource.objects.get(
+        readable_id=website_content_readable_id(content.id)
+    )
+    assert resource.published is False
+
+
+def _unpublish_while_syncing(item):
+    """Stand in for the editor's unpublish, after the task's published check."""
+    from website_content.models import WebsiteContent
+
+    WebsiteContent.objects.filter(id=item.id).update(is_published=False)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        # Losing a row lock race with the unpublish.
+        DatabaseError("deadlock detected"),
+        # An unreachable broker escapes `try_with_retry_as_task`, whose own
+        # fallback is an unguarded `.delay()`.
+        BrokerError("[Errno 111] Connection refused"),
+        # Anything else the search or vector hooks raise.
+        RuntimeError("boom"),
+    ],
+)
+def test_sync_website_content_queues_the_removal_if_undoing_fails(mocker, failure):
+    """
+    Any failed undo is handed to the task that retries.
+
+    This task does not retry, so raising would leave the resource unpublished
+    in the database and still in the index, with nothing behind it.
+    """
+    from website_content.factories import WebsiteContentFactory
+
+    content = WebsiteContentFactory.create(is_published=True, content_type="article")
+
+    mocker.patch(
+        "learning_resources.tasks.sync_website_content_to_learning_resource",
+        side_effect=_unpublish_while_syncing,
+    )
+    mocker.patch(
+        "learning_resources.tasks.unpublish_website_content_learning_resource",
+        side_effect=failure,
+    )
+    mock_task = mocker.patch(
+        "learning_resources.tasks.unpublish_website_content_learning_resource_task.delay"
+    )
+
+    tasks.sync_website_content_learning_resource.delay(content.id)
+
+    mock_task.assert_called_once_with(content.id)
+
+
+def test_sync_website_content_survives_an_unreachable_broker(mocker):
+    """
+    Queueing the undo needs the broker, which may be what failed in the first
+    place. There is nothing further to try, so it is logged and the indexes are
+    left to the next reindex rather than failing the sync that did work.
+    """
+    from website_content.factories import WebsiteContentFactory
+
+    content = WebsiteContentFactory.create(is_published=True, content_type="article")
+
+    mocker.patch(
+        "learning_resources.tasks.sync_website_content_to_learning_resource",
+        side_effect=_unpublish_while_syncing,
+    )
+    mocker.patch(
+        "learning_resources.tasks.unpublish_website_content_learning_resource",
+        side_effect=BrokerError("[Errno 111] Connection refused"),
+    )
+    mocker.patch(
+        "learning_resources.tasks.unpublish_website_content_learning_resource_task.delay",
+        side_effect=BrokerError("[Errno 111] Connection refused"),
+    )
+
+    # Raising nothing is the assertion.
+    tasks.sync_website_content_learning_resource.delay(content.id)
+
+
+def test_unpublish_website_content_task_retries():
+    """
+    The removal task retries, which is what the callers that hand off to it
+    depend on: the inline removal gives up its work to this one, so a
+    transient database or search error here must not end the attempt.
+    """
+    task = tasks.unpublish_website_content_learning_resource_task
+
+    assert task.autoretry_for == (Exception,)
+    assert task.retry_kwargs["max_retries"] == 3
+
+
+def test_unpublish_website_content_learning_resource_task(mocker):
+    """The removal task works from the id, so a deleted item still leaves the index."""
+    mock_unpublish = mocker.patch(
+        "learning_resources.tasks.unpublish_website_content_learning_resource"
+    )
+
+    tasks.unpublish_website_content_learning_resource_task.delay(1234)
+
+    mock_unpublish.assert_called_once_with(1234)
+
+
+@pytest.mark.parametrize(
+    ("is_published", "expect_removal"),
+    [(False, True), (True, False)],
+)
+def test_unpublish_website_content_task_skips_a_republished_item(
+    mocker, is_published, expect_removal
+):
+    """
+    A queued removal can run after the item was republished.
+
+    Removing then would unpublish the resource the republish just restored, so
+    the task re-reads the row and bails out -- the mirror of the sync task only
+    acting on a published one.
+    """
+    from website_content.factories import WebsiteContentFactory
+
+    content = WebsiteContentFactory.create(is_published=is_published)
+    mock_unpublish = mocker.patch(
+        "learning_resources.tasks.unpublish_website_content_learning_resource"
+    )
+
+    tasks.unpublish_website_content_learning_resource_task.delay(content.id)
+
+    assert mock_unpublish.called is expect_removal
+
+
+def credential_metadata_resource(**kwargs):
+    """Create a resource the credential metadata sweep should pick up (a course)"""
+    return LearningResourceFactory.create(
+        **{
+            "is_course": True,
+            "published": True,
+            "etl_source": ETLSource.mitxonline.name,
+            "platform": LearningResourcePlatformFactory.create(
+                code=PlatformType.mitxonline.name
+            ),
+            **kwargs,
+        }
+    )
+
+
+def credential_metadata_program(**kwargs):
+    """Create a program the credential metadata sweep should pick up"""
+    return credential_metadata_resource(is_course=False, is_program=True, **kwargs)
+
+
+@pytest.fixture
+def credential_configurations():
+    """
+    One active configuration per credential metadata field.
+
+    Created here rather than relying on migration 0124's seed: a transactional
+    test elsewhere deletes those rows without restoring them, and with
+    --reuse-db they then stay missing for every later run. Since the sweep's
+    scope is now derived from the active configurations, a test that assumed
+    the seed would pass or fail on test-suite history.
+    """
+    models.CredentialMetadataConfiguration.objects.all().delete()
+    return [
+        CredentialMetadataConfigurationFactory.create(field=field.name)
+        for field in CredentialMetadataField
+    ]
+
+
+@pytest.fixture
+def program_credential_configurations(credential_configurations):
+    """
+    Program configurations, on top of the course ones.
+    """
+    return [
+        CredentialMetadataConfigurationFactory.create(
+            field=field.name,
+            resource_type=LearningResourceType.program.name,
+        )
+        for field in CredentialMetadataField
+    ]
+
+
+@pytest.fixture
+def mock_generate_and_save(mocker):
+    """
+    Stand in for credential metadata generation inside the leaf task.
+
+    Two things are patched because the leaf builds a coroutine and then hands
+    it to the bridge: the generator, so no real LLM coroutine is created, and
+    `run_on_worker_loop`, whose return value is what the task reads. Its
+    `side_effect` is what a test varies to make one resource fail.
+    """
+    # A MagicMock, not the AsyncMock `patch` would infer for an async def:
+    # the leaf builds the coroutine and hands it to the bridge, which is
+    # mocked too, so a real coroutine here would only go unawaited.
+    generator = mocker.patch(
+        "learning_resources.credentials.generate_and_save_credential_metadata",
+        new=mocker.MagicMock(),
+    )
+    bridge = mocker.patch(
+        "learning_resources.tasks.run_on_worker_loop",
+        return_value=CredentialMetadata(fields={"description": "A course"}, errors={}),
+    )
+
+    bridge.generator = generator
+    return bridge
+
+
+def test_generate_credential_metadata_for_resource(
+    credential_configurations, mock_generate_and_save
+):
+    """The resource is generated for, and the store reports it stored something"""
+    resource = credential_metadata_resource()
+
+    assert tasks.generate_credential_metadata_for_resource(resource.id) is True
+    assert mock_generate_and_save.call_count == 1
+
+
+def test_generate_credential_metadata_for_resource_raises(
+    credential_configurations, mock_generate_and_save
+):
+    """
+    A failing resource fails its own task rather than being swallowed.
+
+    With a task per resource there is nothing to protect: celery marks this
+    one failed, where a chunked version had to swallow the error to keep the
+    successes beside it. A visibly failed task is the point.
+    """
+    resource = credential_metadata_resource()
+    mock_generate_and_save.side_effect = ValueError("the provider refused")
+
+    with pytest.raises(ValueError, match="the provider refused"):
+        tasks.generate_credential_metadata_for_resource(resource.id)
+
+
+def test_generate_credential_metadata_for_resource_reports_nothing_stored(
+    credential_configurations, mock_generate_and_save
+):
+    """A generation that produced nothing reports False"""
+    resource = credential_metadata_resource()
+    mock_generate_and_save.return_value = CredentialMetadata(
+        fields={}, errors={"description": "litellm.APIConnectionError"}
+    )
+
+    assert tasks.generate_credential_metadata_for_resource(resource.id) is False
+
+
+def test_generate_credential_metadata_for_a_vanished_resource(
+    credential_configurations, mock_generate_and_save
+):
+    """
+    A resource deleted between the sweep and its task is skipped, not a crash.
+
+    The fan-out is a snapshot of ids, and nothing holds a lock over the hours
+    a full sweep takes.
+    """
+    assert tasks.generate_credential_metadata_for_resource(-1) is False
+    mock_generate_and_save.assert_not_called()
+
+
+def test_generate_credential_metadata_rechecks_an_unpublished_resource(
+    credential_configurations, mock_generate_and_save
+):
+    """
+    A resource unpublished after the fan-out is not generated for.
+
+    Hours can pass between the sweep's queryset and this task being picked
+    up, and a course out of scope by then is pure spend.
+    """
+    resource = credential_metadata_resource()
+    resource.published = False
+    resource.save()
+
+    assert tasks.generate_credential_metadata_for_resource(resource.id) is False
+    mock_generate_and_save.assert_not_called()
+
+
+def test_generate_credential_metadata_skips_a_duplicate_task(
+    credential_configurations, mock_generate_and_save
+):
+    """
+    A redelivered or duplicated task does not pay for the same resource twice.
+
+    The first delivery's row now satisfies the sweep's own predicate, so the
+    second finds nothing to do -- which is why the recheck uses that
+    predicate rather than a bare existence check.
+    """
+    resource = credential_metadata_resource()
+    CredentialMetadataFactory.create(
+        learning_resource=resource, description="A course", criteria=["Did a thing"]
+    )
+
+    assert tasks.generate_credential_metadata_for_resource(resource.id) is False
+    mock_generate_and_save.assert_not_called()
+
+
+def test_generate_credential_metadata_retries_a_partial_row(
+    credential_configurations, mock_generate_and_save
+):
+    """
+    A half-generated resource is generated for again, but only for what it lacks.
+    """
+    resource = credential_metadata_resource()
+    CredentialMetadataFactory.create(
+        learning_resource=resource, description="A course", criteria=[]
+    )
+
+    assert tasks.generate_credential_metadata_for_resource(resource.id) is True
+    assert mock_generate_and_save.call_count == 1
+    assert mock_generate_and_save.generator.call_args.kwargs["fields"] == ["criteria"]
+
+
+def test_generate_credential_metadata_for_an_empty_row(
+    credential_configurations, mock_generate_and_save
+):
+    """A resource with nothing stored is generated for in full"""
+    resource = credential_metadata_resource()
+
+    assert tasks.generate_credential_metadata_for_resource(resource.id) is True
+    assert mock_generate_and_save.generator.call_args.kwargs["fields"] == [
+        "criteria",
+        "description",
+    ]
+
+
+def test_generate_credential_metadata_overwrite_ignores_a_complete_row(
+    credential_configurations, mock_generate_and_save
+):
+    """
+    overwrite=True regenerates a resource that already has complete metadata.
+
+    The recheck still applies -- an unpublished resource is
+    skipped either way -- but a complete row stops being a reason to skip.
+    """
+    resource = credential_metadata_resource()
+    CredentialMetadataFactory.create(
+        learning_resource=resource, description="A course", criteria=["Did a thing"]
+    )
+
+    assert (
+        tasks.generate_credential_metadata_for_resource(resource.id, overwrite=True)
+        is True
+    )
+    assert mock_generate_and_save.call_count == 1
+    assert mock_generate_and_save.generator.call_args.kwargs["fields"] is None
+
+
+def deactivate_credential_configuration(field):
+    """Turn off one field's configuration, as an admin would"""
+    models.CredentialMetadataConfiguration.objects.filter(field=field).update(
+        is_active=False
+    )
+
+
+def test_credential_metadata_scope_follows_the_active_configurations(
+    credential_configurations,
+):
+    """
+    A field with no active configuration is not a reason to regenerate.
+
+    Generation only runs is_active configurations and leaves an unconfigured
+    field out of both its fields and its errors, so that column keeps its
+    default forever. A predicate demanding every column would requeue the
+    resource on every sweep and pay to regenerate the still-active field each
+    time.
+    """
+    resource = credential_metadata_resource()
+    CredentialMetadataFactory.create(
+        learning_resource=resource, description="A course", criteria=[]
+    )
+    assert list(tasks.credential_metadata_resource_ids()) == [resource.id]
+
+    deactivate_credential_configuration(CredentialMetadataField.criteria.name)
+
+    assert list(tasks.credential_metadata_resource_ids()) == []
+
+
+def test_credential_metadata_scope_with_no_active_configurations(
+    credential_configurations,
+):
+    """
+    Nothing needs generating when nothing is configured to generate.
+
+    Otherwise the sweep fans out a task per course that each generate and
+    store nothing.
+    """
+    credential_metadata_resource()
+    models.CredentialMetadataConfiguration.objects.update(is_active=False)
+
+    assert list(tasks.credential_metadata_resource_ids()) == []
+    assert list(tasks.credential_metadata_resource_ids(overwrite=True)) == []
+
+
+def test_generate_all_credential_metadata_with_no_active_configurations(
+    credential_configurations, mocked_celery
+):
+    """The sweep queues nothing when no configuration is active"""
+    credential_metadata_resource()
+    models.CredentialMetadataConfiguration.objects.update(is_active=False)
+
+    assert tasks.generate_all_credential_metadata.delay().get() == 0
+    mocked_celery.group.assert_not_called()
+
+
+def test_generate_credential_metadata_rechecks_the_active_configurations(
+    credential_configurations, mock_generate_and_save
+):
+    """
+    A resource complete for the active fields is skipped, not regenerated.
+
+    The recheck shares the sweep's predicate, so turning a configuration off
+    stops the spend at the task as well as at the fan-out.
+    """
+    resource = credential_metadata_resource()
+    CredentialMetadataFactory.create(
+        learning_resource=resource, description="A course", criteria=[]
+    )
+    deactivate_credential_configuration(CredentialMetadataField.criteria.name)
+
+    assert tasks.generate_credential_metadata_for_resource(resource.id) is False
+    mock_generate_and_save.assert_not_called()
+
+
+def test_credential_metadata_resource_ids_skips_complete_rows(
+    credential_configurations,
+):
+    """A resource with both fields stored is not regenerated"""
+    complete = credential_metadata_resource()
+    CredentialMetadataFactory.create(
+        learning_resource=complete, description="A course", criteria=["Did a thing"]
+    )
+    missing = credential_metadata_resource()
+
+    assert list(tasks.credential_metadata_resource_ids()) == [missing.id]
+
+
+@pytest.mark.parametrize(
+    ("description", "criteria"),
+    [("A course", []), ("", ["Did a thing"]), ("", [])],
+)
+def test_credential_metadata_resource_ids_retries_partial_rows(
+    credential_configurations, description, criteria
+):
+    """
+    A half-generated resource is retried.
+
+    One field failing writes the other, so `credential_metadata__isnull=True`
+    alone would leave that resource permanently half-generated.
+    """
+    resource = credential_metadata_resource()
+    CredentialMetadataFactory.create(
+        learning_resource=resource, description=description, criteria=criteria
+    )
+
+    assert list(tasks.credential_metadata_resource_ids()) == [resource.id]
+
+
+def test_credential_metadata_resource_ids_overwrite(credential_configurations):
+    """Overwrite includes resources that already have complete metadata"""
+    complete = credential_metadata_resource()
+    CredentialMetadataFactory.create(
+        learning_resource=complete, description="A course", criteria=["Did a thing"]
+    )
+
+    assert list(tasks.credential_metadata_resource_ids(overwrite=True)) == [complete.id]
+
+
+def test_credential_metadata_resource_ids_excludes_other_resources(
+    credential_configurations,
+):
+    """
+    Only published MITx Online resources of a swept type are selected.
+
+    All four of published, resource_type, etl_source and platform are pinned
+    because the endpoint's resolver pins them: generating for a row the API
+    will never serve is pure spend.
+    """
+    wanted = credential_metadata_resource()
+    LearningResourceFactory.create(
+        is_course=True, published=True, etl_source=ETLSource.xpro.name
+    )
+    credential_metadata_resource(published=False)
+    # A type the sweep does not cover at all, unlike a program, which it does
+    # once that type has prompts of its own.
+    credential_metadata_resource(is_course=False, is_video=True)
+
+    assert list(tasks.credential_metadata_resource_ids()) == [wanted.id]
+
+
+def test_credential_metadata_resource_ids_includes_programs(
+    program_credential_configurations,
+):
+    """
+    Programs are swept alongside courses, newest first across both.
+
+    Sorted over the combined set rather than per type, so a program added
+    today is not queued behind every course in the catalogue.
+    """
+    course = credential_metadata_resource()
+    program = credential_metadata_program()
+
+    assert list(tasks.credential_metadata_resource_ids()) == sorted(
+        [course.id, program.id], reverse=True
+    )
+
+
+def test_credential_metadata_resource_ids_skips_a_type_with_no_prompts(
+    credential_configurations,
+):
+    """
+    A program is not swept until it has prompts of its own.
+
+    `credential_configurations` configures courses only. Falling back to the
+    course prompts would generate a program description from a prompt asking
+    what the learner did to complete the course.
+    """
+    course = credential_metadata_resource()
+    credential_metadata_program()
+
+    assert list(tasks.credential_metadata_resource_ids()) == [course.id]
+
+
+def test_credential_metadata_resource_ids_per_type_completeness(
+    program_credential_configurations,
+):
+    """
+    Completeness is judged against the resource's own type.
+
+    A program whose stored row is full is done even though a course with the
+    same stored row would be too -- the fields asked of each come from that
+    type's own active configurations.
+    """
+    done = credential_metadata_program()
+    CredentialMetadataFactory.create(
+        learning_resource=done, description="A program", criteria=["Did a thing"]
+    )
+    partial = credential_metadata_program()
+    CredentialMetadataFactory.create(
+        learning_resource=partial, description="A program", criteria=[]
+    )
+
+    assert list(tasks.credential_metadata_resource_ids()) == [partial.id]
+
+
+def test_generate_credential_metadata_for_a_program(
+    program_credential_configurations, mock_generate_and_save
+):
+    """The leaf generates for a program, asking for the fields it lacks"""
+    program = credential_metadata_program()
+
+    assert tasks.generate_credential_metadata_for_resource(program.id) is True
+    assert mock_generate_and_save.generator.call_args.kwargs["fields"] == [
+        "criteria",
+        "description",
+    ]
+
+
+def test_generate_credential_metadata_for_an_unswept_type(
+    program_credential_configurations, mock_generate_and_save
+):
+    """
+    A resource of a type the sweep does not cover is skipped, not generated.
+
+    The leaf is handed an id and reads the type back, so a task queued for
+    the wrong kind of resource -- a stale queue entry, a hand-run task --
+    must not spend anything.
+    """
+    video = credential_metadata_resource(is_course=False, is_video=True)
+
+    assert tasks.generate_credential_metadata_for_resource(video.id) is False
+    mock_generate_and_save.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "resource_type",
+    [LearningResourceType.course.name, LearningResourceType.program.name],
+)
+def test_credential_metadata_resource_ids_for_one_type(
+    program_credential_configurations, resource_type
+):
+    """`resource_types` selects one type without touching the other"""
+    by_type = {
+        LearningResourceType.course.name: credential_metadata_resource(),
+        LearningResourceType.program.name: credential_metadata_program(),
+    }
+
+    assert list(
+        tasks.credential_metadata_resource_ids(resource_types=[resource_type])
+    ) == [by_type[resource_type].id]
+
+
+def test_generate_all_credential_metadata_for_one_type(
+    program_credential_configurations, mocker
+):
+    """The task queues only the named type's resources"""
+    credential_metadata_resource()
+    program = credential_metadata_program()
+    mock_group = mocker.patch("learning_resources.tasks.celery.group")
+
+    queued = tasks.generate_all_credential_metadata.delay(
+        resource_types=[LearningResourceType.program.name]
+    ).get()
+
+    assert queued == 1
+    assert {signature.args[0] for signature in mock_group.call_args.args[0]} == {
+        program.id
+    }
+
+
+def test_generate_all_credential_metadata_covers_both_types(
+    program_credential_configurations, mocker
+):
+    """One task per resource, whatever its type"""
+    course = credential_metadata_resource()
+    program = credential_metadata_program()
+    mock_group = mocker.patch("learning_resources.tasks.celery.group")
+
+    assert tasks.generate_all_credential_metadata.delay().get() == 2
+
+    queued = {signature.args[0] for signature in mock_group.call_args.args[0]}
+    assert queued == {course.id, program.id}
+
+
+def test_generate_all_credential_metadata(credential_configurations, mocked_celery):
+    """The sweep queues one task per resource and returns the count"""
+    resources = [credential_metadata_resource() for _ in range(3)]
+    expected_ids = sorted((resource.id for resource in resources), reverse=True)
+
+    queued = tasks.generate_all_credential_metadata.delay().get()
+
+    assert queued == len(resources)
+    signatures = mocked_celery.group.call_args.args[0]
+    assert [signature.args[0] for signature in signatures] == expected_ids
+    # Passed through so each task re-applies the mode the sweep ran in.
+    assert {signature.kwargs["overwrite"] for signature in signatures} == {False}
+
+
+@pytest.mark.parametrize("overwrite", [True, False])
+def test_generate_all_credential_metadata_passes_overwrite(
+    credential_configurations, mocked_celery, overwrite
+):
+    """Each per-resource task is told which mode the sweep ran in"""
+    resource = credential_metadata_resource()
+    CredentialMetadataFactory.create(
+        learning_resource=resource, description="A course", criteria=["Did a thing"]
+    )
+
+    tasks.generate_all_credential_metadata.delay(overwrite=overwrite).get()
+
+    if not overwrite:
+        # the complete row takes it out of scope entirely
+        mocked_celery.group.assert_not_called()
+        return
+    signatures = mocked_celery.group.call_args.args[0]
+    assert [signature.kwargs["overwrite"] for signature in signatures] == [True]
+
+
+def test_generate_all_credential_metadata_does_not_wait(
+    credential_configurations, mocked_celery
+):
+    """
+    The sweep publishes the group and returns rather than becoming it.
+
+    `self.replace` would make this task's result the whole group's, so any
+    caller -- and CELERY_RESULT_EXPIRES' worth of result keys -- would hang on
+    hours of per-resource LLM calls to learn what each resource's own task
+    already logs.
+    """
+    credential_metadata_resource()
+
+    tasks.generate_all_credential_metadata.delay().get()
+
+    mocked_celery.group.return_value.apply_async.assert_called_once_with()
+    mocked_celery.replace.assert_not_called()
+
+
+def test_generate_all_credential_metadata_with_nothing_to_do(
+    credential_configurations, mocked_celery
+):
+    """
+    An empty sweep queues nothing.
+
+    In the non-overwriting steady state an empty set is the normal case, so
+    this is the day-two path, not an edge case.
+    """
+    assert tasks.generate_all_credential_metadata.delay().get() == 0
+    mocked_celery.group.assert_not_called()
+
+
+def test_credential_metadata_task_paths_resolve():
+    """
+    The dotted path the beat schedule names exists.
+
+    It is a string in settings, so a rename is otherwise only caught at run
+    time, as a scheduled task that silently never runs.
+    """
+    assert (
+        tasks.generate_all_credential_metadata.name
+        == "learning_resources.tasks.generate_all_credential_metadata"
+    )
+    assert (
+        tasks.generate_credential_metadata_for_resource.name
+        == "learning_resources.tasks.generate_credential_metadata_for_resource"
+    )
+
+
+def test_credential_metadata_tasks_are_unrouted():
+    """
+    Both tasks run on the default queue.
+
+    Left out of task_routes rather than routed to "default" by name:
+    task_default_queue already is "default", so an entry there would only be a
+    second place to keep in step.
+    """
+    for name in (
+        tasks.generate_all_credential_metadata.name,
+        tasks.generate_credential_metadata_for_resource.name,
+    ):
+        assert name not in app.conf.task_routes
+    assert app.conf.task_default_queue == "default"
+
+
+def test_credential_metadata_leaf_task_is_acknowledged_late():
+    """
+    The per-resource task survives a lost or recycled worker.
+
+    Early acking would tell the broker the task is done before the LLM call
+    returns, so a worker recycled mid-generation would leave that course
+    ungenerated until the next daily sweep. The eligibility recheck makes the
+    redelivery safe rather than a second frontier-model call.
+    """
+    task = tasks.generate_credential_metadata_for_resource
+
+    assert task.acks_late is True
+    assert task.reject_on_worker_lost is True
+
+
+@pytest.fixture
+def warehouse_owns(request):
+    """Name the warehouse as the owner of an etl source's resource types"""
+    etl_source, resource_types = request.param
+    for resource_type in resource_types:
+        factories.ETLSourceOwnershipFactory.create(
+            etl_source=etl_source,
+            resource_type=resource_type,
+            owner=ETLSourceOwnership.Pipeline.WAREHOUSE,
+        )
+
+
+YOUTUBE_OWNED = pytest.param(
+    (ETLSource.youtube.name, ["video_playlist", "video"]), id="youtube"
+)
+PODCAST_OWNED = pytest.param(
+    (ETLSource.podcast.name, ["podcast", "podcast_episode"]), id="podcast"
+)
+XPRO_OWNED = pytest.param((ETLSource.xpro.name, ["course", "program"]), id="xpro")
+MITXONLINE_OWNED = pytest.param(
+    (ETLSource.mitxonline.name, ["course", "program"]), id="mitxonline"
+)
+OCW_OWNED = pytest.param((ETLSource.ocw.name, ["course"]), id="ocw")
+
+
+@pytest.mark.parametrize("warehouse_owns", [YOUTUBE_OWNED], indirect=True)
+def test_sync_youtube_task_queues_a_task_per_playlist(mocker, settings, warehouse_owns):
+    """SyncYouTubeTask reads each youtube view in full and queues every playlist"""
+    settings.WAREHOUSE_CATALOG = "ol_data_lake_qa"
+    settings.WAREHOUSE_SCHEMA = "ol_warehouse_qa_integrations"
+    rows = {
+        "integrations__learn__youtube_channels": [{"channel_id": "c"}],
+        "integrations__learn__youtube_playlists": [{"readable_id": "p"}],
+        "integrations__learn__youtube_playlist_videos": [{"position": 0}],
+        "integrations__learn__youtube_videos": [{"readable_id": "v"}],
+    }
+    prefix = "ol_data_lake_qa.ol_warehouse_qa_integrations."
+    mock_iter_rows = mocker.patch(
+        "learning_resources.tasks.iter_rows",
+        side_effect=lambda _conn, view: iter(rows[view.removeprefix(prefix)]),
+    )
+    to_load = [("c", {"playlist_id": "p1"}), ("c", {"playlist_id": "p2"})]
+    prepared = {"c": [playlist for _, playlist in to_load]}
+    mock_prepare = mocker.patch(
+        "learning_resources.tasks.warehouse_media.prepare_youtube_sync",
+        return_value=prepared,
+    )
+    mock_sync = mocker.patch(
+        "learning_resources.tasks.warehouse_media.sync_youtube_channels",
+        return_value=to_load,
+    )
+    mock_delay = mocker.patch(
+        "learning_resources.tasks.load_warehouse_youtube_playlist.delay"
+    )
+
+    with tasks.writing_as(tasks.Pipeline.WAREHOUSE):
+        count = tasks.SyncYouTubeTask.fetch_and_upsert(
+            conn=mocker.Mock(), since="ignored"
+        )
+
+    assert count == 2
+    assert [call.args[1] for call in mock_iter_rows.call_args_list] == [
+        prefix + table for table in rows
+    ]
+    mock_prepare.assert_called_once_with(*rows.values(), allow_mass_unpublish=False)
+    mock_sync.assert_called_once_with(
+        rows["integrations__learn__youtube_channels"], prepared
+    )
+    generation = caches["durable"].get(tasks.YOUTUBE_SYNC_GENERATION_KEY)
+    assert generation
+    assert [call.args for call in mock_delay.call_args_list] == [
+        (*playlist, generation) for playlist in to_load
+    ]
+
+
+@pytest.mark.parametrize("warehouse_owns", [YOUTUBE_OWNED], indirect=True)
+def test_sync_youtube_task_keeps_the_generation_of_a_refused_run(
+    mocker, warehouse_owns
+):
+    """
+    A run its checks refuse writes nothing and leaves the generation alone, so
+    the playlist loads an earlier run queued still load
+    """
+    mocker.patch("learning_resources.tasks.iter_rows", return_value=iter([]))
+    mocker.patch(
+        "learning_resources.tasks.warehouse_media.prepare_youtube_sync",
+        side_effect=ExtractException("refused"),
+    )
+    mock_sync = mocker.patch(
+        "learning_resources.tasks.warehouse_media.sync_youtube_channels"
+    )
+    caches["durable"].set(tasks.YOUTUBE_SYNC_GENERATION_KEY, "earlier", timeout=None)
+
+    with (
+        tasks.writing_as(tasks.Pipeline.WAREHOUSE),
+        pytest.raises(ExtractException, match="refused"),
+    ):
+        tasks.SyncYouTubeTask.fetch_and_upsert(conn=mocker.Mock())
+
+    assert caches["durable"].get(tasks.YOUTUBE_SYNC_GENERATION_KEY) == "earlier"
+    mock_sync.assert_not_called()
+
+
+def youtube_view_rows():
+    """Rows of the four youtube views, for one playlist with one video"""
+    return {
+        "integrations__learn__youtube_channels": [{"channel_id": "c", "title": "C"}],
+        "integrations__learn__youtube_playlists": [
+            {
+                "readable_id": "p",
+                "channel_id": "c",
+                "title": "P",
+                "url": "https://www.youtube.com/playlist?list=p",
+                "image_url": None,
+                "image_alt": None,
+                "offered_by": None,
+                "create_videos": 1,
+                "etl_source": ETLSource.youtube.name,
+                "platform": PlatformType.youtube.name,
+                "availability": "anytime",
+            }
+        ],
+        "integrations__learn__youtube_playlist_videos": [
+            {"playlist_readable_id": "p", "video_readable_id": "v", "position": 0}
+        ],
+        "integrations__learn__youtube_videos": [
+            {
+                "readable_id": "v",
+                "youtube_id": "v",
+                "title": "V",
+                "description_raw": "",
+                "url": "https://www.youtube.com/watch?v=v",
+                "image_url": None,
+                "last_modified": "2026-10-01T00:00:00Z",
+                "duration": "PT1M",
+                "etl_source": ETLSource.youtube.name,
+                "platform": PlatformType.youtube.name,
+                "resource_type": "video",
+                "availability": "anytime",
+            }
+        ],
+    }
+
+
+def test_sync_youtube_task_as_a_shadow_queues_and_writes_nothing(mocker):
+    """
+    As the shadow of youtube, SyncYouTubeTask compares the playlists and their
+    videos, saves a report of each pair, and queues and writes nothing
+    """
+    for resource_type in tasks.warehouse_media.YOUTUBE_TYPES:
+        factories.ETLSourceOwnershipFactory.create(
+            etl_source=ETLSource.youtube.name,
+            resource_type=resource_type,
+            shadow=ETLSourceOwnership.Pipeline.WAREHOUSE,
+        )
+    factories.LearningResourcePlatformFactory.create(code=PlatformType.youtube.name)
+    rows = youtube_view_rows()
+    mocker.patch("learning_resources.lib.warehouse.connect_to_warehouse")
+    mocker.patch(
+        "learning_resources.tasks.iter_rows",
+        side_effect=lambda _conn, view: iter(rows[view.rsplit(".", 1)[1]]),
+    )
+    mock_delay = mocker.patch(
+        "learning_resources.tasks.load_warehouse_youtube_playlist.delay"
+    )
+    caches["durable"].set(tasks.YOUTUBE_SYNC_GENERATION_KEY, "earlier", timeout=None)
+
+    count = tasks.SyncYouTubeTask.run()
+
+    # one playlist and one video compared
+    assert count == 2
+    mock_delay.assert_not_called()
+    assert caches["durable"].get(tasks.YOUTUBE_SYNC_GENERATION_KEY) == "earlier"
+    reports = ETLShadowRun.objects.filter(etl_source=ETLSource.youtube.name)
+    assert {
+        (report.resource_type, report.error, report.counts["created"])
+        for report in reports
+    } == {("video_playlist", "", 1), ("video", "", 1)}
+    assert not LearningResource.objects.exists()
+    assert not VideoChannel.objects.exists()
+
+
+def test_sync_youtube_task_writes_nothing_once_it_is_only_the_shadow(mocker):
+    """
+    A run that started as the owner of youtube and became only its shadow
+    while it read the views writes and queues nothing, since it is not a
+    shadow run
+    """
+    for resource_type in tasks.warehouse_media.YOUTUBE_TYPES:
+        factories.ETLSourceOwnershipFactory.create(
+            etl_source=ETLSource.youtube.name,
+            resource_type=resource_type,
+            owner=ETLSourceOwnership.Pipeline.WAREHOUSE,
+        )
+    factories.LearningResourcePlatformFactory.create(code=PlatformType.youtube.name)
+    rows = youtube_view_rows()
+
+    def read_after_cutback(_conn, view):
+        ETLSourceOwnership.objects.filter(etl_source=ETLSource.youtube.name).update(
+            owner=ETLSourceOwnership.Pipeline.LEGACY,
+            shadow=ETLSourceOwnership.Pipeline.WAREHOUSE,
+        )
+        return iter(rows[view.rsplit(".", 1)[1]])
+
+    mocker.patch("learning_resources.lib.warehouse.connect_to_warehouse")
+    mocker.patch("learning_resources.tasks.iter_rows", side_effect=read_after_cutback)
+    mock_delay = mocker.patch(
+        "learning_resources.tasks.load_warehouse_youtube_playlist.delay"
+    )
+
+    assert tasks.SyncYouTubeTask.run() == 0
+
+    mock_delay.assert_not_called()
+    assert not VideoChannel.objects.exists()
+    assert not ETLShadowRun.objects.exists()
+
+
+@pytest.mark.parametrize("warehouse_owns", [PODCAST_OWNED], indirect=True)
+def test_sync_podcasts_task_reads_both_views(mocker, warehouse_owns):
+    """SyncPodcastsTask reads both podcast views in full for sync_podcasts"""
+    rows = {
+        "integrations__learn__podcasts": [{"readable_id": "p"}],
+        "integrations__learn__podcast_episodes": [{"readable_id": "e"}],
+    }
+    mock_iter_rows = mocker.patch(
+        "learning_resources.tasks.iter_rows",
+        side_effect=lambda _conn, view: iter(rows[view.rsplit(".", 1)[1]]),
+    )
+    mock_sync = mocker.patch(
+        "learning_resources.tasks.warehouse_media.sync_podcasts", return_value=1
+    )
+
+    with tasks.writing_as(tasks.Pipeline.WAREHOUSE):
+        count = tasks.SyncPodcastsTask.fetch_and_upsert(
+            conn=mocker.Mock(), since="ignored"
+        )
+
+    assert count == 1
+    assert mock_iter_rows.call_count == 2
+    mock_sync.assert_called_once_with(*rows.values(), allow_mass_unpublish=False)
+
+
+@pytest.mark.parametrize("task", ["SyncYouTubeTask", "SyncPodcastsTask"])
+def test_media_sync_tasks_read_nothing_they_do_not_own(mocker, task):
+    """Until the ownership row is flipped a run neither connects to the warehouse nor writes"""
+    mock_connect = mocker.patch("learning_resources.lib.warehouse.connect_to_warehouse")
+    mock_iter_rows = mocker.patch("learning_resources.tasks.iter_rows")
+
+    assert getattr(tasks, task).run() == 0
+
+    mock_connect.assert_not_called()
+    mock_iter_rows.assert_not_called()
+    assert not LearningResource.objects.exists()
+
+
+@pytest.mark.parametrize("warehouse_owns", [YOUTUBE_OWNED], indirect=True)
+def test_load_warehouse_youtube_playlist(mocker, warehouse_owns):
+    """The playlist task loads as the warehouse pipeline, under the playlist's channel"""
+    channel = factories.VideoChannelFactory.create()
+    pipelines_seen = []
+    mock_load = mocker.patch(
+        "learning_resources.tasks.loaders.load_playlist",
+        side_effect=lambda *_: pipelines_seen.append(
+            tasks.may_write("youtube", "video")
+        ),
+    )
+
+    caches["durable"].set(tasks.YOUTUBE_SYNC_GENERATION_KEY, "gen-2")
+
+    tasks.load_warehouse_youtube_playlist(
+        channel.channel_id, {"playlist_id": "p"}, "gen-2"
+    )
+    tasks.load_warehouse_youtube_playlist(
+        "no-such-channel", {"playlist_id": "p"}, "gen-2"
+    )
+
+    mock_load.assert_called_once_with(channel, {"playlist_id": "p"})
+    assert pipelines_seen == [True]
+
+
+@pytest.mark.parametrize("warehouse_owns", [YOUTUBE_OWNED], indirect=True)
+@pytest.mark.parametrize("current", ["gen-2", None])
+def test_load_warehouse_youtube_playlist_skips_a_superseded_sync(
+    mocker, warehouse_owns, current
+):
+    """A playlist queued by an earlier sync than the current one is not loaded"""
+    channel = factories.VideoChannelFactory.create()
+    mock_load = mocker.patch("learning_resources.tasks.loaders.load_playlist")
+    caches["durable"].clear()
+    if current:
+        caches["durable"].set(tasks.YOUTUBE_SYNC_GENERATION_KEY, current)
+
+    tasks.load_warehouse_youtube_playlist(
+        channel.channel_id, {"playlist_id": "p"}, "gen-1"
+    )
+
+    mock_load.assert_not_called()
+
+
+def test_load_warehouse_youtube_playlist_stops_when_ownership_moved(mocker):
+    """A playlist queued before youtube was handed back is not loaded"""
+    channel = factories.VideoChannelFactory.create()
+    mock_load = mocker.patch("learning_resources.tasks.loaders.load_playlist")
+
+    tasks.load_warehouse_youtube_playlist(
+        channel.channel_id, {"playlist_id": "p"}, "gen-1"
+    )
+
+    mock_load.assert_not_called()
+
+
+def test_get_ocw_data_skips_when_legacy_does_not_own_courses(settings, mocker):
+    """get_ocw_data lists no bucket and queues no course once OCW is owned elsewhere"""
+    settings.OCW_LIVE_BUCKET = "bucket"
+    ETLSourceOwnershipFactory.create(
+        etl_source=ETLSource.ocw.name,
+        resource_type=LearningResourceType.course.name,
+        owner=ETLSourceOwnership.Pipeline.WAREHOUSE,
+    )
+    mock_boto = mocker.patch("learning_resources.tasks.boto3")
+    mock_get_ocw_courses = mocker.patch("learning_resources.tasks.get_ocw_courses")
+
+    assert get_ocw_data.delay().get() is None
+
+    mock_boto.resource.assert_not_called()
+    mock_get_ocw_courses.si.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("warehouse_owns", "task", "sync"),
+    [
+        pytest.param(
+            YOUTUBE_OWNED.values[0],
+            "SyncYouTubeTask",
+            "prepare_youtube_sync",
+            id="youtube",
+        ),
+        pytest.param(
+            PODCAST_OWNED.values[0], "SyncPodcastsTask", "sync_podcasts", id="podcast"
+        ),
+    ],
+    indirect=["warehouse_owns"],
+)
+@pytest.mark.parametrize(
+    ("kwargs", "allow"),
+    [
+        ({"allow_mass_unpublish": True}, True),
+        ({}, False),
+        ({"allow_mass_unpublish": "false"}, False),
+        ({"allow_mass_unpublish": 1}, False),
+    ],
+)
+@pytest.mark.parametrize("call", ["run", "apply"])
+def test_media_sync_tasks_pass_on_allow_mass_unpublish(  # noqa: PLR0913
+    mocker, warehouse_owns, task, sync, call, kwargs, allow
+):
+    """
+    Only the boolean allow_mass_unpublish=True lifts the limit, whether the task
+    is queued or run() is called directly
+    """
+    mocker.patch("learning_resources.lib.warehouse.connect_to_warehouse")
+    mocker.patch("learning_resources.tasks.iter_rows", return_value=[])
+    # None is a youtube run with nothing to write, which stops before the writes
+    mock_sync = mocker.patch(
+        f"learning_resources.tasks.warehouse_media.{sync}",
+        return_value=0 if sync == "sync_podcasts" else None,
+    )
+
+    if call == "run":
+        getattr(tasks, task).run(**kwargs)
+    else:
+        getattr(tasks, task).apply(kwargs=kwargs).get()
+
+    assert mock_sync.call_args.kwargs == {"allow_mass_unpublish": allow}
+
+
+@pytest.mark.parametrize(
+    ("warehouse_owns", "task", "sync", "views"),
+    [
+        pytest.param(
+            XPRO_OWNED.values[0],
+            "SyncXproCoursesTask",
+            "warehouse_xpro.sync_courses",
+            ["integrations__learn__xpro_courses", "integrations__learn__xpro_runs"],
+            id="xpro-courses",
+        ),
+        pytest.param(
+            XPRO_OWNED.values[0],
+            "SyncXproProgramsTask",
+            "warehouse_xpro.sync_programs",
+            ["integrations__learn__xpro_programs"],
+            id="xpro-programs",
+        ),
+        pytest.param(
+            MITXONLINE_OWNED.values[0],
+            "SyncMITxOnlineCoursesTask",
+            "warehouse_mitxonline.sync_courses",
+            [
+                "integrations__learn__mitxonline_courses",
+                "integrations__learn__mitxonline_runs",
+            ],
+            id="mitxonline-courses",
+        ),
+        pytest.param(
+            MITXONLINE_OWNED.values[0],
+            "SyncMITxOnlineProgramsTask",
+            "warehouse_mitxonline.sync_programs",
+            [
+                "integrations__learn__mitxonline_programs",
+                "integrations__learn__mitxonline_program_children",
+                "integrations__learn__mitxonline_courses",
+            ],
+            id="mitxonline-programs",
+        ),
+    ],
+    indirect=["warehouse_owns"],
+)
+@pytest.mark.parametrize("allow", [True, False])
+@pytest.mark.parametrize("call", ["run", "apply"])
+def test_catalog_sync_tasks_read_their_views(  # noqa: PLR0913
+    mocker, warehouse_owns, task, sync, views, allow, call
+):
+    """
+    Each xPRO and MITx Online sync task reads its views in full and passes on
+    the unpublish override, whether queued or run directly
+    """
+    mocker.patch("learning_resources.lib.warehouse.connect_to_warehouse")
+    rows = {view: [{"readable_id": view}] for view in views}
+    mock_iter_rows = mocker.patch(
+        "learning_resources.tasks.iter_rows",
+        side_effect=lambda _conn, view: iter(rows[view.rsplit(".", 1)[1]]),
+    )
+    mock_sync = mocker.patch(f"learning_resources.tasks.{sync}", return_value=1)
+
+    kwargs = {"allow_mass_unpublish": True} if allow else {}
+    count = (
+        getattr(tasks, task).run(**kwargs)
+        if call == "run"
+        else getattr(tasks, task).apply(kwargs=kwargs).get()
+    )
+
+    assert count == 1
+
+    assert mock_iter_rows.call_count == len(views)
+    mock_sync.assert_called_once_with(
+        *(rows[view] for view in views), allow_mass_unpublish=allow
+    )
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "SyncXproCoursesTask",
+        "SyncXproProgramsTask",
+        "SyncMITxOnlineCoursesTask",
+        "SyncMITxOnlineProgramsTask",
+    ],
+)
+def test_catalog_sync_tasks_read_nothing_they_do_not_own(mocker, task):
+    """Until the ownership row is flipped a run neither connects to the warehouse nor writes"""
+    mock_connect = mocker.patch("learning_resources.lib.warehouse.connect_to_warehouse")
+    mock_iter_rows = mocker.patch("learning_resources.tasks.iter_rows")
+
+    assert getattr(tasks, task).run() == 0
+
+    mock_connect.assert_not_called()
+    mock_iter_rows.assert_not_called()
+    assert not LearningResource.objects.exists()
+
+
+HOUR = timedelta(hours=1)
+WATERMARK_KEY = tasks.RELEASED_CONTENT_FILES_WATERMARK_KEY
+
+
+@pytest.fixture
+def mock_loaded_actions(mocker):
+    """Mock the hook dispatched by the reindex sweep"""
+    return mocker.patch("learning_resources.tasks.content_files_loaded_actions")
+
+
+@pytest.fixture
+def sweep_cache():
+    """Return the DB-backed cache holding the sweep watermark, cleared first"""
+    cache = caches["release_sweep"]
+    cache.delete(WATERMARK_KEY)
+    return cache
+
+
+def test_reindex_released_content_files_without_watermark_uses_lookback(
+    settings, mock_loaded_actions, sweep_cache
+):
+    """With no watermark, one reindex per run released inside the fallback window"""
+    settings.RELEASED_CONTENT_FILES_LOOKBACK = HOUR
+    now = now_in_utc()
+
+    before_window = LearningResourceRunFactory.create()
+    in_window = LearningResourceRunFactory.create()
+    future = LearningResourceRunFactory.create()
+    undated = LearningResourceRunFactory.create()
+    unpublished = LearningResourceRunFactory.create()
+
+    ContentFileFactory.create(run=before_window, release_date=now - HOUR - HOUR)
+    # two files on the same run still reindex it once
+    ContentFileFactory.create(run=in_window, release_date=now - (HOUR / 2))
+    ContentFileFactory.create(run=in_window, release_date=now - (HOUR / 4))
+    ContentFileFactory.create(run=future, release_date=now + HOUR)
+    ContentFileFactory.create(run=undated, release_date=None)
+    # an unpublished file has nothing to index
+    ContentFileFactory.create(
+        run=unpublished, published=False, release_date=now - (HOUR / 2)
+    )
+
+    assert tasks.reindex_released_content_files() == 1
+    mock_loaded_actions.assert_called_once_with(in_window)
+
+
+def test_reindex_released_content_files_catches_up_from_watermark(
+    settings, mock_loaded_actions, sweep_cache
+):
+    """A stale watermark widens the window past the fallback lookback"""
+    settings.RELEASED_CONTENT_FILES_LOOKBACK = HOUR
+    settings.RELEASED_CONTENT_FILES_SWEEP_OVERLAP = HOUR
+    now = now_in_utc()
+    sweep_cache.set(WATERMARK_KEY, now - timedelta(days=3), timeout=None)
+
+    during_outage = LearningResourceRunFactory.create()
+    in_overlap = LearningResourceRunFactory.create()
+    before_overlap = LearningResourceRunFactory.create()
+    ContentFileFactory.create(run=during_outage, release_date=now - timedelta(days=2))
+    ContentFileFactory.create(
+        run=in_overlap, release_date=now - timedelta(days=3) - (HOUR / 2)
+    )
+    ContentFileFactory.create(
+        run=before_overlap, release_date=now - timedelta(days=3) - HOUR - HOUR
+    )
+
+    assert tasks.reindex_released_content_files() == 2
+    assert {call.args[0] for call in mock_loaded_actions.call_args_list} == {
+        during_outage,
+        in_overlap,
+    }
+
+
+def test_reindex_released_content_files_retries_a_release_once(
+    settings, mocker, mock_loaded_actions, sweep_cache
+):
+    """A release is swept on the next sweep too (overlap), then no more"""
+    settings.RELEASED_CONTENT_FILES_LOOKBACK = timedelta(days=1)
+    settings.RELEASED_CONTENT_FILES_SWEEP_OVERLAP = HOUR
+    start = now_in_utc()
+    clock = mocker.patch("learning_resources.tasks.now_in_utc", return_value=start)
+    ContentFileFactory.create(published=True, release_date=start - (HOUR / 2))
+
+    assert tasks.reindex_released_content_files() == 1
+    clock.return_value = start + HOUR
+    assert tasks.reindex_released_content_files() == 1
+    clock.return_value = start + HOUR + HOUR
+    assert tasks.reindex_released_content_files() == 0
+
+    assert mock_loaded_actions.call_count == 2
+
+
+def test_reindex_released_content_files_advances_watermark_to_sweep_start(
+    mocker, mock_loaded_actions, sweep_cache
+):
+    """The stored watermark is the time sampled before the query, not after"""
+    sweep_start = now_in_utc()
+    mocker.patch("learning_resources.tasks.now_in_utc", return_value=sweep_start)
+
+    tasks.reindex_released_content_files()
+
+    assert sweep_cache.get(WATERMARK_KEY) == sweep_start
+
+
+def test_reindex_released_content_files_watermark_survives_durable_culling(
+    mock_loaded_actions, sweep_cache
+):
+    """Culling the shared "durable" cache, which ignores timeouts, can't drop it"""
+    tasks.reindex_released_content_files()
+    durable = caches["durable"]
+    # keys that sort after the watermark's, so a shared table would cull it
+    for i in range(durable._max_entries + 100):  # noqa: SLF001
+        durable.set(f"zz_{i:04d}", "x", timeout=None)
+
+    assert sweep_cache.get(WATERMARK_KEY) is not None
+
+
+def test_reindex_released_content_files_keeps_watermark_on_failure(
+    mock_loaded_actions, sweep_cache
+):
+    """A sweep that fails mid-dispatch leaves its window for the retry"""
+    previous = now_in_utc() - HOUR
+    sweep_cache.set(WATERMARK_KEY, previous, timeout=None)
+    run = LearningResourceRunFactory.create()
+    ContentFileFactory.create(run=run, release_date=now_in_utc() - (HOUR / 2))
+    mock_loaded_actions.side_effect = ConnectionError
+
+    with pytest.raises(ConnectionError):
+        tasks.reindex_released_content_files()
+
+    assert sweep_cache.get(WATERMARK_KEY) == previous
+
+
+ALL_OWNERS = pytest.mark.parametrize("owner", list(ETLSourceOwnership.Pipeline))
+
+
+def _owned_by(owner, etl_source, resource_type):
+    """Record which pipeline owns a pair"""
+    ETLSourceOwnershipFactory.create(
+        etl_source=etl_source, resource_type=resource_type, owner=owner
+    )
+
+
+@ALL_OWNERS
+@pytest.mark.parametrize(
+    ("task", "etl_source"),
+    [
+        ("import_all_oll_files", ETLSource.oll.name),
+        ("import_all_mitxonline_files", ETLSource.mitxonline.name),
+        ("import_all_xpro_files", ETLSource.xpro.name),
+        ("import_content_files", ETLSource.xpro.name),
+    ],
+)
+def test_import_files_tasks_run_only_while_legacy_owns_content_files(
+    mocker, mocked_celery, owner, task, etl_source
+):
+    """The content-file fan-out lists no archives for a source cut over elsewhere"""
+    _owned_by(owner, etl_source, CONTENT_FILE)
+    mock_get_content_tasks = mocker.patch(
+        "learning_resources.tasks.get_content_tasks", autospec=True
+    )
+    args = [etl_source] if task == "import_content_files" else []
+
+    if owner == ETLSourceOwnership.Pipeline.LEGACY:
+        with pytest.raises(mocked_celery.replace_exception_class):
+            getattr(tasks, task).delay(*args)
+        mock_get_content_tasks.assert_called_once()
+    else:
+        assert getattr(tasks, task).delay(*args).get() is None
+        mock_get_content_tasks.assert_not_called()
+        mocked_celery.replace.assert_not_called()
+
+
+@ALL_OWNERS
+def test_get_content_files_runs_only_while_legacy_owns_content_files(
+    mocker, settings, owner
+):
+    """A chunk queued before the cutover reads no archive after it"""
+    settings.AWS_ACCESS_KEY_ID = "key"
+    settings.AWS_SECRET_ACCESS_KEY = "secret"  # noqa: S105
+    settings.COURSE_ARCHIVE_BUCKET_NAME = "bucket"
+    _owned_by(owner, ETLSource.mitxonline.name, CONTENT_FILE)
+    mock_sync = mocker.patch("learning_resources.tasks.sync_edx_course_files")
+
+    tasks.get_content_files([1], ETLSource.mitxonline.name, ["foo.tar.gz"])
+
+    assert mock_sync.called is (owner == ETLSourceOwnership.Pipeline.LEGACY)
+
+
+@ALL_OWNERS
+def test_unpublish_excluded_files_run_only_while_legacy_owns_content_files(
+    mocker, mocked_celery, owner
+):
+    """Neither the fan-out nor a queued chunk touches a source cut over elsewhere"""
+    etl_source = ETLSource.mitxonline.name
+    _owned_by(owner, etl_source, CONTENT_FILE)
+    mock_archives = mocker.patch(
+        "learning_resources.tasks.get_most_recent_course_archives", return_value=[]
+    )
+    mock_unpublish = mocker.patch(
+        "learning_resources.tasks.unpublish_excluded_content_files", return_value=[]
+    )
+
+    if owner == ETLSourceOwnership.Pipeline.LEGACY:
+        with pytest.raises(mocked_celery.replace_exception_class):
+            tasks.unpublish_all_excluded_files.delay(etl_source=etl_source)
+        tasks.unpublish_excluded_files([1], etl_source, ["k"])
+        mock_archives.assert_called_once()
+        mock_unpublish.assert_called_once()
+    else:
+        assert (
+            tasks.unpublish_all_excluded_files.delay(etl_source=etl_source).get()
+            is None
+        )
+        assert tasks.unpublish_excluded_files([1], etl_source, ["k"]) == []
+        mock_archives.assert_not_called()
+        mock_unpublish.assert_not_called()
+
+
+@ALL_OWNERS
+@pytest.mark.parametrize(
+    ("task", "module", "etl_source", "job", "fetch"),
+    [
+        (
+            "get_youtube_transcripts",
+            "youtube",
+            ETLSource.youtube.name,
+            "get_youtube_videos_for_transcripts_job",
+            "get_youtube_transcripts",
+        ),
+        (
+            "get_ovs_transcripts",
+            "ovs",
+            ETLSource.ovs.name,
+            "get_ovs_videos_for_transcripts_job",
+            "get_ovs_transcripts",
+        ),
+        (
+            "get_podcast_transcripts",
+            "podcast",
+            ETLSource.podcast.name,
+            "get_podcast_episodes_for_transcripts_job",
+            "get_podcast_transcripts",
+        ),
+    ],
+)
+def test_transcript_tasks_run_only_while_legacy_owns_transcripts(  # noqa: PLR0913
+    mocker, owner, task, module, etl_source, job, fetch
+):
+    """A transcript job fetches nothing for a source whose transcripts moved"""
+    _owned_by(owner, etl_source, TRANSCRIPT)
+    mock_module = mocker.patch(f"learning_resources.tasks.{module}")
+
+    getattr(tasks, task).delay()
+
+    legacy = owner == ETLSourceOwnership.Pipeline.LEGACY
+    assert getattr(mock_module, job).called is legacy
+    assert getattr(mock_module, fetch).called is legacy
+
+
+@pytest.mark.parametrize(
+    "resource_type", [LearningResourceType.course.name, CONTENT_FILE]
+)
+@ALL_OWNERS
+def test_ingest_canvas_course_runs_only_while_legacy_owns_canvas(
+    mocker, owner, resource_type
+):
+    """A canvas archive loads nothing once its course or content files moved"""
+    _owned_by(owner, ETLSource.canvas.name, resource_type)
+    mock_bucket = mocker.patch("learning_resources.tasks.get_bucket_by_name")
+    mock_sync = mocker.patch("learning_resources.tasks.sync_canvas_archive")
+
+    tasks.ingest_canvas_course.delay("canvas/course/archive.imscc", False)  # noqa: FBT003
+
+    legacy = owner == ETLSourceOwnership.Pipeline.LEGACY
+    assert mock_bucket.called is legacy
+    assert mock_sync.called is legacy
+
+
+@ALL_OWNERS
+def test_ingest_edx_run_archive_runs_only_while_legacy_owns_content_files(
+    mocker, owner
+):
+    """The content_files webhook's edX task reads no archive for a source cut over"""
+    _owned_by(owner, ETLSource.xpro.name, CONTENT_FILE)
+    mock_sync = mocker.patch("learning_resources.tasks.sync_edx_archive")
+
+    tasks.ingest_edx_run_archive.delay(ETLSource.xpro.name, "xpro/a.tar.gz")
+
+    assert mock_sync.called is (owner == ETLSourceOwnership.Pipeline.LEGACY)
+
+
+def test_sync_canvas_courses_skips_when_legacy_does_not_own_content_files(mocker):
+    """Every archive it would queue needs canvas content files too"""
+    _owned_by(
+        ETLSourceOwnership.Pipeline.WAREHOUSE, ETLSource.canvas.name, CONTENT_FILE
+    )
+    mock_get_bucket = mocker.patch("learning_resources.tasks.get_bucket_by_name")
+    mock_ingest_course = mocker.patch("learning_resources.tasks.ingest_canvas_course")
+
+    assert sync_canvas_courses(canvas_course_ids=None, overwrite=False) is None
+
+    mock_get_bucket.assert_not_called()
+    mock_ingest_course.delay.assert_not_called()
+
+
+@pytest.mark.parametrize("warehouse_owns", [OCW_OWNED], indirect=True)
+@pytest.mark.parametrize("allow", [True, False])
+@pytest.mark.parametrize("call", ["run", "apply"])
+def test_ocw_sync_task_reads_its_view(mocker, settings, warehouse_owns, allow, call):
+    """
+    SyncOCWCoursesTask reads the OCW course view in full and passes on the
+    unpublish override, whether queued or run directly
+    """
+    settings.WAREHOUSE_CATALOG = "ol_data_lake_production"
+    settings.WAREHOUSE_SCHEMA = "ol_warehouse_production_integrations"
+    mocker.patch("learning_resources.lib.warehouse.connect_to_warehouse")
+    rows = [{"url": "https://ocw.mit.edu/courses/a/"}]
+    mock_iter_rows = mocker.patch(
+        "learning_resources.tasks.iter_rows", return_value=iter(rows)
+    )
+    mock_sync = mocker.patch(
+        "learning_resources.tasks.warehouse_ocw.sync_courses", return_value=1
+    )
+
+    kwargs = {"allow_mass_unpublish": True} if allow else {}
+    count = (
+        tasks.SyncOCWCoursesTask.run(**kwargs)
+        if call == "run"
+        else tasks.SyncOCWCoursesTask.apply(kwargs=kwargs).get()
+    )
+
+    assert count == 1
+    mock_iter_rows.assert_called_once_with(
+        mocker.ANY,
+        "ol_data_lake_production.ol_warehouse_production_integrations."
+        "integrations__learn__ocw_courses",
+    )
+    mock_sync.assert_called_once_with(rows, allow_mass_unpublish=allow)
+
+
+def test_ocw_sync_task_reads_nothing_it_does_not_own(mocker):
+    """Until the ownership row is flipped a run neither connects to the warehouse nor writes"""
+    mock_connect = mocker.patch("learning_resources.lib.warehouse.connect_to_warehouse")
+    mock_iter_rows = mocker.patch("learning_resources.tasks.iter_rows")
+
+    assert tasks.SyncOCWCoursesTask.run() == 0
+
+    mock_connect.assert_not_called()
+    mock_iter_rows.assert_not_called()
+    assert not LearningResource.objects.exists()
+
+
+def test_unpublish_mit_edx_resources(mocker):
+    """mit_edx resources are unpublished and the lists that held one reindexed"""
+    plugins = mocker.patch("learning_resources.utils.get_plugin_manager")
+    upsert = mocker.patch("learning_resources.tasks.resource_upserted_actions")
+    views_cache = mocker.patch("learning_resources.tasks.clear_views_cache")
+    edx_courses = [
+        LearningResourceFactory.create(is_course=True, etl_source="mit_edx"),
+        LearningResourceFactory.create(
+            is_course=True, etl_source="mit_edx", published=False, test_mode=True
+        ),
+    ]
+    other = LearningResourceFactory.create(is_course=True, etl_source="xpro")
+    path, _draft_path = (
+        LearningPathFactory.create(
+            resources=[edx_courses[0], other], learning_resource__published=published
+        ).learning_resource
+        for published in (True, False)
+    )
+
+    tasks.unpublish_mit_edx_resources()
+
+    for course in edx_courses:
+        course.refresh_from_db()
+        assert (course.published, course.test_mode) == (False, False)
+    other.refresh_from_db()
+    assert other.published is True
+    assert plugins.return_value.hook.resource_unpublished.call_count == 2
+    # the draft path stays out of search
+    upsert.assert_called_once_with(path, percolate=False, generate_embeddings=True)
+    views_cache.assert_called_once_with()

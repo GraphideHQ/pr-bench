@@ -1,0 +1,381 @@
+"use client"
+
+import React from "react"
+import { learningResourceQueries } from "api/hooks/learningResources"
+import { channelQueries } from "api/hooks/channels"
+import {
+  TabPanel,
+  TabContext,
+  styled,
+  Typography,
+  TypographyProps,
+  SkipLink,
+} from "ol-components"
+import { CarouselV2 } from "ol-components/CarouselV2"
+import { TabButton, TabButtonList } from "@mitodl/smoot-design"
+import type { TabConfig } from "./types"
+import { LearningResource, PaginatedLearningResourceList } from "api"
+import { ResourceCard } from "../ResourceCard/ResourceCard"
+import {
+  useQueries,
+  UseQueryResult,
+  UseQueryOptions,
+} from "@tanstack/react-query"
+import { analytics } from "@/common/analytics"
+
+/**
+ * Only surface the "Skip {title}" affordance once the active tab holds enough
+ * cards that tabbing past them is a real burden. At or below this count the
+ * skip mechanism (its own trigger + return link) would add more tab stops than
+ * it saves, so we leave the short list in the natural tab order.
+ */
+const SKIP_LINK_CARD_THRESHOLD = 3
+
+const StyledCarouselV2 = styled(CarouselV2)(({ theme }) => ({
+  margin: "24px 0",
+  ".MitCarousel-track": {
+    paddingBottom: "4px",
+  },
+  [theme.breakpoints.down("sm")]: {
+    marginTop: 0,
+  },
+}))
+
+/* Leaving for reference while we determine whether to swap out for CarouselV2
+const StyledCarousel = styled(Carousel)({
+  /**
+   * Our cards have a hover shadow that gets clipped by the carousel container.
+   * To compensate for this, we add a 4px padding to the left of each slide, and
+   * remove 4px from the gap.
+   *
+  width: "calc(100% + 4px)",
+  transform: "translateX(-4px)",
+  ".slick-track": {
+    display: "flex",
+    gap: "20px",
+    marginBottom: "4px",
+  },
+  ".slick-slide": {
+    paddingLeft: "4px",
+  },
+})
+*/
+
+const HeaderRow = styled.div(({ theme }) => ({
+  display: "flex",
+  flexWrap: "wrap",
+  alignItems: "center",
+  justifyContent: "space-between",
+  marginBottom: "24px",
+  [theme.breakpoints.down("sm")]: {
+    alignItems: "flex-start",
+    flexDirection: "column",
+    marginBottom: "0px",
+  },
+}))
+
+const HeaderText = styled(Typography)<Pick<TypographyProps, "component">>(
+  ({ theme }) => ({
+    paddingRight: "16px",
+    [theme.breakpoints.down("sm")]: {
+      paddingBottom: "16px",
+      ...theme.typography.h5,
+    },
+  }),
+)
+
+const ControlsContainer = styled.div(({ theme }) => ({
+  display: "flex",
+  flex: 1,
+  minWidth: "0px",
+  maxWidth: "100%",
+  justifyContent: "space-between",
+  [theme.breakpoints.down("sm")]: {
+    paddingBottom: "16px",
+  },
+}))
+
+const StyledTabPanel = styled(TabPanel)({
+  paddingTop: "0px",
+  paddingLeft: "0px",
+  paddingRight: "0px",
+})
+
+const ButtonsContainer = styled.div(({ theme }) => ({
+  display: "flex",
+  gap: "8px",
+  [theme.breakpoints.down("sm")]: {
+    display: "none",
+  },
+}))
+
+const TabsList = styled(TabButtonList)({
+  ".MuiTabScrollButton-root.Mui-disabled": {
+    display: "none",
+  },
+})
+
+type ContentProps = {
+  resources: LearningResource[]
+  childrenLoading?: boolean
+  tabConfig: TabConfig
+}
+
+type PanelChildrenProps = {
+  config: TabConfig[]
+  queries: UseQueryResult<
+    PaginatedLearningResourceList | LearningResource[],
+    unknown
+  >[]
+  children: (props: ContentProps) => React.ReactNode
+}
+const PanelChildren: React.FC<PanelChildrenProps> = ({
+  config,
+  queries,
+  children,
+}) => {
+  const getResults = (
+    data: PaginatedLearningResourceList | LearningResource[] | undefined,
+  ): LearningResource[] => {
+    if (!data) {
+      return []
+    }
+    if ("results" in data) {
+      return data.results
+    }
+    return data
+  }
+
+  if (config.length === 1) {
+    const { data, isLoading } = queries[0]
+    const resources = getResults(data)
+
+    return children({
+      resources,
+      childrenLoading: isLoading,
+      tabConfig: config[0],
+    })
+  }
+  return (
+    <>
+      {config.map((tabConfig, index) => {
+        const { data, isLoading } = queries[index]
+        const resources = getResults(data)
+
+        return (
+          <StyledTabPanel key={index} value={index.toString()}>
+            {children({
+              resources,
+              childrenLoading: isLoading,
+              tabConfig,
+            })}
+          </StyledTabPanel>
+        )
+      })}
+    </>
+  )
+}
+
+type ResourceCarouselProps = {
+  config: TabConfig[]
+  title: string
+  className?: string
+  isLoading?: boolean
+  "data-testid"?: string
+  /**
+   * Element type for the carousel title
+   */
+  titleComponent?: "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+  titleVariant?: TypographyProps["variant"]
+  excludeResourceId?: number
+}
+
+type CarouselQuery = UseQueryOptions<
+  LearningResource[] | PaginatedLearningResourceList
+>
+
+const getTabQuery = (tab: TabConfig): CarouselQuery => {
+  switch (tab.data.type) {
+    case "resources":
+      return learningResourceQueries.list(tab.data.params) as CarouselQuery
+    case "resource_items":
+      return learningResourceQueries.items(
+        tab.data.params.learning_resource_id,
+        tab.data.params,
+      ) as CarouselQuery
+    case "lr_search":
+      return learningResourceQueries.search(tab.data.params) as CarouselQuery
+    case "lr_featured":
+      return learningResourceQueries.featured(tab.data.params) as CarouselQuery
+    case "channel_featured":
+      return channelQueries.featured(tab.data.params) as CarouselQuery
+    case "lr_similar":
+      return learningResourceQueries.similar(
+        tab.data.params.id,
+      ) as CarouselQuery
+    case "lr_vector_similar":
+      return learningResourceQueries.vectorSimilar({
+        id: tab.data.params.id,
+      }) as CarouselQuery
+  }
+}
+
+/**
+ * A tabbed carousel that fetches resources based on the configuration provided.
+ *  - each TabConfig generates a tab + tabpanel that pulls data from an API based
+ *    on the config
+ *  - data is lazily when the tabpanel first becomes visible
+ *
+ * For now, this is a carousel of learning resource cards, to be moved out if/when it is needed for other items.
+ *
+ * If there is only one tab, the carousel will not have tabs, and will just show
+ * the content.
+ *
+ * Keyboard users can bypass the whole carousel via a "Skip {title}" link
+ * (SkipLink) that appears as the first focusable element in the section — this
+ * is the WCAG G123 escape hatch for the block of repeated card links, so cards
+ * stay in the natural tab order without forcing a long traversal.
+ */
+const ResourceCarousel: React.FC<ResourceCarouselProps> = ({
+  config,
+  title,
+  className,
+  isLoading,
+  titleComponent = "h4",
+  titleVariant = "h4",
+  excludeResourceId,
+}) => {
+  const [tab, setTab] = React.useState("0")
+  const [ref, setRef] = React.useState<HTMLDivElement | null>(null)
+  const queries = useQueries({
+    queries: config.map((tab) => {
+      return { ...getTabQuery(tab), enabled: !isLoading }
+    }),
+  })
+
+  const getVisibleCount = (
+    data: PaginatedLearningResourceList | LearningResource[] | undefined,
+  ) => {
+    if (!data) {
+      return 0
+    }
+    const resources = "results" in data ? data.results : data
+    if (excludeResourceId !== undefined) {
+      return resources.filter((resource) => resource.id !== excludeResourceId)
+        .length
+    }
+    return resources.length
+  }
+
+  const allChildrenLoaded = queries.every(({ isLoading }) => !isLoading)
+  const allChildrenEmpty = queries.every(({ data }) => !getVisibleCount(data))
+  if (!isLoading && allChildrenLoaded && allChildrenEmpty) {
+    return null
+  }
+  const buttonsContainerElement = (
+    <ButtonsContainer role="group" aria-label="Slide navigation" ref={setRef} />
+  )
+
+  // Base the decision on the tab actually on screen: that's the set of card
+  // links a keyboard user would tab through right now, and it's what the skip
+  // link would bypass.
+  const showSkipLink =
+    getVisibleCount(queries[Number(tab)]?.data) > SKIP_LINK_CARD_THRESHOLD
+
+  return (
+    <div className={className} data-testid="resource-carousel">
+      <SkipLink.Container label={title}>
+        {showSkipLink ? <SkipLink.Trigger /> : null}
+        <TabContext value={tab}>
+          <HeaderRow>
+            <HeaderText component={titleComponent} variant={titleVariant}>
+              {title}
+            </HeaderText>
+            {config.length === 1 ? buttonsContainerElement : null}
+            {config.length > 1 ? (
+              <ControlsContainer>
+                <TabsList
+                  aria-label="Carousel Filters"
+                  onChange={(e, newValue) => setTab(newValue)}
+                >
+                  {config
+                    .map((tabConfig, index) => ({
+                      tabConfig,
+                      index,
+                      shouldShow:
+                        isLoading ||
+                        queries[index].isLoading ||
+                        getVisibleCount(queries[index].data) > 0,
+                    }))
+                    .filter(({ shouldShow }) => shouldShow)
+                    .map(({ tabConfig, index }) => (
+                      <TabButton
+                        key={index}
+                        label={tabConfig.label}
+                        value={index.toString()}
+                      />
+                    ))}
+                </TabsList>
+                {buttonsContainerElement}
+              </ControlsContainer>
+            ) : null}
+          </HeaderRow>
+          <PanelChildren
+            config={config}
+            queries={
+              queries as UseQueryResult<
+                PaginatedLearningResourceList | LearningResource[]
+              >[]
+            }
+          >
+            {({ resources, childrenLoading, tabConfig }) => {
+              return (
+                <StyledCarouselV2
+                  arrowsContainer={ref}
+                  mobileBleed="symmetric"
+                  mobileGutter={16}
+                >
+                  {isLoading || childrenLoading
+                    ? Array.from({ length: 6 }).map((_, index) => (
+                        <ResourceCard
+                          isLoading
+                          key={index}
+                          resource={null}
+                          parentHeadingEl={titleComponent}
+                          size={tabConfig.size}
+                        />
+                      ))
+                    : resources
+                        .filter((resource) => resource.id !== excludeResourceId)
+                        .map((resource, index) => (
+                          <ResourceCard
+                            key={resource.id}
+                            resource={resource}
+                            parentHeadingEl={titleComponent}
+                            size={tabConfig.size}
+                            onCardClick={() =>
+                              analytics.courseCardClicked({
+                                label: title,
+                                resourceId: resource.id,
+                                readableId: resource.readable_id,
+                                resourceType: resource.resource_type,
+                                platformCode: resource.platform?.code,
+                                position: index,
+                              })
+                            }
+                          />
+                        ))}
+                </StyledCarouselV2>
+              )
+            }}
+          </PanelChildren>
+        </TabContext>
+        {showSkipLink ? <SkipLink.Target /> : null}
+      </SkipLink.Container>
+    </div>
+  )
+}
+
+export default ResourceCarousel
+export type { ResourceCarouselProps }
+export type { TabConfig }

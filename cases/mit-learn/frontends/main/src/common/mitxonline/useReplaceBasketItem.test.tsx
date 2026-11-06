@@ -1,0 +1,214 @@
+import { act, renderHook, setupLocationMock } from "@/test-utils"
+import React from "react"
+import { QueryClientProvider } from "@tanstack/react-query"
+import { makeBrowserQueryClient } from "@/app/getQueryClient"
+import { makeRequest, setMockResponse } from "api/test-utils"
+import * as mitxonline from "api/mitxonline-test-utils"
+import { mitxonlineLegacyUrl } from "@/common/mitxonline"
+import { useReplaceBasketItem } from "./useReplaceBasketItem"
+
+// The compliance gate fetches the MITx Online user through react-query.
+const wrapper = ({ children }: { children: React.ReactNode }) => {
+  const queryClient = makeBrowserQueryClient({ maxRetries: 0 })
+  return (
+    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+  )
+}
+
+const reset = jest.fn()
+const mutate = jest.fn(
+  (_productId: number, opts?: { onSuccess?: () => void }) =>
+    opts?.onSuccess?.(),
+)
+const mutateAsync = jest.fn().mockResolvedValue({ id: 7 })
+const clearMutate = jest.fn(
+  (_vars: undefined, opts?: { onSuccess?: () => void }) => opts?.onSuccess?.(),
+)
+const clearMutateAsync = jest.fn().mockResolvedValue(undefined)
+// Mutable so a test can put one or both legs into an errored state.
+const basketErrors: { add: unknown; clear: unknown } = {
+  add: null,
+  clear: null,
+}
+
+jest.mock("api/mitxonline-hooks/baskets", () => ({
+  useAddToBasket: () => ({
+    mutate,
+    mutateAsync,
+    reset,
+    isPending: false,
+    get error() {
+      return basketErrors.add
+    },
+  }),
+  useClearBasket: () => ({
+    mutate: clearMutate,
+    mutateAsync: clearMutateAsync,
+    isPending: false,
+    get error() {
+      return basketErrors.clear
+    },
+  }),
+}))
+
+describe("useReplaceBasketItem", () => {
+  setupLocationMock()
+
+  beforeEach(() => {
+    jest.clearAllMocks()
+    basketErrors.add = null
+    basketErrors.clear = null
+    // The compliance gate reads the MITx Online user before touching the
+    // basket. A complete profile (the factory default) lets it through.
+    setMockResponse.get(
+      mitxonline.urls.userMe.get(),
+      mitxonline.factories.user.user(),
+    )
+  })
+
+  test("redirects after the sync mutate path succeeds", async () => {
+    const assign = jest.mocked(window.location.assign)
+    const { result } = renderHook(() => useReplaceBasketItem(), { wrapper })
+
+    await act(async () => {
+      result.current.mutate(42)
+    })
+
+    expect(reset).toHaveBeenCalled()
+    expect(clearMutate).toHaveBeenCalledWith(
+      undefined,
+      expect.objectContaining({ onSuccess: expect.any(Function) }),
+    )
+    expect(mutate).toHaveBeenCalledWith(
+      42,
+      expect.objectContaining({ onSuccess: expect.any(Function) }),
+    )
+    expect(assign).toHaveBeenCalledWith(mitxonlineLegacyUrl("/cart/"))
+  })
+
+  test("redirects after the async mutateAsync path succeeds", async () => {
+    const assign = jest.mocked(window.location.assign)
+    const { result } = renderHook(() => useReplaceBasketItem(), { wrapper })
+
+    await act(async () => {
+      await result.current.mutateAsync(42)
+    })
+
+    expect(reset).toHaveBeenCalled()
+    expect(clearMutateAsync).toHaveBeenCalled()
+    expect(mutateAsync).toHaveBeenCalledWith(42)
+    expect(assign).toHaveBeenCalledWith(mitxonlineLegacyUrl("/cart/"))
+  })
+
+  test("does not add or redirect when the sync clear never succeeds", async () => {
+    const assign = jest.mocked(window.location.assign)
+    // Simulate clear failing: its onSuccess is never invoked. This also pins the
+    // ordering — add must be nested inside clear's onSuccess, not fired directly.
+    clearMutate.mockImplementationOnce(() => {})
+    const { result } = renderHook(() => useReplaceBasketItem(), { wrapper })
+
+    await act(async () => {
+      result.current.mutate(42)
+    })
+
+    expect(clearMutate).toHaveBeenCalled()
+    expect(mutate).not.toHaveBeenCalled()
+    expect(assign).not.toHaveBeenCalled()
+  })
+
+  test("does not add or redirect when the async clear rejects", async () => {
+    const assign = jest.mocked(window.location.assign)
+    clearMutateAsync.mockRejectedValueOnce(new Error("clear failed"))
+    const { result } = renderHook(() => useReplaceBasketItem(), { wrapper })
+
+    await act(async () => {
+      await expect(result.current.mutateAsync(42)).rejects.toThrow(
+        "clear failed",
+      )
+    })
+
+    expect(mutateAsync).not.toHaveBeenCalled()
+    expect(assign).not.toHaveBeenCalled()
+  })
+
+  test("surfaces the clear error when only that leg failed", () => {
+    const clearError = new Error("clear failed")
+    basketErrors.clear = clearError
+    const { result } = renderHook(() => useReplaceBasketItem(), { wrapper })
+
+    expect(result.current.error).toBe(clearError)
+  })
+
+  test("prefers the add-to-basket error, which carries the specific detail", () => {
+    const addError = new Error("add failed")
+    basketErrors.add = addError
+    basketErrors.clear = new Error("clear failed")
+    const { result } = renderHook(() => useReplaceBasketItem(), { wrapper })
+
+    expect(result.current.error).toBe(addError)
+  })
+
+  test("has no error when neither leg failed", () => {
+    const { result } = renderHook(() => useReplaceBasketItem(), { wrapper })
+
+    expect(result.current.error).toBeNull()
+  })
+})
+
+describe("useReplaceBasketItem with the product's target", () => {
+  setupLocationMock()
+  const target = { type: "course_run" as const, id: 5 }
+  const eligibilityUrl = mitxonline.urls.enrollmentEligibility.courseRun(5)
+
+  beforeEach(() => {
+    jest.clearAllMocks()
+    basketErrors.add = null
+    basketErrors.clear = null
+    setMockResponse.get(
+      mitxonline.urls.userMe.get(),
+      mitxonline.factories.user.user(),
+    )
+  })
+
+  test("runs the compliance check before replacing the basket", async () => {
+    setMockResponse.post(
+      eligibilityUrl,
+      { enrollable: true, reason_code: null, missing_fields: [] },
+      { code: 200 },
+    )
+    const { result } = renderHook(() => useReplaceBasketItem(), { wrapper })
+
+    await act(async () => {
+      await result.current.mutateAsync(42, target)
+    })
+
+    expect(
+      jest
+        .mocked(makeRequest)
+        .mock.calls.some(
+          ([request]) =>
+            request.method === "post" && request.url === eligibilityUrl,
+        ),
+    ).toBe(true)
+    expect(mutateAsync).toHaveBeenCalledWith(42)
+    expect(jest.mocked(window.location.assign)).toHaveBeenCalledWith(
+      mitxonlineLegacyUrl("/cart/"),
+    )
+  })
+
+  test("continues to the cart when the check can't answer, e.g. throttled", async () => {
+    setMockResponse.post(
+      eligibilityUrl,
+      { detail: "Request was throttled." },
+      { code: 429 },
+    )
+    const { result } = renderHook(() => useReplaceBasketItem(), { wrapper })
+
+    await act(async () => {
+      await result.current.mutateAsync(42, target)
+    })
+
+    expect(mutateAsync).toHaveBeenCalledWith(42)
+    expect(jest.mocked(window.location.assign)).toHaveBeenCalled()
+  })
+})

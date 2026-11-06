@@ -1,0 +1,554 @@
+"""Shared functions for EdX sites"""
+
+import logging
+import tarfile
+from itertools import chain
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from defusedxml import DefusedXmlException, ElementTree
+from django.conf import settings
+from django.core.cache import caches
+from django.db.models import Prefetch, Q
+
+from learning_resources.etl.constants import ETLSource
+from learning_resources.etl.loaders import load_content_files, load_course_units
+from learning_resources.etl.olx import OlxArchive
+from learning_resources.etl.utils import (
+    calc_checksum,
+    course_units_from_archive,
+    get_bucket_by_name,
+    get_s3_prefix_for_source,
+    reconcile_release_dates,
+    transform_content_files,
+    unpacked_course_archive,
+)
+from learning_resources.models import ContentFile, LearningResourceRun
+from learning_resources.utils import content_files_loaded_actions
+from main.utils import now_in_utc
+
+log = logging.getLogger(__name__)
+
+ETL_CACHE_TIMEOUT = 300
+ARCHIVE_KEYS_CACHE_TIMEOUT = 300
+
+
+def normalize_run_id(etl_source: str, run_id: str) -> str:
+    """
+    Normalize a run_id for in-memory matching.
+
+    Args:
+        etl_source(str): The ETL source, which determines the normalization rules
+        run_id(str): The run_id to normalize
+
+    Returns:
+        str: The normalized run_id
+    """
+    if etl_source == ETLSource.oll.name:
+        normalized = (
+            run_id.replace("-", ".").replace("_", ".").replace("+", ".").lower()
+        )
+        return normalized.removeprefix("course.v1:")
+    return run_id
+
+
+def extract_run_id_from_key(etl_source: str, key: str) -> str:
+    """
+    Extract and normalize a run_id from an S3 archive key path.
+
+    Args:
+        etl_source(str): The ETL source, which determines the extraction rules
+        key(str): The S3 key path of the course archive
+
+    Returns:
+        str: The extracted and normalized run_id
+    """
+    if etl_source == ETLSource.oll.name:
+        filename_only = key.rsplit("/", maxsplit=1)[-1]
+        raw = filename_only.split(".tar.gz")[0]
+        raw = raw.replace("_OLL", "")
+    else:
+        raw = Path(key).parent.name.split("/")[-1]
+    return normalize_run_id(etl_source, raw)
+
+
+def build_run_lookup(
+    etl_source: str, ids: list[int]
+) -> dict[str, list[LearningResourceRun]]:
+    """
+    Batch-fetch all candidate LearningResourceRun objects and build a
+    normalized run_id lookup dictionary.
+
+    Args:
+        etl_source(str): The ETL source
+        ids(list of int): List of LearningResource IDs to filter by.
+            If empty/falsy, all runs of every published/test_mode course
+            for the source are included.
+
+    Returns:
+        dict: Mapping of normalized run_id -> list of LearningResourceRun
+    """
+    runs = (
+        LearningResourceRun.objects.filter(
+            learning_resource__etl_source=etl_source,
+        )
+        .filter(
+            Q(learning_resource__published=True) | Q(learning_resource__test_mode=True)
+        )
+        .select_related("learning_resource")
+        .prefetch_related(
+            Prefetch(
+                "learning_resource__runs",
+                queryset=LearningResourceRun.objects.filter(published=True),
+                to_attr="_published_runs",
+            )
+        )
+        # ties among published runs go to the lowest id, as in run_for_edx_archive
+        .order_by("id")
+    )
+    if ids:
+        runs = runs.filter(learning_resource_id__in=ids)
+
+    lookup: dict[str, list[LearningResourceRun]] = {}
+    for run in runs:
+        normalized = normalize_run_id(etl_source, run.run_id)
+        lookup.setdefault(normalized, []).append(run)
+        if etl_source == ETLSource.oll.name and run.run_id.count("+") > 1:
+            # OLL archive filenames omit the org segment (MITx+, OCW+, ...)
+            org_less = normalize_run_id(etl_source, run.run_id.split("+", 1)[1])
+            lookup.setdefault(org_less, []).append(run)
+    return lookup
+
+
+def process_course_archive(
+    bucket,
+    key: str,
+    run: LearningResourceRun,
+    *,
+    overwrite: bool = False,
+    overwrite_units: bool = False,
+) -> bool:
+    """
+    Download and process a course archive from S3, skipping the download
+    entirely when run.archive_key already matches the content-addressed key.
+
+    Args:
+        bucket: S3 bucket object
+        key(str): S3 object key for the course archive
+        run(LearningResourceRun): The run to process
+        overwrite(bool): Whether to overwrite existing content files
+        overwrite_units(bool): Whether to rebuild the run's units from an
+            unchanged archive, without reloading its content files
+
+    Returns:
+        bool: False if skipped via matching archive_key, True otherwise
+    """
+    # A saved checksum means this archive once produced published rows. If
+    # none are left (a bulk deindex unpublished them, cleanup may have deleted
+    # them since), the run is stale and must not skip the load. An empty
+    # archive records archive_key with no checksum, so it still skips.
+    stale_run = (
+        bool(run.checksum) and not run.content_files.filter(published=True).exists()
+    )
+    reload = overwrite or stale_run
+
+    if run.archive_key == key and not reload and not overwrite_units:
+        log.debug("Archive key unchanged for %s, skipping download", key)
+        return False
+    with TemporaryDirectory() as export_tempdir:
+        course_tarpath = Path(export_tempdir, key.rsplit("/", maxsplit=1)[-1])
+        log.info("course tarpath for run %s is %s", run.run_id, course_tarpath)
+        bucket.download_file(key, course_tarpath)
+        try:
+            checksum = calc_checksum(course_tarpath)
+        except tarfile.ReadError:
+            log.exception("Error reading tar file %s, skipping", course_tarpath)
+            return True
+        if run.checksum == checksum and not reload:
+            # unchanged content under a new key: record it to skip future downloads
+            if run.archive_key != key:
+                run.archive_key = key
+                run.save(update_fields=["archive_key"])
+            log.info("Checksums match for %s, skipping load", key)
+            if overwrite_units:
+                rebuild_course_units(course_tarpath, run)
+            return True
+        load_course_archive(course_tarpath, key, run, checksum, overwrite=overwrite)
+    return True
+
+
+def load_course_archive(
+    course_tarpath: Path,
+    key: str,
+    run: LearningResourceRun,
+    checksum: str,
+    *,
+    overwrite: bool,
+):
+    """
+    Load a downloaded course archive's content files and units, recording the
+    archive receipt on the run once they're loaded.
+
+    Args:
+        course_tarpath(Path): The path to the downloaded course archive
+        key(str): S3 object key for the course archive
+        run(LearningResourceRun): The run to load
+        checksum(str): The archive's checksum
+        overwrite(bool): Whether to overwrite existing content files
+    """
+    try:
+        with unpacked_course_archive(course_tarpath, run) as archive:
+            failed_keys = []
+            content_files_data = iter(
+                transform_content_files(
+                    archive, run, overwrite=overwrite, failed_keys=failed_keys
+                )
+            )
+            first = next(content_files_data, None)
+            if first is None:
+                # a row may have just gone unreleased; deindex it
+                content_files_loaded_actions(run)
+                if failed_keys:
+                    # every file raised: retry next sync, don't mark as empty
+                    return
+                # empty archive: stop re-downloading it. Drop any checksum
+                # from an earlier ingest so a stale run doesn't keep
+                # forcing the download.
+                run.archive_key = key
+                run.checksum = None
+                run.save(update_fields=["archive_key", "checksum"])
+                return
+            content_files_ids = load_content_files(
+                run, chain([first], content_files_data), failed_keys=failed_keys
+            )
+            if content_files_ids:
+                load_archive_units(archive, run, key)
+                run.checksum = checksum
+                run.archive_key = key
+                run.save(update_fields=["checksum", "archive_key"])
+    except:  # noqa: E722
+        log.exception("Error ingesting OLX content data for %s", key)
+
+
+def load_archive_units(archive: OlxArchive, run: LearningResourceRun, key: str):
+    """
+    Load a run's units from its unpacked archive, after its content files. A
+    failure is logged rather than raised: the same archive fails the same way
+    every time, so the receipt is still recorded and the archive isn't reloaded
+    on every sync. A new export, overwrite or overwrite_units tries again. The
+    run then keeps its units, minus links to files no longer published.
+
+    Args:
+        archive(OlxArchive): The run's unpacked course archive
+        run(LearningResourceRun): The run whose units to load
+        key(str): S3 object key for the course archive
+    """
+    units = []
+    try:
+        units = archive.units(run)
+    except Exception:
+        log.exception("Units not built for run %s from %s", run.run_id, key)
+    try:
+        load_course_units(run, units)
+    except Exception:
+        log.exception("Units not loaded for run %s from %s", run.run_id, key)
+
+
+def rebuild_course_units(course_tarpath: Path, run: LearningResourceRun):
+    """
+    Rebuild a run's units from its course archive, leaving its content files
+    as they are. The run's units are kept if the archive's can't be built.
+
+    Args:
+        course_tarpath(Path): The path to the downloaded course archive
+        run(LearningResourceRun): The run whose units to rebuild
+    """
+    try:
+        load_course_units(run, course_units_from_archive(course_tarpath, run))
+    except Exception:
+        log.exception(
+            "Units not built for run %s from %s", run.run_id, course_tarpath.name
+        )
+
+
+def get_most_recent_course_archives(etl_source: str) -> list[str]:
+    """
+    Retrieve a list of S3 keys for the most recent edx course archives.
+
+    Results are cached for ARCHIVE_KEYS_CACHE_TIMEOUT seconds so that
+    multiple tasks for the same etl_source don't each perform a full
+    S3 bucket listing.
+
+    Args:
+        etl_source(str): The edx ETL source
+
+    Returns:
+        list of str: edx archive S3 keys
+    """
+    redis_cache = caches["redis"]
+    cache_key = f"archive_keys_{etl_source}"
+    cached = redis_cache.get(cache_key)
+    if cached is not None:
+        log.info("Using cached archive keys for %s", etl_source)
+        return cached
+
+    bucket = get_bucket_by_name(settings.COURSE_ARCHIVE_BUCKET_NAME)
+    if not bucket:
+        log.warning("No S3 bucket for platform %s", etl_source)
+        return []
+    s3_prefix = get_s3_prefix_for_source(etl_source)
+    try:
+        log.info("Getting recent archives from %s with prefix %s", bucket, s3_prefix)
+
+        latest_archives = {}
+
+        for archive in bucket.objects.filter(Prefix=s3_prefix):
+            key = archive.key
+            if etl_source == ETLSource.oll.name:
+                course_id = key.split("/")[-1].split(".tar.gz")[0]
+            else:
+                course_id = Path(key).parent.name.split("/")[-1]
+            if (course_id not in latest_archives) or max(
+                archive.last_modified, latest_archives[course_id]["last_modified"]
+            ) == archive.last_modified:
+                latest_archives[course_id] = {
+                    "key": archive.key,
+                    "last_modified": archive.last_modified,
+                }
+        result = [entry["key"] for entry in latest_archives.values()]
+        redis_cache.set(cache_key, result, timeout=ARCHIVE_KEYS_CACHE_TIMEOUT)
+        return result  # noqa: TRY300
+    except (StopIteration, IndexError):
+        log.warning(
+            "No %s exported courses found in S3 bucket %s", etl_source, bucket.name
+        )
+        return []
+
+
+def trigger_resource_etl(etl_source):
+    """
+    Trigger an ETL process for all resources of a given source
+    """
+    from learning_resources import tasks
+
+    redis_cache = caches["redis"]
+    cache_key = f"etl_triggered_{etl_source}"
+    if not redis_cache.add(cache_key, True, timeout=ETL_CACHE_TIMEOUT):  # noqa: FBT003
+        log.info("ETL already triggered recently for %s, skipping", etl_source)
+        return
+    try:
+        if etl_source == ETLSource.mitxonline.name:
+            tasks.get_mitxonline_data.apply_async()
+        elif etl_source == ETLSource.xpro.name:
+            tasks.get_xpro_data.apply_async()
+        else:
+            log.warning(
+                "No ETL pipeline for %s, cannot sync archive",
+                etl_source,
+            )
+            redis_cache.delete(cache_key)
+    except Exception:
+        redis_cache.delete(cache_key)
+        log.exception("Failed to trigger ETL for %s", etl_source)
+
+
+def sync_edx_archive(
+    etl_source, s3_key: str, *, run_id: str | None = None, overwrite: bool = False
+):
+    """
+    Sync an edx course archive
+
+    Args:
+        etl_source(str): The edx ETL source
+        s3_key(str): S3 path of the content archive
+        run_id(str or None): Optional run_id to process.
+        overwrite(bool): Whether to overwrite existing content files
+    """
+    run = (
+        LearningResourceRun.objects.filter(
+            learning_resource__etl_source=etl_source,
+            run_id=run_id,
+        ).first()
+        if run_id
+        else run_for_edx_archive(etl_source, s3_key)
+    )
+    if not run:
+        trigger_resource_etl(etl_source)
+        return
+    course = run.learning_resource
+    if not course.published and not course.test_mode:
+        # Fully-retired course; skip it
+        log.warning(
+            "%s belongs to a retired course %s, skipping",
+            run.run_id,
+            course.readable_id,
+        )
+        return
+    bucket = get_bucket_by_name(settings.COURSE_ARCHIVE_BUCKET_NAME)
+    process_course_archive(bucket, s3_key, run, overwrite=overwrite)
+
+
+def run_for_edx_archive(etl_source: str, archive_filename: str):
+    """
+    Generate and return a LearningResourceRun for an edx course archive
+
+    Args:
+        etl_source(str): The edx ETL source
+        archive_filename(str): The S3 key path of the course archive
+
+    Returns:
+        LearningResourceRun or None: The matching run, or None if not found
+    """
+    normalized_run_id = extract_run_id_from_key(etl_source, archive_filename)
+    runs = LearningResourceRun.objects.filter(
+        learning_resource__etl_source=etl_source,
+    ).filter(
+        Q(learning_resource__published=True) | Q(learning_resource__test_mode=True)
+    )
+    if etl_source == ETLSource.oll.name:
+        runs = runs.filter(run_id__iregex=normalized_run_id)
+    else:
+        runs = runs.filter(run_id=normalized_run_id)
+    # There should be only 1 matching run per course archive, warn if not
+    if runs.count() > 1:
+        log.warning("There are %d runs for %s", runs.count(), normalized_run_id)
+    return runs.order_by("-published", "id").first()
+
+
+def sync_edx_course_files(
+    etl_source: str,
+    ids: list[int],
+    keys: list[str],
+    *,
+    overwrite: bool = False,
+    overwrite_units: bool = False,
+):
+    """
+    Sync all edx course run files for a list of course ids to database
+
+    Args:
+        etl_source(str): The edx ETL source
+        ids(list of int): list of course ids to process
+        keys(list[str]): list of S3 archive keys to search through
+        overwrite(bool): Whether to overwrite existing content files
+        overwrite_units(bool): Whether to rebuild units from unchanged archives
+    """
+    bucket = get_bucket_by_name(settings.COURSE_ARCHIVE_BUCKET_NAME)
+    run_lookup = build_run_lookup(etl_source, ids)
+
+    skipped = processed = 0
+    for key in keys:
+        normalized_key_id = extract_run_id_from_key(etl_source, key)
+        matching_runs = run_lookup.get(normalized_key_id)
+
+        if not matching_runs:
+            log.debug("No runs found for %s, skipping", key)
+            continue
+
+        if len(matching_runs) > 1:
+            log.warning("There are %d runs for %s", len(matching_runs), key)
+
+        # legacy unpublished runs can share an archive id with the current run
+        run = max(matching_runs, key=lambda r: r.published)
+        if process_course_archive(
+            bucket, key, run, overwrite=overwrite, overwrite_units=overwrite_units
+        ):
+            processed += 1
+        else:
+            skipped += 1
+    log.info(
+        "%s content file sync: %d unchanged archives skipped, %d processed",
+        etl_source,
+        skipped,
+        processed,
+    )
+
+
+def unpublish_excluded_content_files(
+    etl_source: str, ids: list[int], keys: list[str], *, dry_run: bool = False
+) -> list[dict]:
+    """
+    Unpublish (and deindex) content files the course does not use and set the
+    release date of the rest, for the runs matching the given archive keys,
+    without re-extracting anything. Unreleased files stay published but hidden.
+
+    Args:
+        etl_source(str): The edx ETL source
+        ids(list of int): list of course ids to process
+        keys(list[str]): list of S3 archive keys to search through
+        dry_run(bool): count the rows but change nothing and deindex nothing
+
+    Returns:
+        list of dict: a count row per run with excluded or unreleased files
+            (counts, not paths, to fit the celery result backend)
+    """
+    from learning_resources_search import tasks as search_tasks
+    from vector_search import tasks as vector_tasks
+
+    bucket = get_bucket_by_name(settings.COURSE_ARCHIVE_BUCKET_NAME)
+    run_lookup = build_run_lookup(etl_source, ids)
+    now = now_in_utc()
+    rows = []
+    for key in keys:
+        matching_runs = run_lookup.get(extract_run_id_from_key(etl_source, key))
+        if not matching_runs:
+            continue
+        run = max(matching_runs, key=lambda r: r.published)
+        run_files = ContentFile.objects.filter(run=run)
+        if not run_files.exists():
+            # a run with no content files has none to unpublish, and its archive
+            # is a download and an extract to find that out
+            continue
+        with TemporaryDirectory() as tempdir:
+            tarpath = Path(tempdir, key.rsplit("/", maxsplit=1)[-1])
+            bucket.download_file(key, tarpath)
+            try:
+                with tarfile.open(tarpath) as tar:
+                    tar.extractall(tempdir, filter="data")
+            except tarfile.ReadError:
+                log.exception("Error extracting %s, skipping", key)
+                continue
+            olx_path = next((p for p in Path(tempdir).iterdir() if p.is_dir()), None)
+            if olx_path is None:
+                continue
+            archive = OlxArchive(olx_path, etl_source)
+            try:
+                excluded_keys = archive.excluded_keys(run)
+                key_dates = archive.key_dates(run)
+            # one unreadable archive must not stop the rest of the backfill
+            except (ElementTree.ParseError, DefusedXmlException, OSError):
+                log.exception("Malformed OLX in %s, skipping", key)
+                continue
+        # scoped to this run: keys embed the run_id, but never rely on that alone
+        excluded_files = run_files.filter(key__in=excluded_keys)
+        unreleased_keys = [
+            content_key
+            for content_key, date in key_dates.items()
+            if date and date > now
+        ]
+        excluded = excluded_files.count()
+        unreleased = run_files.filter(key__in=unreleased_keys).count()
+        if not (excluded or unreleased):
+            continue
+        unpublished = excluded_files.filter(published=True).count()
+        if not dry_run:
+            excluded_files.filter(published=True).update(published=False)
+            reconcile_release_dates(run, key_dates)
+            log.info(
+                "Unpublished %d excluded content files for %s", unpublished, run.run_id
+            )
+            # dispatched whenever excluded or unreleased rows exist, not only
+            # when this call flipped them, so a re-run after a failed deindex
+            # task cleans up the indexes
+            search_tasks.deindex_run_content_files.delay(run.id, unpublished_only=True)
+            vector_tasks.remove_unpublished_run_content_files.delay(run.id)
+        rows.append(
+            {
+                "run_id": run.run_id,
+                "excluded": excluded,
+                "unreleased": unreleased,
+                "unpublished": unpublished,
+                "total": run_files.count(),
+            }
+        )
+    return rows

@@ -1,0 +1,2649 @@
+/**
+ * Test layering — what belongs in THIS file:
+ *
+ * 1. Smoke / seam tests for the ProgramEnrollmentDisplay <->
+ *    useProgramDashboardData integration: that the hook's output actually
+ *    renders (sections -> cards, the right kind per item). Only the rendered
+ *    component proves the seam.
+ * 2. Genuine component-level concerns: simple display cases, a11y
+ *    roles/headings, user interactions (enroll dialog, certificate button),
+ *    404 / not-enrolled state.
+ *
+ * Exhaustive case coverage — req-tree ordering, completion/elective caps,
+ * language-key resolution, program-as-course derivation — belongs in the
+ * pure model (model/dashboardViewModel.test.ts) or the hook tests
+ * (hooks/useProgramDashboardData.test.tsx),
+ * NOT here.
+ */
+import React from "react"
+import { waitFor } from "@testing-library/react"
+import {
+  renderWithProviders,
+  screen,
+  setMockResponse,
+  setupLocationMock,
+  user,
+  within,
+} from "@/test-utils"
+import { ProgramEnrollmentDisplay } from "./ProgramEnrollmentDisplay"
+import * as mitxonline from "api/mitxonline-test-utils"
+import { makeRequest } from "api/test-utils"
+import { setupOrderHistory, setupCoursePricing } from "./test-utils"
+import { useFeatureFlagEnabled } from "posthog-js/react"
+import { faker } from "@faker-js/faker/locale/en"
+import invariant from "tiny-invariant"
+
+// The paid path checks enrollment eligibility before the cart.
+beforeEach(() => {
+  mitxonline.mockEnrollmentEligible()
+})
+
+// Verified cards look up their order; default to none, tests override.
+beforeEach(() => {
+  setupOrderHistory()
+})
+
+jest.mock("posthog-js/react")
+const mockedUseFeatureFlagEnabled = jest
+  .mocked(useFeatureFlagEnabled)
+  .mockImplementation(() => false)
+
+describe("ProgramEnrollmentDisplay", () => {
+  setupLocationMock()
+  test("Filters to single program when programId is provided", async () => {
+    const mitxOnlineUser = mitxonline.factories.user.user()
+    setMockResponse.get(mitxonline.urls.userMe.get(), mitxOnlineUser)
+
+    const program = mitxonline.factories.programs.program({
+      id: 123,
+      title: "Target Program",
+      courses: [1, 2, 3],
+    })
+    const courses = mitxonline.factories.courses.courses({ count: 3 })
+
+    mockedUseFeatureFlagEnabled.mockReturnValue(true)
+    setMockResponse.get(mitxonline.urls.enrollment.enrollmentsListV3(), [])
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [
+        mitxonline.factories.enrollment.programEnrollmentV3({
+          program: {
+            id: program.id,
+            title: program.title,
+            live: program.live,
+            program_type: program.program_type,
+            readable_id: program.readable_id,
+          },
+        }),
+      ],
+    )
+    setMockResponse.get(mitxonline.urls.programs.programDetail(123), program)
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: program.courses,
+        page_size: program.courses.length,
+      }),
+      courses,
+    )
+    // Also mock the undefined id case (when program data isn't loaded yet)
+    setMockResponse.get(mitxonline.urls.courses.coursesList({}), {
+      results: [],
+    })
+
+    renderWithProviders(<ProgramEnrollmentDisplay programId={123} />)
+
+    await screen.findByText("Target Program")
+    expect(screen.getByText("Target Program")).toBeInTheDocument()
+  })
+
+  test("Displays course requirements when programId is provided", async () => {
+    const mitxOnlineUser = mitxonline.factories.user.user()
+    setMockResponse.get(mitxonline.urls.userMe.get(), mitxOnlineUser)
+
+    const reqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const coreCourses = reqTree.addOperator({
+      operator: "all_of",
+      title: "Core Courses",
+    })
+    coreCourses.addCourse({ course: 1 })
+
+    const program = mitxonline.factories.programs.program({
+      id: 456,
+      courses: [1], // Only course 1 is in the requirements
+      req_tree: reqTree.serialize(),
+    })
+    const courses = {
+      count: 1,
+      next: null,
+      previous: null,
+      results: [
+        mitxonline.factories.courses.course({
+          id: 1,
+          title: "Required Course 1",
+          courseruns: [mitxonline.factories.courses.courseRun()],
+        }),
+      ],
+    }
+
+    mockedUseFeatureFlagEnabled.mockReturnValue(true)
+    setMockResponse.get(mitxonline.urls.enrollment.enrollmentsListV3(), [])
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [
+        mitxonline.factories.enrollment.programEnrollmentV3({
+          program: {
+            id: program.id,
+            title: program.title,
+            live: program.live,
+            program_type: program.program_type,
+            readable_id: program.readable_id,
+          },
+        }),
+      ],
+    )
+    setMockResponse.get(mitxonline.urls.programs.programDetail(456), program)
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: program.courses,
+        page_size: program.courses.length,
+      }),
+      courses,
+    )
+    // Also mock the undefined id case (when program data isn't loaded yet)
+    setMockResponse.get(mitxonline.urls.courses.coursesList({}), {
+      results: [],
+    })
+
+    renderWithProviders(<ProgramEnrollmentDisplay programId={456} />)
+
+    // Wait for program data to load
+    await screen.findByText(/You have completed/)
+
+    // Wait for requirement sections to appear
+    await waitFor(
+      () => {
+        const coreCourses = screen.queryByText("Core Courses")
+        expect(coreCourses).toBeInTheDocument()
+      },
+      { timeout: 2000 },
+    )
+  })
+
+  test("Completion summary omits 'courses for this program' when the program's display_mode is unset", async () => {
+    const mitxOnlineUser = mitxonline.factories.user.user()
+    setMockResponse.get(mitxonline.urls.userMe.get(), mitxOnlineUser)
+
+    const reqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const coreCourses = reqTree.addOperator({
+      operator: "all_of",
+      title: "Core Courses",
+    })
+    coreCourses.addCourse({ course: 1 })
+
+    const program = mitxonline.factories.programs.program({
+      id: 457,
+      display_mode: null,
+      courses: [1],
+      req_tree: reqTree.serialize(),
+    })
+    const courses = {
+      count: 1,
+      next: null,
+      previous: null,
+      results: [
+        mitxonline.factories.courses.course({
+          id: 1,
+          courseruns: [mitxonline.factories.courses.courseRun()],
+        }),
+      ],
+    }
+
+    setMockResponse.get(mitxonline.urls.enrollment.enrollmentsListV3(), [])
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [
+        mitxonline.factories.enrollment.programEnrollmentV3({
+          program: {
+            id: program.id,
+            title: program.title,
+            live: program.live,
+            program_type: program.program_type,
+            readable_id: program.readable_id,
+          },
+        }),
+      ],
+    )
+    setMockResponse.get(mitxonline.urls.programs.programDetail(457), program)
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: program.courses,
+        page_size: program.courses.length,
+      }),
+      courses,
+    )
+
+    renderWithProviders(<ProgramEnrollmentDisplay programId={457} />)
+
+    const completionCount = await screen.findByTestId(
+      "program-completion-count",
+    )
+    expect(completionCount).toHaveTextContent("You have completed 0 of 1.")
+    expect(completionCount).not.toHaveTextContent("courses for this program")
+  })
+
+  test("Completion summary keeps 'courses for this program' when the program's display_mode is 'course'", async () => {
+    const mitxOnlineUser = mitxonline.factories.user.user()
+    setMockResponse.get(mitxonline.urls.userMe.get(), mitxOnlineUser)
+
+    const reqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const coreCourses = reqTree.addOperator({
+      operator: "all_of",
+      title: "Core Courses",
+    })
+    coreCourses.addCourse({ course: 1 })
+
+    const program = mitxonline.factories.programs.program({
+      id: 458,
+      display_mode: "course",
+      courses: [1],
+      req_tree: reqTree.serialize(),
+    })
+    const courses = {
+      count: 1,
+      next: null,
+      previous: null,
+      results: [
+        mitxonline.factories.courses.course({
+          id: 1,
+          courseruns: [mitxonline.factories.courses.courseRun()],
+        }),
+      ],
+    }
+
+    setMockResponse.get(mitxonline.urls.enrollment.enrollmentsListV3(), [])
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [
+        mitxonline.factories.enrollment.programEnrollmentV3({
+          program: {
+            id: program.id,
+            title: program.title,
+            live: program.live,
+            program_type: program.program_type,
+            readable_id: program.readable_id,
+          },
+        }),
+      ],
+    )
+    setMockResponse.get(mitxonline.urls.programs.programDetail(458), program)
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: program.courses,
+        page_size: program.courses.length,
+      }),
+      courses,
+    )
+
+    renderWithProviders(<ProgramEnrollmentDisplay programId={458} />)
+
+    const completionCount = await screen.findByTestId(
+      "program-completion-count",
+    )
+    expect(completionCount).toHaveTextContent(
+      "You have completed 0 of 1 courses for this program.",
+    )
+  })
+
+  test("Shows required ProgramAsCourse cards even when user is not enrolled in that ProgramAsCourse", async () => {
+    const mitxOnlineUser = mitxonline.factories.user.user()
+    setMockResponse.get(mitxonline.urls.userMe.get(), mitxOnlineUser)
+
+    const parentReqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const parentRequirements = parentReqTree.addOperator({
+      operator: "all_of",
+      title: "Requirements",
+    })
+    parentRequirements.addCourse({ course: 1 })
+    parentRequirements.addProgram({ program: 900 })
+
+    const parentProgram = mitxonline.factories.programs.program({
+      id: 1234,
+      title: "Parent Program",
+      courses: [1],
+      req_tree: parentReqTree.serialize(),
+    })
+
+    const parentCourses = {
+      count: 1,
+      next: null,
+      previous: null,
+      results: [
+        mitxonline.factories.courses.course({
+          id: 1,
+          title: "Core Course",
+          courseruns: [mitxonline.factories.courses.courseRun()],
+        }),
+      ],
+    }
+
+    const programAsCourseReqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const programAsCourseRequirements = programAsCourseReqTree.addOperator({
+      operator: "all_of",
+      title: "Modules",
+    })
+    programAsCourseRequirements.addCourse({ course: 11 })
+    programAsCourseRequirements.addCourse({ course: 12 })
+
+    const programAsCourseProgram = mitxonline.factories.programs.program({
+      id: 900,
+      title: "Program As Course",
+      display_mode: "course",
+      courses: [11, 12],
+      req_tree: programAsCourseReqTree.serialize(),
+    })
+
+    const programAsCourseCourses = {
+      count: 2,
+      next: null,
+      previous: null,
+      results: [
+        mitxonline.factories.courses.course({
+          id: 11,
+          title: "Module A",
+          courseruns: [mitxonline.factories.courses.courseRun()],
+        }),
+        mitxonline.factories.courses.course({
+          id: 12,
+          title: "Module B",
+          courseruns: [mitxonline.factories.courses.courseRun()],
+        }),
+      ],
+    }
+
+    mockedUseFeatureFlagEnabled.mockReturnValue(true)
+    setMockResponse.get(mitxonline.urls.enrollment.enrollmentsListV3(), [])
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [
+        mitxonline.factories.enrollment.programEnrollmentV3({
+          program: {
+            id: parentProgram.id,
+            title: parentProgram.title,
+            live: parentProgram.live,
+            program_type: parentProgram.program_type,
+            readable_id: parentProgram.readable_id,
+          },
+        }),
+      ],
+    )
+    setMockResponse.get(
+      mitxonline.urls.programs.programDetail(parentProgram.id),
+      parentProgram,
+    )
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: parentProgram.courses,
+        page_size: parentProgram.courses.length,
+      }),
+      parentCourses,
+    )
+    setMockResponse.get(
+      mitxonline.urls.programs.programsList({
+        id: [900],
+        page_size: 1,
+      }),
+      {
+        count: 1,
+        next: null,
+        previous: null,
+        results: [programAsCourseProgram],
+      },
+    )
+    setMockResponse.get(
+      mitxonline.urls.programs.programDetail(900),
+      programAsCourseProgram,
+    )
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: [11, 12],
+        page_size: 2,
+      }),
+      programAsCourseCourses,
+    )
+
+    renderWithProviders(
+      <ProgramEnrollmentDisplay programId={parentProgram.id} />,
+    )
+
+    await screen.findByText("Requirements")
+    // Rendered once in the desktop header, once in the mobile header.
+    expect(
+      (await screen.findAllByText("Program As Course")).length,
+    ).toBeGreaterThan(0)
+    expect((await screen.findAllByText("Module A")).length).toBeGreaterThan(0)
+    expect((await screen.findAllByText("Module B")).length).toBeGreaterThan(0)
+  })
+
+  test("Shows nested Program cards (display_mode unset) with course children even when user is not enrolled in that program", async () => {
+    const mitxOnlineUser = mitxonline.factories.user.user()
+    setMockResponse.get(mitxonline.urls.userMe.get(), mitxOnlineUser)
+
+    const parentReqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const parentRequirements = parentReqTree.addOperator({
+      operator: "min_number_of",
+      operator_value: "1",
+      title: "Learning Paths",
+    })
+    parentRequirements.addProgram({ program: 910 })
+
+    const parentProgram = mitxonline.factories.programs.program({
+      id: 2345,
+      title: "Program of Programs",
+      courses: [],
+      req_tree: parentReqTree.serialize(),
+    })
+
+    const trackReqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const trackRequirements = trackReqTree.addOperator({
+      operator: "all_of",
+      title: "Track Courses",
+    })
+    trackRequirements.addCourse({ course: 21 })
+    trackRequirements.addCourse({ course: 22 })
+
+    const trackProgram = mitxonline.factories.programs.program({
+      id: 910,
+      title: "General Track",
+      display_mode: null,
+      courses: [21, 22],
+      req_tree: trackReqTree.serialize(),
+    })
+
+    const trackCourses = {
+      count: 2,
+      next: null,
+      previous: null,
+      results: [
+        mitxonline.factories.courses.course({
+          id: 21,
+          title: "Track Course A",
+          courseruns: [mitxonline.factories.courses.courseRun()],
+        }),
+        mitxonline.factories.courses.course({
+          id: 22,
+          title: "Track Course B",
+          courseruns: [mitxonline.factories.courses.courseRun()],
+        }),
+      ],
+    }
+
+    mockedUseFeatureFlagEnabled.mockReturnValue(true)
+    setMockResponse.get(mitxonline.urls.enrollment.enrollmentsListV3(), [])
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [
+        mitxonline.factories.enrollment.programEnrollmentV3({
+          program: {
+            id: parentProgram.id,
+            title: parentProgram.title,
+            live: parentProgram.live,
+            program_type: parentProgram.program_type,
+            readable_id: parentProgram.readable_id,
+          },
+        }),
+      ],
+    )
+    setMockResponse.get(
+      mitxonline.urls.programs.programDetail(parentProgram.id),
+      parentProgram,
+    )
+    setMockResponse.get(
+      mitxonline.urls.programs.programsList({
+        id: [910],
+        page_size: 1,
+      }),
+      {
+        count: 1,
+        next: null,
+        previous: null,
+        results: [trackProgram],
+      },
+    )
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: [21, 22],
+        page_size: 2,
+      }),
+      trackCourses,
+    )
+
+    renderWithProviders(
+      <ProgramEnrollmentDisplay programId={parentProgram.id} />,
+    )
+
+    await screen.findByText("Learning Paths")
+    expect(
+      (await screen.findAllByText("General Track")).length,
+    ).toBeGreaterThan(0)
+    expect(
+      (await screen.findAllByText("Track Course A")).length,
+    ).toBeGreaterThan(0)
+    expect(
+      (await screen.findAllByText("Track Course B")).length,
+    ).toBeGreaterThan(0)
+    // "Program" wording, not the program-as-course's "Course"/"Modules" wording.
+    expect(screen.getAllByText("Program").length).toBeGreaterThan(0)
+    expect(screen.getByText("2 Courses (0 of 2 complete)")).toBeInTheDocument()
+  })
+
+  test("Completion counts include program-as-course items in required totals", async () => {
+    /**
+     * A section contains 1 course + 1 program-as-course.
+     * Neither item is completed, so the counter should show "Completed 0 of 2".
+     * The total includes program-as-course items.
+     */
+    const mitxOnlineUser = mitxonline.factories.user.user()
+    setMockResponse.get(mitxonline.urls.userMe.get(), mitxOnlineUser)
+
+    const parentReqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const parentRequirements = parentReqTree.addOperator({
+      operator: "all_of",
+      title: "Requirements",
+    })
+    parentRequirements.addCourse({ course: 1 })
+    parentRequirements.addProgram({ program: 900 })
+
+    const parentProgram = mitxonline.factories.programs.program({
+      id: 4321,
+      title: "Parent Program",
+      courses: [1],
+      req_tree: parentReqTree.serialize(),
+    })
+
+    const parentCourses = {
+      count: 1,
+      next: null,
+      previous: null,
+      results: [
+        mitxonline.factories.courses.course({
+          id: 1,
+          title: "Core Course",
+          courseruns: [mitxonline.factories.courses.courseRun()],
+        }),
+      ],
+    }
+
+    const programAsCourseReqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const programAsCourseRequirements = programAsCourseReqTree.addOperator({
+      operator: "all_of",
+      title: "Modules",
+    })
+    programAsCourseRequirements.addCourse({ course: 11 })
+
+    const programAsCourseProgram = mitxonline.factories.programs.program({
+      id: 900,
+      title: "Program As Course",
+      display_mode: "course",
+      courses: [11],
+      req_tree: programAsCourseReqTree.serialize(),
+    })
+
+    const programAsCourseCourses = {
+      count: 1,
+      next: null,
+      previous: null,
+      results: [
+        mitxonline.factories.courses.course({
+          id: 11,
+          title: "Module A",
+          courseruns: [mitxonline.factories.courses.courseRun()],
+        }),
+      ],
+    }
+
+    mockedUseFeatureFlagEnabled.mockReturnValue(true)
+    setMockResponse.get(mitxonline.urls.enrollment.enrollmentsListV3(), [])
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [
+        mitxonline.factories.enrollment.programEnrollmentV3({
+          program: {
+            id: parentProgram.id,
+            title: parentProgram.title,
+            live: parentProgram.live,
+            program_type: parentProgram.program_type,
+            readable_id: parentProgram.readable_id,
+          },
+        }),
+      ],
+    )
+    setMockResponse.get(
+      mitxonline.urls.programs.programDetail(parentProgram.id),
+      parentProgram,
+    )
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: parentProgram.courses,
+        page_size: parentProgram.courses.length,
+      }),
+      parentCourses,
+    )
+    setMockResponse.get(
+      mitxonline.urls.programs.programsList({
+        id: [900],
+        page_size: 1,
+      }),
+      {
+        count: 1,
+        next: null,
+        previous: null,
+        results: [programAsCourseProgram],
+      },
+    )
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: [11],
+        page_size: 1,
+      }),
+      programAsCourseCourses,
+    )
+
+    renderWithProviders(
+      <ProgramEnrollmentDisplay programId={parentProgram.id} />,
+    )
+
+    // Section header includes both the course and program-as-course item
+    await screen.findByText(/Completed 0 of 2/)
+    // Overall summary uses the same counting behavior
+    expect(screen.getByTestId("program-completion-count")).toHaveTextContent(
+      "0 of 2",
+    )
+  })
+
+  test("Completed program-as-course items count toward completion total", async () => {
+    /**
+     * A section contains 1 course (not completed) + 1 program-as-course (completed,
+     * has certificate). The counter should show "Completed 1 of 2".
+     */
+    const mitxOnlineUser = mitxonline.factories.user.user()
+    setMockResponse.get(mitxonline.urls.userMe.get(), mitxOnlineUser)
+
+    const parentReqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const parentRequirements = parentReqTree.addOperator({
+      operator: "all_of",
+      title: "Requirements",
+    })
+    parentRequirements.addCourse({ course: 1 })
+    parentRequirements.addProgram({ program: 900 })
+
+    const parentProgram = mitxonline.factories.programs.program({
+      id: 4321,
+      title: "Parent Program",
+      courses: [1],
+      req_tree: parentReqTree.serialize(),
+    })
+
+    const parentCourses = {
+      count: 1,
+      next: null,
+      previous: null,
+      results: [
+        mitxonline.factories.courses.course({
+          id: 1,
+          title: "Core Course",
+          courseruns: [mitxonline.factories.courses.courseRun()],
+        }),
+      ],
+    }
+
+    const programAsCourseReqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const programAsCourseRequirements = programAsCourseReqTree.addOperator({
+      operator: "all_of",
+      title: "Modules",
+    })
+    programAsCourseRequirements.addCourse({ course: 11 })
+
+    const programAsCourseProgram = mitxonline.factories.programs.program({
+      id: 900,
+      title: "Program As Course",
+      display_mode: "course",
+      courses: [11],
+      req_tree: programAsCourseReqTree.serialize(),
+    })
+
+    const programAsCourseCourses = {
+      count: 1,
+      next: null,
+      previous: null,
+      results: [
+        mitxonline.factories.courses.course({
+          id: 11,
+          title: "Module A",
+          courseruns: [mitxonline.factories.courses.courseRun()],
+        }),
+      ],
+    }
+
+    mockedUseFeatureFlagEnabled.mockReturnValue(true)
+    setMockResponse.get(mitxonline.urls.enrollment.enrollmentsListV3(), [])
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [
+        mitxonline.factories.enrollment.programEnrollmentV3({
+          program: {
+            id: parentProgram.id,
+            title: parentProgram.title,
+            live: parentProgram.live,
+            program_type: parentProgram.program_type,
+            readable_id: parentProgram.readable_id,
+          },
+        }),
+        mitxonline.factories.enrollment.programEnrollmentV3({
+          program: {
+            id: programAsCourseProgram.id,
+            title: programAsCourseProgram.title,
+            live: programAsCourseProgram.live,
+            program_type: programAsCourseProgram.program_type,
+            readable_id: programAsCourseProgram.readable_id,
+          },
+          certificate: {
+            uuid: "test-uuid-900",
+            link: "/certificate/program/test-uuid-900/",
+          },
+        }),
+      ],
+    )
+    setMockResponse.get(
+      mitxonline.urls.programs.programDetail(parentProgram.id),
+      parentProgram,
+    )
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: parentProgram.courses,
+        page_size: parentProgram.courses.length,
+      }),
+      parentCourses,
+    )
+    setMockResponse.get(
+      mitxonline.urls.programs.programsList({
+        id: [900],
+        page_size: 1,
+      }),
+      {
+        count: 1,
+        next: null,
+        previous: null,
+        results: [programAsCourseProgram],
+      },
+    )
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: [11],
+        page_size: 1,
+      }),
+      programAsCourseCourses,
+    )
+
+    renderWithProviders(
+      <ProgramEnrollmentDisplay programId={parentProgram.id} />,
+    )
+
+    // program-as-course has certificate → counts as completed
+    await screen.findByText(/Completed 1 of 2/)
+    expect(screen.getByTestId("program-completion-count")).toHaveTextContent(
+      "1 of 2",
+    )
+  })
+
+  test("Program-as-course items with every module passed count toward completion total without a certificate", async () => {
+    /**
+     * A section contains 1 course (not completed) + 1 program-as-course whose
+     * only module is passed in audit mode (no certificate). The counter should
+     * show "Completed 1 of 2".
+     */
+    const mitxOnlineUser = mitxonline.factories.user.user()
+    setMockResponse.get(mitxonline.urls.userMe.get(), mitxOnlineUser)
+
+    const parentReqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const parentRequirements = parentReqTree.addOperator({
+      operator: "all_of",
+      title: "Requirements",
+    })
+    parentRequirements.addCourse({ course: 1 })
+    parentRequirements.addProgram({ program: 900 })
+
+    const parentProgram = mitxonline.factories.programs.program({
+      id: 4321,
+      title: "Parent Program",
+      courses: [1],
+      req_tree: parentReqTree.serialize(),
+    })
+
+    const parentCourses = {
+      count: 1,
+      next: null,
+      previous: null,
+      results: [
+        mitxonline.factories.courses.course({
+          id: 1,
+          title: "Core Course",
+          courseruns: [mitxonline.factories.courses.courseRun()],
+        }),
+      ],
+    }
+
+    const programAsCourseReqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const programAsCourseRequirements = programAsCourseReqTree.addOperator({
+      operator: "all_of",
+      title: "Modules",
+    })
+    programAsCourseRequirements.addCourse({ course: 11 })
+
+    const programAsCourseProgram = mitxonline.factories.programs.program({
+      id: 900,
+      title: "Program As Course",
+      display_mode: "course",
+      courses: [11],
+      req_tree: programAsCourseReqTree.serialize(),
+    })
+
+    const moduleRun = mitxonline.factories.courses.courseRun()
+    const moduleCourse = mitxonline.factories.courses.course({
+      id: 11,
+      title: "Module A",
+      courseruns: [moduleRun],
+    })
+    const programAsCourseCourses = {
+      count: 1,
+      next: null,
+      previous: null,
+      results: [moduleCourse],
+    }
+
+    mockedUseFeatureFlagEnabled.mockReturnValue(true)
+    setMockResponse.get(mitxonline.urls.enrollment.enrollmentsListV3(), [
+      mitxonline.factories.enrollment.courseEnrollment({
+        run: { ...moduleRun, course: moduleCourse },
+        enrollment_mode: "audit",
+        grades: [mitxonline.factories.enrollment.grade({ passed: true })],
+        certificate: null,
+      }),
+    ])
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [
+        mitxonline.factories.enrollment.programEnrollmentV3({
+          program: {
+            id: parentProgram.id,
+            title: parentProgram.title,
+            live: parentProgram.live,
+            program_type: parentProgram.program_type,
+            readable_id: parentProgram.readable_id,
+          },
+        }),
+        mitxonline.factories.enrollment.programEnrollmentV3({
+          program: {
+            id: programAsCourseProgram.id,
+            title: programAsCourseProgram.title,
+            live: programAsCourseProgram.live,
+            program_type: programAsCourseProgram.program_type,
+            readable_id: programAsCourseProgram.readable_id,
+          },
+          certificate: null,
+        }),
+      ],
+    )
+    setMockResponse.get(
+      mitxonline.urls.programs.programDetail(parentProgram.id),
+      parentProgram,
+    )
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: parentProgram.courses,
+        page_size: parentProgram.courses.length,
+      }),
+      parentCourses,
+    )
+    setMockResponse.get(
+      mitxonline.urls.programs.programsList({
+        id: [900],
+        page_size: 1,
+      }),
+      {
+        count: 1,
+        next: null,
+        previous: null,
+        results: [programAsCourseProgram],
+      },
+    )
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: [11],
+        page_size: 1,
+      }),
+      programAsCourseCourses,
+    )
+
+    renderWithProviders(
+      <ProgramEnrollmentDisplay programId={parentProgram.id} />,
+    )
+
+    // every module passed → program-as-course counts as completed
+    await screen.findByText(/Completed 1 of 2/)
+    expect(screen.getByTestId("program-completion-count")).toHaveTextContent(
+      "1 of 2",
+    )
+  })
+
+  test("Shows enrollment status for program courses", async () => {
+    const mitxOnlineUser = mitxonline.factories.user.user()
+    setMockResponse.get(mitxonline.urls.userMe.get(), mitxOnlineUser)
+
+    const reqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const requirements = reqTree.addOperator({
+      operator: "all_of",
+      title: "Requirements",
+    })
+    requirements.addCourse({ course: 1 })
+
+    const program = mitxonline.factories.programs.program({
+      id: 789,
+      courses: [1],
+      req_tree: reqTree.serialize(),
+    })
+
+    const courses = {
+      count: 1,
+      next: null,
+      previous: null,
+      results: [
+        mitxonline.factories.courses.course({
+          id: 1,
+          title: "Test Course",
+          page: {
+            page_url: "/courses/test-course/",
+          },
+          courseruns: [
+            mitxonline.factories.courses.courseRun({
+              title: "Test Course",
+            }),
+          ],
+        }),
+      ],
+    }
+
+    mockedUseFeatureFlagEnabled.mockReturnValue(true)
+    setMockResponse.get(mitxonline.urls.enrollment.enrollmentsListV3(), [])
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [
+        mitxonline.factories.enrollment.programEnrollmentV3({
+          program: {
+            id: program.id,
+            title: program.title,
+            live: program.live,
+            program_type: program.program_type,
+            readable_id: program.readable_id,
+          },
+        }),
+      ],
+    )
+    setMockResponse.get(mitxonline.urls.programs.programDetail(789), program)
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: program.courses,
+        page_size: program.courses.length,
+      }),
+      courses,
+    )
+    // Also mock the undefined id case
+    setMockResponse.get(mitxonline.urls.courses.coursesList({}), {
+      results: [],
+    })
+
+    renderWithProviders(<ProgramEnrollmentDisplay programId={789} />)
+
+    // Wait for the section header to load
+    await screen.findByText("Requirements")
+
+    // Wait for the completion count to appear (this means courses have loaded)
+    await screen.findByText(/Completed 0 of 1/)
+
+    // Wait for loading to complete - check that skeleton is gone
+    await waitFor(
+      () => {
+        const skeletons = screen.queryAllByTestId("skeleton")
+        expect(skeletons).toHaveLength(0)
+      },
+      { timeout: 3000 },
+    )
+
+    // Now check for the title - there will be 2 (desktop and mobile)
+    const titles = screen.getAllByText("Test Course")
+    expect(titles.length).toBeGreaterThanOrEqual(1)
+  })
+
+  test("Shows 'Continue' button for enrolled courses and 'Start' for unenrolled", async () => {
+    const mitxOnlineUser = mitxonline.factories.user.user()
+    setMockResponse.get(mitxonline.urls.userMe.get(), mitxOnlineUser)
+
+    const reqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const requirements = reqTree.addOperator({
+      operator: "all_of",
+      title: "Requirements",
+    })
+    requirements.addCourse({ course: 1 })
+    requirements.addCourse({ course: 2 })
+
+    const program = mitxonline.factories.programs.program({
+      id: 777,
+      courses: [1, 2],
+      req_tree: reqTree.serialize(),
+    })
+
+    const enrolledRun = mitxonline.factories.courses.courseRun({
+      id: 100,
+      title: "Enrolled Course",
+      start_date: "2024-01-01T00:00:00Z", // Past date
+      end_date: "2099-12-31T23:59:59Z", // Far future date
+      courseware_url: faker.internet.url(),
+    })
+    const unenrolledRun = mitxonline.factories.courses.courseRun({
+      id: 200,
+      title: "Unenrolled Course",
+    })
+
+    const courses = {
+      count: 2,
+      next: null,
+      previous: null,
+      results: [
+        mitxonline.factories.courses.course({
+          id: 1,
+          title: "Enrolled Course",
+          courseruns: [enrolledRun],
+        }),
+        mitxonline.factories.courses.course({
+          id: 2,
+          title: "Unenrolled Course",
+          courseruns: [unenrolledRun],
+        }),
+      ],
+    }
+
+    const enrollment = mitxonline.factories.enrollment.courseEnrollment({
+      run: {
+        ...enrolledRun,
+        course: courses.results[0],
+      },
+      certificate: null, // No certificate - course is not completed
+      grades: [], // Enrolled but not completed
+    })
+
+    mockedUseFeatureFlagEnabled.mockReturnValue(true)
+    setMockResponse.get(mitxonline.urls.enrollment.enrollmentsListV3(), [
+      enrollment,
+    ])
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [
+        mitxonline.factories.enrollment.programEnrollmentV3({
+          program: {
+            id: program.id,
+            title: program.title,
+            live: program.live,
+            program_type: program.program_type,
+            readable_id: program.readable_id,
+          },
+        }),
+      ],
+    )
+    setMockResponse.get(mitxonline.urls.programs.programDetail(777), program)
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: program.courses,
+        page_size: program.courses.length,
+      }),
+      courses,
+    )
+
+    renderWithProviders(<ProgramEnrollmentDisplay programId={777} />)
+
+    await screen.findByText("Requirements")
+
+    // Wait for cards to load
+    await waitFor(
+      () => {
+        const skeletons = screen.queryAllByTestId("skeleton")
+        expect(skeletons).toHaveLength(0)
+      },
+      { timeout: 3000 },
+    )
+
+    // Find desktop cards (we'll focus on those for this test)
+    const cards = screen.getAllByTestId("enrollment-card-desktop")
+    const enrolledCard = cards.find((card) =>
+      within(card).queryByText("Enrolled Course"),
+    )
+    const unenrolledCard = cards.find((card) =>
+      within(card).queryByText("Unenrolled Course"),
+    )
+
+    expect(enrolledCard).toBeDefined()
+    expect(unenrolledCard).toBeDefined()
+
+    // Enrolled course should show "Continue" button and be a link
+    const continueButton = within(enrolledCard!).getByTestId(
+      "courseware-button",
+    )
+    expect(continueButton).toHaveTextContent("Continue")
+    expect(continueButton.tagName).toBe("A") // Should be a link
+
+    // Unenrolled course should show "Start" button
+    const startButton = within(unenrolledCard!).getByTestId("courseware-button")
+    expect(startButton).toHaveTextContent("Start")
+    expect(startButton.tagName).toBe("BUTTON") // Should be a button
+  })
+
+  test("Clicking unenrolled course in program opens CourseEnrollmentDialog", async () => {
+    const mitxOnlineUser = mitxonline.factories.user.user()
+    setMockResponse.get(mitxonline.urls.userMe.get(), mitxOnlineUser)
+
+    const reqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const requirements = reqTree.addOperator({
+      operator: "all_of",
+      title: "Requirements",
+    })
+    requirements.addCourse({ course: 1 })
+
+    const program = mitxonline.factories.programs.program({
+      id: 666,
+      courses: [1],
+      req_tree: reqTree.serialize(),
+    })
+
+    const run = mitxonline.factories.courses.courseRun({
+      title: "Clickable Course",
+      b2b_contract: null, // Non-B2B
+      is_enrollable: true,
+      enrollment_modes: [
+        mitxonline.factories.courses.enrollmentMode({
+          requires_payment: false,
+        }),
+        mitxonline.factories.courses.enrollmentMode({
+          requires_payment: true,
+        }),
+      ],
+    })
+
+    const courses = {
+      count: 1,
+      next: null,
+      previous: null,
+      results: [
+        mitxonline.factories.courses.course({
+          id: 1,
+          title: "Clickable Course",
+          courseruns: [run],
+        }),
+      ],
+    }
+
+    setupCoursePricing(...courses.results)
+    mockedUseFeatureFlagEnabled.mockReturnValue(true)
+    setMockResponse.get(mitxonline.urls.enrollment.enrollmentsListV3(), []) // No enrollments
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [
+        mitxonline.factories.enrollment.programEnrollmentV3({
+          enrollment_mode: "audit",
+          program: {
+            id: program.id,
+            title: program.title,
+            live: program.live,
+            program_type: program.program_type,
+            readable_id: program.readable_id,
+          },
+        }),
+      ],
+    )
+    setMockResponse.get(mitxonline.urls.programs.programDetail(666), program)
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: program.courses,
+        page_size: program.courses.length,
+      }),
+      courses,
+    )
+
+    renderWithProviders(<ProgramEnrollmentDisplay programId={666} />)
+
+    await screen.findByText("Requirements")
+
+    // Wait for cards to load
+    await waitFor(
+      () => {
+        const skeletons = screen.queryAllByTestId("skeleton")
+        expect(skeletons).toHaveLength(0)
+      },
+      { timeout: 3000 },
+    )
+
+    const cards = screen.getAllByTestId("enrollment-card-desktop")
+    const card = cards.find((c) => within(c).queryByText("Clickable Course"))
+    invariant(card, "Expected to find a card containing 'Clickable Course'")
+
+    const startButton = within(card).getByTestId("courseware-button")
+    await user.click(startButton)
+
+    // Should open CourseEnrollmentDialog
+    await screen.findByRole("dialog", { name: "Clickable Course" })
+  })
+
+  test.each([
+    { minNumberOf: "1", expectCompletionCount: true },
+    { minNumberOf: "0", expectCompletionCount: false },
+  ])(
+    "Displays correct completion count for sections with min_number_of operator",
+    async ({ minNumberOf, expectCompletionCount }) => {
+      const mitxOnlineUser = mitxonline.factories.user.user()
+      setMockResponse.get(mitxonline.urls.userMe.get(), mitxOnlineUser)
+
+      const reqTree =
+        new mitxonline.factories.requirements.RequirementTreeBuilder()
+      const electives = reqTree.addOperator({
+        operator: "min_number_of",
+        operator_value: minNumberOf,
+        title: "Electives",
+      })
+      electives.addCourse({ course: 1 })
+      electives.addCourse({ course: 2 })
+
+      const program = mitxonline.factories.programs.program({
+        id: 999,
+        courses: [1, 2],
+        req_tree: reqTree.serialize(),
+      })
+
+      const courses = {
+        count: 2,
+        next: null,
+        previous: null,
+        results: [
+          mitxonline.factories.courses.course({
+            id: 1,
+            title: "Elective Course 1",
+            page: {
+              page_url: "/courses/elective-1/",
+            },
+            courseruns: [mitxonline.factories.courses.courseRun()],
+          }),
+          mitxonline.factories.courses.course({
+            id: 2,
+            title: "Elective Course 2",
+            page: {
+              page_url: "/courses/elective-2/",
+            },
+            courseruns: [mitxonline.factories.courses.courseRun()],
+          }),
+        ],
+      }
+
+      mockedUseFeatureFlagEnabled.mockReturnValue(true)
+      setMockResponse.get(mitxonline.urls.enrollment.enrollmentsListV3(), [])
+      setMockResponse.get(
+        mitxonline.urls.programEnrollments.enrollmentsListV3(),
+        [
+          mitxonline.factories.enrollment.programEnrollmentV3({
+            program: {
+              id: program.id,
+              title: program.title,
+              live: program.live,
+              program_type: program.program_type,
+              readable_id: program.readable_id,
+            },
+          }),
+        ],
+      )
+      setMockResponse.get(mitxonline.urls.programs.programDetail(999), program)
+      setMockResponse.get(
+        mitxonline.urls.courses.coursesList({
+          id: program.courses,
+          page_size: program.courses.length,
+        }),
+        courses,
+      )
+
+      renderWithProviders(<ProgramEnrollmentDisplay programId={999} />)
+
+      await screen.findByText("Electives")
+
+      if (expectCompletionCount) {
+        const completionCount = screen.getByTestId("section-completion-count")
+        expect(completionCount).toHaveTextContent("Completed 0 of 1")
+        expect(
+          screen.getByTestId("program-completion-count"),
+        ).toHaveTextContent("0 of 1")
+      } else {
+        expect(
+          screen.queryByTestId("section-completion-count"),
+        ).not.toBeInTheDocument()
+      }
+    },
+  )
+
+  test("Overall completion count caps elective completions at min_number_of value", async () => {
+    /**
+     * Program has 2 required courses (all_of) and 3 electives (min_number_of=1).
+     * User completes 1 required course + 2 electives.
+     * Bug: counts all 3 completions → "3 of 3 courses" (wrong).
+     * Fix: caps elective contribution at 1 → "2 of 3 courses" (correct).
+     */
+    const mitxOnlineUser = mitxonline.factories.user.user()
+    setMockResponse.get(mitxonline.urls.userMe.get(), mitxOnlineUser)
+
+    const reqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const required = reqTree.addOperator({
+      operator: "all_of",
+      title: "Required Courses",
+    })
+    required.addCourse({ course: 1 })
+    required.addCourse({ course: 2 })
+
+    const electives = reqTree.addOperator({
+      operator: "min_number_of",
+      operator_value: "1",
+      title: "Electives",
+    })
+    electives.addCourse({ course: 3 })
+    electives.addCourse({ course: 4 })
+    electives.addCourse({ course: 5 })
+
+    const program = mitxonline.factories.programs.program({
+      id: 5555,
+      courses: [1, 2, 3, 4, 5],
+      req_tree: reqTree.serialize(),
+    })
+
+    const run1 = mitxonline.factories.courses.courseRun({ id: 101 })
+    const run3 = mitxonline.factories.courses.courseRun({ id: 103 })
+    const run4 = mitxonline.factories.courses.courseRun({ id: 104 })
+
+    const courses = {
+      count: 5,
+      next: null,
+      previous: null,
+      results: [
+        mitxonline.factories.courses.course({
+          id: 1,
+          courseruns: [run1],
+        }),
+        mitxonline.factories.courses.course({
+          id: 2,
+          courseruns: [mitxonline.factories.courses.courseRun({ id: 102 })],
+        }),
+        mitxonline.factories.courses.course({
+          id: 3,
+          courseruns: [run3],
+        }),
+        mitxonline.factories.courses.course({
+          id: 4,
+          courseruns: [run4],
+        }),
+        mitxonline.factories.courses.course({
+          id: 5,
+          courseruns: [mitxonline.factories.courses.courseRun({ id: 105 })],
+        }),
+      ],
+    }
+
+    // Course 1 (required) completed, courses 3 and 4 (electives) completed
+    const completedGrade = mitxonline.factories.enrollment.grade({
+      passed: true,
+    })
+    const enrollments = [
+      mitxonline.factories.enrollment.courseEnrollment({
+        run: { ...run1, course: courses.results[0] },
+        grades: [completedGrade],
+      }),
+      mitxonline.factories.enrollment.courseEnrollment({
+        run: { ...run3, course: courses.results[2] },
+        grades: [completedGrade],
+      }),
+      mitxonline.factories.enrollment.courseEnrollment({
+        run: { ...run4, course: courses.results[3] },
+        grades: [completedGrade],
+      }),
+    ]
+
+    mockedUseFeatureFlagEnabled.mockReturnValue(true)
+    setMockResponse.get(
+      mitxonline.urls.enrollment.enrollmentsListV3(),
+      enrollments,
+    )
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [
+        mitxonline.factories.enrollment.programEnrollmentV3({
+          program: {
+            id: program.id,
+            title: program.title,
+            live: program.live,
+            program_type: program.program_type,
+            readable_id: program.readable_id,
+          },
+        }),
+      ],
+    )
+    setMockResponse.get(mitxonline.urls.programs.programDetail(5555), program)
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: program.courses,
+        page_size: program.courses.length,
+      }),
+      courses,
+    )
+
+    renderWithProviders(<ProgramEnrollmentDisplay programId={5555} />)
+
+    // 1 required completed + min(2 electives completed, 1 required) = 2 total completed
+    // total = 2 required + 1 elective min = 3
+    expect(
+      await screen.findByTestId("program-completion-count"),
+    ).toHaveTextContent("2 of 3")
+  })
+
+  test("Section header caps displayed count at operator_value for min_number_of sections", async () => {
+    /**
+     * Electives section with min_number_of=1 and 3 completed courses.
+     * The section header should show "Completed 1 of 1", not "Completed 3 of 1".
+     */
+    const mitxOnlineUser = mitxonline.factories.user.user()
+    setMockResponse.get(mitxonline.urls.userMe.get(), mitxOnlineUser)
+
+    const reqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const electives = reqTree.addOperator({
+      operator: "min_number_of",
+      operator_value: "1",
+      title: "Electives",
+    })
+    electives.addCourse({ course: 1 })
+    electives.addCourse({ course: 2 })
+    electives.addCourse({ course: 3 })
+
+    const program = mitxonline.factories.programs.program({
+      id: 6666,
+      courses: [1, 2, 3],
+      req_tree: reqTree.serialize(),
+    })
+
+    const run1 = mitxonline.factories.courses.courseRun({ id: 201 })
+    const run2 = mitxonline.factories.courses.courseRun({ id: 202 })
+    const run3 = mitxonline.factories.courses.courseRun({ id: 203 })
+
+    const courses = {
+      count: 3,
+      next: null,
+      previous: null,
+      results: [
+        mitxonline.factories.courses.course({
+          id: 1,
+          courseruns: [run1],
+        }),
+        mitxonline.factories.courses.course({
+          id: 2,
+          courseruns: [run2],
+        }),
+        mitxonline.factories.courses.course({
+          id: 3,
+          courseruns: [run3],
+        }),
+      ],
+    }
+
+    // All 3 electives completed
+    const completedGrade = mitxonline.factories.enrollment.grade({
+      passed: true,
+    })
+    const enrollments = [
+      mitxonline.factories.enrollment.courseEnrollment({
+        run: { ...run1, course: courses.results[0] },
+        grades: [completedGrade],
+      }),
+      mitxonline.factories.enrollment.courseEnrollment({
+        run: { ...run2, course: courses.results[1] },
+        grades: [completedGrade],
+      }),
+      mitxonline.factories.enrollment.courseEnrollment({
+        run: { ...run3, course: courses.results[2] },
+        grades: [completedGrade],
+      }),
+    ]
+
+    mockedUseFeatureFlagEnabled.mockReturnValue(true)
+    setMockResponse.get(
+      mitxonline.urls.enrollment.enrollmentsListV3(),
+      enrollments,
+    )
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [
+        mitxonline.factories.enrollment.programEnrollmentV3({
+          program: {
+            id: program.id,
+            title: program.title,
+            live: program.live,
+            program_type: program.program_type,
+            readable_id: program.readable_id,
+          },
+        }),
+      ],
+    )
+    setMockResponse.get(mitxonline.urls.programs.programDetail(6666), program)
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: program.courses,
+        page_size: program.courses.length,
+      }),
+      courses,
+    )
+
+    renderWithProviders(<ProgramEnrollmentDisplay programId={6666} />)
+
+    await screen.findByText("Electives")
+
+    // Section header should show "Completed 1 of 1", capped at operator_value
+    const sectionCount = screen.getByTestId("section-completion-count")
+    expect(sectionCount).toHaveTextContent("Completed 1 of 1")
+    // Overall header should also show 1 of 1 (only electives section)
+    expect(screen.getByTestId("program-completion-count")).toHaveTextContent(
+      "1 of 1",
+    )
+  })
+
+  test("Returns 404 page when user is not enrolled in the program", async () => {
+    const mitxOnlineUser = mitxonline.factories.user.user()
+    setMockResponse.get(mitxonline.urls.userMe.get(), mitxOnlineUser)
+
+    const reqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const requirements = reqTree.addOperator({
+      operator: "all_of",
+      title: "Requirements",
+    })
+    requirements.addCourse({ course: 1 })
+
+    const program = mitxonline.factories.programs.program({
+      id: 888,
+      courses: [1],
+      req_tree: reqTree.serialize(),
+    })
+
+    mockedUseFeatureFlagEnabled.mockReturnValue(true)
+    setMockResponse.get(mitxonline.urls.enrollment.enrollmentsListV3(), [])
+    // User is not enrolled in any programs
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [],
+    )
+    setMockResponse.get(mitxonline.urls.programs.programDetail(888), program)
+
+    renderWithProviders(<ProgramEnrollmentDisplay programId={888} />)
+
+    // Should show 404 page instead of program content
+    await screen.findByText(
+      "Looks like we couldn't find what you were looking for!",
+    )
+    expect(screen.queryByText("Requirements")).not.toBeInTheDocument()
+  })
+
+  /**
+   * Sets up a verified program dashboard scenario with:
+   * - A parent program with a verified enrollment
+   * - A direct child course (regular requirement)
+   * - A child program-as-course with its own module course
+   *
+   * Mocks all API responses. Does not render — callers handle rendering
+   * and assertions.
+   */
+  const setupProgramDashboardVerifiedEnrollmentScenario = () => {
+    const mitxOnlineUser = mitxonline.factories.user.user()
+    setMockResponse.get(mitxonline.urls.userMe.get(), mitxOnlineUser)
+
+    // Child course (direct requirement of the parent program)
+    const childCourseRun = mitxonline.factories.courses.courseRun({
+      title: "Verified Child Course",
+      b2b_contract: null,
+      is_enrollable: true,
+      courseware_url: faker.internet.url(),
+    })
+    const childCourse = mitxonline.factories.courses.course({
+      title: "Verified Child Course",
+      courseruns: [childCourseRun],
+      next_run_id: childCourseRun.id,
+    })
+
+    // Module course (child of the program-as-course)
+    const moduleRun = mitxonline.factories.courses.courseRun({
+      title: "Verified Module Course",
+      b2b_contract: null,
+      is_enrollable: true,
+      courseware_url: faker.internet.url(),
+    })
+    const moduleCourse = mitxonline.factories.courses.course({
+      title: "Verified Module Course",
+      courseruns: [moduleRun],
+      next_run_id: moduleRun.id,
+    })
+
+    // Program-as-course (child requirement of the parent program)
+    const programAsCourseReqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const moduleSection = programAsCourseReqTree.addOperator({
+      operator: "all_of",
+      title: "Modules",
+    })
+    moduleSection.addCourse({ course: moduleCourse.id })
+
+    const programAsCourse = mitxonline.factories.programs.program({
+      display_mode: "course",
+      courses: [moduleCourse.id],
+      req_tree: programAsCourseReqTree.serialize(),
+    })
+
+    // Parent program with both a course and a program-as-course
+    const parentReqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const parentRequirements = parentReqTree.addOperator({
+      operator: "all_of",
+      title: "Program Requirements",
+    })
+    parentRequirements.addCourse({ course: childCourse.id })
+    parentRequirements.addProgram({ program: programAsCourse.id })
+
+    const parentProgram = mitxonline.factories.programs.program({
+      courses: [childCourse.id],
+      req_tree: parentReqTree.serialize(),
+    })
+
+    const parentProgramEnrollment =
+      mitxonline.factories.enrollment.programEnrollmentV3({
+        enrollment_mode: "verified",
+        program: {
+          id: parentProgram.id,
+          title: parentProgram.title,
+          live: parentProgram.live,
+          program_type: parentProgram.program_type,
+          readable_id: parentProgram.readable_id,
+        },
+      })
+
+    mockedUseFeatureFlagEnabled.mockReturnValue(true)
+    setMockResponse.get(mitxonline.urls.enrollment.enrollmentsListV3(), [])
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [parentProgramEnrollment],
+    )
+    setMockResponse.get(
+      mitxonline.urls.programs.programDetail(parentProgram.id),
+      parentProgram,
+    )
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: parentProgram.courses,
+        page_size: parentProgram.courses.length,
+      }),
+      { count: 1, next: null, previous: null, results: [childCourse] },
+    )
+    setMockResponse.get(
+      mitxonline.urls.programs.programsList({
+        id: [programAsCourse.id],
+        page_size: 1,
+      }),
+      {
+        count: 1,
+        next: null,
+        previous: null,
+        results: [programAsCourse],
+      },
+    )
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: [moduleCourse.id],
+        page_size: 1,
+      }),
+      { count: 1, next: null, previous: null, results: [moduleCourse] },
+    )
+
+    // Mock verified enrollment endpoints for both course runs
+    const childCourseEnrollmentEndpoint =
+      mitxonline.urls.verifiedProgramEnrollments.create(
+        childCourseRun.courseware_id,
+      )
+    setMockResponse.post(childCourseEnrollmentEndpoint, {})
+
+    const moduleCourseEnrollmentEndpoint =
+      mitxonline.urls.verifiedProgramEnrollments.create(moduleRun.courseware_id)
+    setMockResponse.post(moduleCourseEnrollmentEndpoint, {})
+
+    return {
+      parentProgram,
+      parentProgramEnrollment,
+      childCourse,
+      childCourseRun,
+      childCourseEnrollmentEndpoint,
+      programAsCourse,
+      moduleCourse,
+      moduleRun,
+      moduleCourseEnrollmentEndpoint,
+    }
+  }
+
+  test("Clicking 'Start' on a regular course in a verified program does one-click enrollment", async () => {
+    const {
+      parentProgram,
+      parentProgramEnrollment,
+      childCourse,
+      childCourseEnrollmentEndpoint,
+    } = setupProgramDashboardVerifiedEnrollmentScenario()
+
+    renderWithProviders(
+      <ProgramEnrollmentDisplay programId={parentProgram.id} />,
+    )
+
+    await screen.findByText("Program Requirements")
+    await waitFor(
+      () => {
+        const skeletons = screen.queryAllByTestId("skeleton")
+        expect(skeletons).toHaveLength(0)
+      },
+      { timeout: 3000 },
+    )
+
+    const cards = screen.getAllByTestId("enrollment-card-desktop")
+    const card = cards.find((c) => within(c).queryByText(childCourse.title))
+    invariant(card, `Expected to find a card containing "${childCourse.title}"`)
+
+    const startButton = within(card).getByTestId("courseware-button")
+    await user.click(startButton)
+
+    await waitFor(() => {
+      expect(makeRequest).toHaveBeenCalledWith(
+        expect.objectContaining({
+          method: "post",
+          url: childCourseEnrollmentEndpoint,
+          body: [parentProgramEnrollment.program.readable_id],
+        }),
+      )
+    })
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+  })
+
+  test("Clicking 'Start' on a module in a program-as-course sends both parent and grandparent program IDs", async () => {
+    const {
+      parentProgram,
+      parentProgramEnrollment,
+      programAsCourse,
+      moduleCourse,
+      moduleCourseEnrollmentEndpoint,
+    } = setupProgramDashboardVerifiedEnrollmentScenario()
+
+    renderWithProviders(
+      <ProgramEnrollmentDisplay programId={parentProgram.id} />,
+    )
+
+    await screen.findByText("Program Requirements")
+    await waitFor(
+      () => {
+        const skeletons = screen.queryAllByTestId("skeleton")
+        expect(skeletons).toHaveLength(0)
+      },
+      { timeout: 3000 },
+    )
+
+    const cards = screen.getAllByTestId("enrollment-card-desktop")
+    const card = cards.find((c) => within(c).queryByText(moduleCourse.title))
+    invariant(
+      card,
+      `Expected to find a card containing "${moduleCourse.title}"`,
+    )
+
+    const startButton = within(card).getByTestId("courseware-button")
+    await user.click(startButton)
+
+    await waitFor(() => {
+      expect(makeRequest).toHaveBeenCalledWith(
+        expect.objectContaining({
+          method: "post",
+          url: moduleCourseEnrollmentEndpoint,
+          body: [
+            programAsCourse.readable_id,
+            parentProgramEnrollment.program.readable_id,
+          ],
+        }),
+      )
+    })
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+  })
+
+  test("Upgrading a module course omits an unverified root program from the request body", async () => {
+    // Regression test for a nested-program (e.g. SDS-style track) scenario:
+    // the learner has a verified enrollment in the program-as-course track
+    // itself but only an audit enrollment in its parent program, and is
+    // already audit-enrolled in the module course. The verified enrollment
+    // for the track alone is sufficient to grant the free upgrade, so the
+    // unverified parent must not be sent - see ProgramAsCourseCard's
+    // `parentProgramIds` trimming.
+    const mitxOnlineUser = mitxonline.factories.user.user()
+    setMockResponse.get(mitxonline.urls.userMe.get(), mitxOnlineUser)
+
+    const moduleRunUpgradeDeadline = faker.date.future().toISOString()
+    const moduleRunUpgradeProductId = faker.number.int()
+    const moduleRunUpgradeProductPrice = faker.commerce.price()
+    const moduleRun = mitxonline.factories.courses.courseRun({
+      title: "Module Course",
+      b2b_contract: null,
+      is_enrollable: true,
+      is_upgradable: true,
+      upgrade_deadline: moduleRunUpgradeDeadline,
+      courseware_url: faker.internet.url(),
+    })
+    const moduleCourse = mitxonline.factories.courses.course({
+      title: "Module Course",
+      courseruns: [moduleRun],
+      next_run_id: moduleRun.id,
+    })
+
+    const programAsCourseReqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const moduleSection = programAsCourseReqTree.addOperator({
+      operator: "all_of",
+      title: "Modules",
+    })
+    moduleSection.addCourse({ course: moduleCourse.id })
+
+    const programAsCourse = mitxonline.factories.programs.program({
+      display_mode: "course",
+      courses: [moduleCourse.id],
+      req_tree: programAsCourseReqTree.serialize(),
+    })
+
+    const parentReqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const parentRequirements = parentReqTree.addOperator({
+      operator: "all_of",
+      title: "Program Requirements",
+    })
+    parentRequirements.addProgram({ program: programAsCourse.id })
+
+    const parentProgram = mitxonline.factories.programs.program({
+      req_tree: parentReqTree.serialize(),
+    })
+
+    // Root/ancestor program enrollment is audit - not verified.
+    const parentProgramEnrollment =
+      mitxonline.factories.enrollment.programEnrollmentV3({
+        enrollment_mode: "audit",
+        program: {
+          id: parentProgram.id,
+          title: parentProgram.title,
+          live: parentProgram.live,
+          program_type: parentProgram.program_type,
+          readable_id: parentProgram.readable_id,
+        },
+      })
+    // The nested track itself is verified.
+    const programAsCourseEnrollment =
+      mitxonline.factories.enrollment.programEnrollmentV3({
+        enrollment_mode: "verified",
+        program: {
+          id: programAsCourse.id,
+          title: programAsCourse.title,
+          live: programAsCourse.live,
+          program_type: programAsCourse.program_type,
+          readable_id: programAsCourse.readable_id,
+        },
+      })
+
+    // Learner already has an audit enrollment in the module course run.
+    const moduleCourseEnrollment =
+      mitxonline.factories.enrollment.courseEnrollment({
+        enrollment_mode: "audit",
+        certificate: null,
+        run: {
+          id: moduleRun.id,
+          course_id: moduleCourse.id,
+          courseware_id: moduleRun.courseware_id,
+          courseware_url: moduleRun.courseware_url,
+          is_upgradable: true,
+          upgrade_deadline: moduleRunUpgradeDeadline,
+          upgrade_product_id: moduleRunUpgradeProductId,
+          upgrade_product_price: moduleRunUpgradeProductPrice,
+          upgrade_product_is_active: true,
+          course: {
+            id: moduleCourse.id,
+            title: moduleCourse.title,
+            readable_id: moduleCourse.readable_id,
+          },
+        },
+      })
+
+    mockedUseFeatureFlagEnabled.mockReturnValue(true)
+    setMockResponse.get(mitxonline.urls.enrollment.enrollmentsListV3(), [
+      moduleCourseEnrollment,
+    ])
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [parentProgramEnrollment, programAsCourseEnrollment],
+    )
+    setMockResponse.get(
+      mitxonline.urls.programs.programDetail(parentProgram.id),
+      parentProgram,
+    )
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: parentProgram.courses,
+        page_size: parentProgram.courses.length || undefined,
+      }),
+      { count: 0, next: null, previous: null, results: [] },
+    )
+    setMockResponse.get(
+      mitxonline.urls.programs.programsList({
+        id: [programAsCourse.id],
+        page_size: 1,
+      }),
+      {
+        count: 1,
+        next: null,
+        previous: null,
+        results: [programAsCourse],
+      },
+    )
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: [moduleCourse.id],
+        page_size: 1,
+      }),
+      { count: 1, next: null, previous: null, results: [moduleCourse] },
+    )
+    const moduleCourseEnrollmentEndpoint =
+      mitxonline.urls.verifiedProgramEnrollments.create(moduleRun.courseware_id)
+    setMockResponse.post(moduleCourseEnrollmentEndpoint, {})
+
+    renderWithProviders(
+      <ProgramEnrollmentDisplay programId={parentProgram.id} />,
+    )
+
+    await screen.findByText("Program Requirements")
+    await waitFor(
+      () => {
+        const skeletons = screen.queryAllByTestId("skeleton")
+        expect(skeletons).toHaveLength(0)
+      },
+      { timeout: 3000 },
+    )
+
+    const cards = screen.getAllByTestId("enrollment-card-desktop")
+    const card = cards.find((c) => within(c).queryByText(moduleCourse.title))
+    invariant(
+      card,
+      `Expected to find a card containing "${moduleCourse.title}"`,
+    )
+
+    const upgradeLink = within(card).getByRole("link", {
+      name: "Upgrade for certificate",
+    })
+    await user.click(upgradeLink)
+
+    await waitFor(() => {
+      expect(makeRequest).toHaveBeenCalledWith(
+        expect.objectContaining({
+          method: "post",
+          url: moduleCourseEnrollmentEndpoint,
+          body: [programAsCourse.readable_id],
+        }),
+      )
+    })
+  })
+
+  test("Shows an error banner when the one-click verified-program upgrade fails", async () => {
+    const mitxOnlineUser = mitxonline.factories.user.user()
+    setMockResponse.get(mitxonline.urls.userMe.get(), mitxOnlineUser)
+
+    const courseRunUpgradeDeadline = faker.date.future().toISOString()
+    const courseRunUpgradeProductId = faker.number.int()
+    const courseRunUpgradeProductPrice = faker.commerce.price()
+    const courseRun = mitxonline.factories.courses.courseRun({
+      title: "Verified Track Course",
+      b2b_contract: null,
+      is_enrollable: true,
+      is_upgradable: true,
+      upgrade_deadline: courseRunUpgradeDeadline,
+      courseware_url: faker.internet.url(),
+    })
+    const course = mitxonline.factories.courses.course({
+      title: "Verified Track Course",
+      courseruns: [courseRun],
+      next_run_id: courseRun.id,
+    })
+
+    const reqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const requirements = reqTree.addOperator({
+      operator: "all_of",
+      title: "Program Requirements",
+    })
+    requirements.addCourse({ course: course.id })
+
+    const program = mitxonline.factories.programs.program({
+      courses: [course.id],
+      req_tree: reqTree.serialize(),
+    })
+    const programEnrollment =
+      mitxonline.factories.enrollment.programEnrollmentV3({
+        enrollment_mode: "verified",
+        program: {
+          id: program.id,
+          title: program.title,
+          live: program.live,
+          program_type: program.program_type,
+          readable_id: program.readable_id,
+        },
+      })
+
+    // Learner already has an audit enrollment in the course run.
+    const courseEnrollment = mitxonline.factories.enrollment.courseEnrollment({
+      enrollment_mode: "audit",
+      certificate: null,
+      run: {
+        id: courseRun.id,
+        course_id: course.id,
+        courseware_id: courseRun.courseware_id,
+        courseware_url: courseRun.courseware_url,
+        is_upgradable: true,
+        upgrade_deadline: courseRunUpgradeDeadline,
+        upgrade_product_id: courseRunUpgradeProductId,
+        upgrade_product_price: courseRunUpgradeProductPrice,
+        upgrade_product_is_active: true,
+        course: {
+          id: course.id,
+          title: course.title,
+          readable_id: course.readable_id,
+        },
+      },
+    })
+
+    mockedUseFeatureFlagEnabled.mockReturnValue(true)
+    setMockResponse.get(mitxonline.urls.enrollment.enrollmentsListV3(), [
+      courseEnrollment,
+    ])
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [programEnrollment],
+    )
+    setMockResponse.get(
+      mitxonline.urls.programs.programDetail(program.id),
+      program,
+    )
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: program.courses,
+        page_size: program.courses.length,
+      }),
+      { count: 1, next: null, previous: null, results: [course] },
+    )
+
+    const enrollmentEndpoint =
+      mitxonline.urls.verifiedProgramEnrollments.create(courseRun.courseware_id)
+    setMockResponse.post(
+      enrollmentEndpoint,
+      { error: "No verified enrollment in root program" },
+      { code: 400 },
+    )
+
+    renderWithProviders(<ProgramEnrollmentDisplay programId={program.id} />)
+
+    await screen.findByText("Program Requirements")
+    await waitFor(
+      () => {
+        const skeletons = screen.queryAllByTestId("skeleton")
+        expect(skeletons).toHaveLength(0)
+      },
+      { timeout: 3000 },
+    )
+
+    const cards = screen.getAllByTestId("enrollment-card-desktop")
+    const card = cards.find((c) => within(c).queryByText(course.title))
+    invariant(card, `Expected to find a card containing "${course.title}"`)
+
+    const upgradeLink = within(card).getByRole("link", {
+      name: "Upgrade for certificate",
+    })
+    await user.click(upgradeLink)
+
+    await waitFor(() => {
+      expect(makeRequest).toHaveBeenCalledWith(
+        expect.objectContaining({
+          method: "post",
+          url: enrollmentEndpoint,
+        }),
+      )
+    })
+
+    expect(
+      await screen.findByText(/problem upgrading your enrollment/i),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole("link", { name: "Contact Support" }),
+    ).toBeInTheDocument()
+  })
+
+  test("Displays courses in the order defined by the requirement tree, not API order", async () => {
+    const mitxOnlineUser = mitxonline.factories.user.user()
+    setMockResponse.get(mitxonline.urls.userMe.get(), mitxOnlineUser)
+
+    const courses = mitxonline.factories.courses.courses({ count: 3 })
+    courses.results = courses.results.map((course) => {
+      const firstRun = course.courseruns[0]
+      return {
+        ...course,
+        courseruns: firstRun
+          ? [
+              {
+                ...firstRun,
+                title: course.title,
+                is_enrollable: true,
+              },
+            ]
+          : [],
+        next_run_id: firstRun?.id ?? null,
+        language_options: firstRun
+          ? [
+              {
+                id: firstRun.id,
+                courseware_id: firstRun.courseware_id,
+                courseware_url: firstRun.courseware_url ?? "",
+                language: firstRun.language ?? "en",
+                title: course.title,
+                run_tag: firstRun.run_tag,
+              },
+            ]
+          : [],
+      }
+    })
+    const [courseA, courseB, courseC] = courses.results
+
+    // Requirement tree defines courses in order: C, A, B
+    const reqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    const core = reqTree.addOperator({
+      operator: "all_of",
+      title: "Core Courses",
+    })
+    core.addCourse({ course: courseC.id })
+    core.addCourse({ course: courseA.id })
+    core.addCourse({ course: courseB.id })
+
+    const program = mitxonline.factories.programs.program({
+      courses: [courseA.id, courseB.id, courseC.id],
+      req_tree: reqTree.serialize(),
+    })
+
+    mockedUseFeatureFlagEnabled.mockReturnValue(true)
+    setMockResponse.get(mitxonline.urls.enrollment.enrollmentsListV3(), [])
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [
+        mitxonline.factories.enrollment.programEnrollmentV3({
+          program: {
+            id: program.id,
+            title: program.title,
+            live: program.live,
+            program_type: program.program_type,
+            readable_id: program.readable_id,
+          },
+        }),
+      ],
+    )
+    setMockResponse.get(
+      mitxonline.urls.programs.programDetail(program.id),
+      program,
+    )
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: program.courses,
+        page_size: program.courses.length,
+      }),
+      courses,
+    )
+
+    renderWithProviders(<ProgramEnrollmentDisplay programId={program.id} />)
+
+    await screen.findByText("Core Courses")
+
+    // Cards should render in req_tree order (C, A, B), not API order.
+    const cards = await screen.findAllByTestId("enrollment-card-desktop")
+    expect(cards.length).toBe(3)
+    const expectedTitles = [
+      courseC.courseruns[0].title,
+      courseA.courseruns[0].title,
+      courseB.courseruns[0].title,
+    ]
+
+    expectedTitles.forEach((title, index) => {
+      expect(cards[index]).toHaveTextContent(title)
+    })
+  })
+
+  test("displays certificate button when program enrollment has a certificate", async () => {
+    const mitxOnlineUser = mitxonline.factories.user.user()
+    setMockResponse.get(mitxonline.urls.userMe.get(), mitxOnlineUser)
+
+    const certUuid = "test-program-cert-uuid"
+    const program = mitxonline.factories.programs.program({
+      id: 456,
+      title: "Program With Certificate",
+      courses: [10, 11],
+    })
+    const programEnrollment =
+      mitxonline.factories.enrollment.programEnrollmentV3({
+        program: {
+          id: program.id,
+          title: program.title,
+          live: program.live,
+          program_type: program.program_type,
+          readable_id: program.readable_id,
+        },
+        certificate: {
+          uuid: certUuid,
+          link: `/certificate/${certUuid}/`,
+        },
+      })
+    const courses = mitxonline.factories.courses.courses({ count: 2 })
+
+    mockedUseFeatureFlagEnabled.mockReturnValue(true)
+    setMockResponse.get(mitxonline.urls.enrollment.enrollmentsListV3(), [])
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [programEnrollment],
+    )
+    setMockResponse.get(mitxonline.urls.programs.programDetail(456), program)
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: program.courses,
+        page_size: program.courses.length,
+      }),
+      courses,
+    )
+
+    renderWithProviders(<ProgramEnrollmentDisplay programId={456} />)
+
+    await screen.findByText("Program With Certificate")
+    const certButton = screen.getByRole("link", { name: "Certificate" })
+    const expectedCertHref = `/certificate/program/${certUuid}`
+    expect(certButton).toBeInTheDocument()
+    expect(certButton).toHaveAttribute("href", expectedCertHref)
+    expect(certButton).not.toHaveAttribute("target")
+  })
+
+  test("does not display certificate button when program enrollment has no certificate", async () => {
+    const mitxOnlineUser = mitxonline.factories.user.user()
+    setMockResponse.get(mitxonline.urls.userMe.get(), mitxOnlineUser)
+
+    const program = mitxonline.factories.programs.program({
+      id: 457,
+      title: "Program Without Certificate",
+      courses: [12, 13],
+    })
+    const programEnrollment =
+      mitxonline.factories.enrollment.programEnrollmentV3({
+        program: {
+          id: program.id,
+          title: program.title,
+          live: program.live,
+          program_type: program.program_type,
+          readable_id: program.readable_id,
+        },
+        certificate: null,
+      })
+    const courses = mitxonline.factories.courses.courses({ count: 2 })
+
+    mockedUseFeatureFlagEnabled.mockReturnValue(true)
+    setMockResponse.get(mitxonline.urls.enrollment.enrollmentsListV3(), [])
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [programEnrollment],
+    )
+    setMockResponse.get(mitxonline.urls.programs.programDetail(457), program)
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: program.courses,
+        page_size: program.courses.length,
+      }),
+      courses,
+    )
+
+    renderWithProviders(<ProgramEnrollmentDisplay programId={457} />)
+
+    await screen.findByText("Program Without Certificate")
+    const certButton = screen.queryByRole("link", { name: "Certificate" })
+    expect(certButton).not.toBeInTheDocument()
+  })
+  test("Shows a requirement group's description under its heading, not on its cards", async () => {
+    const mitxOnlineUser = mitxonline.factories.user.user()
+    setMockResponse.get(mitxonline.urls.userMe.get(), mitxOnlineUser)
+
+    const description = "Unlocks after all required courses are complete"
+    const reqTree =
+      new mitxonline.factories.requirements.RequirementTreeBuilder()
+    reqTree
+      .addOperator({ operator: "all_of", title: "Core Courses" })
+      .addCourse({ course: 1 })
+    const capstone = reqTree.addOperator({
+      operator: "all_of",
+      title: "Capstone Exam",
+      description,
+    })
+    capstone.addCourse({ course: 2 })
+    capstone.addCourse({ course: 3 })
+
+    const program = mitxonline.factories.programs.program({
+      id: 7777,
+      courses: [1, 2, 3],
+      req_tree: reqTree.serialize(),
+    })
+    const [course1, course2, course3] = [1, 2, 3].map((id) =>
+      mitxonline.factories.courses.course({
+        id,
+        courseruns: [mitxonline.factories.courses.courseRun({ id: 300 + id })],
+      }),
+    )
+    // Course 2 is enrolled and course 3 is not, so both card kinds are present.
+    const enrollment = mitxonline.factories.enrollment.courseEnrollment({
+      run: { ...course2.courseruns[0], course: course2 },
+    })
+
+    setMockResponse.get(mitxonline.urls.enrollment.enrollmentsListV3(), [
+      enrollment,
+    ])
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [
+        mitxonline.factories.enrollment.programEnrollmentV3({
+          program: {
+            id: program.id,
+            title: program.title,
+            live: program.live,
+            program_type: program.program_type,
+            readable_id: program.readable_id,
+          },
+        }),
+      ],
+    )
+    setMockResponse.get(mitxonline.urls.programs.programDetail(7777), program)
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: program.courses,
+        page_size: program.courses.length,
+      }),
+      {
+        count: 3,
+        next: null,
+        previous: null,
+        results: [course1, course2, course3],
+      },
+    )
+
+    renderWithProviders(<ProgramEnrollmentDisplay programId={7777} />)
+    await screen.findByText("Capstone Exam")
+
+    // Once, in the Capstone Exam header rather than on either course card.
+    const [note] = screen.getAllByText(description)
+    expect(screen.getAllByText(description)).toHaveLength(1)
+    expect(
+      screen.getByRole("heading", { name: "Capstone Exam" }).parentElement,
+    ).toContainElement(note)
+    for (const card of screen.getAllByTestId("enrollment-card-desktop")) {
+      expect(card).not.toContainElement(note)
+    }
+  })
+})
+
+describe("ProgramEnrollmentDisplay with program tracks", () => {
+  setupLocationMock()
+
+  const setupTrackedProgram = (
+    chosen: "General Track" | "Methods Track" | null = null,
+    enrolledCourseIds: number[] = [],
+  ) => {
+    setMockResponse.get(
+      mitxonline.urls.userMe.get(),
+      mitxonline.factories.user.user(),
+    )
+    const root = new mitxonline.RequirementTreeBuilder()
+    root
+      .addOperator({ operator: "all_of", title: "Core Courses" })
+      .addCourse({ course: 1 })
+    const container = root.addOperator({
+      operator: "min_number_of",
+      operator_value: "1",
+    })
+    const general = container.addTrack({ title: "General Track" })
+    general.addOperator({ operator: "all_of" }).addCourse({ course: 2 })
+    const methods = container.addTrack({ title: "Methods Track" })
+    methods.addOperator({ operator: "all_of" }).addCourse({ course: 3 })
+    root
+      .addOperator({ operator: "all_of", title: "Capstone" })
+      .addCourse({ course: 4 })
+
+    const program = mitxonline.factories.programs.program({
+      id: 456,
+      courses: [1, 2, 3, 4],
+      req_tree: root.serialize(),
+    })
+    const courses = [1, 2, 3, 4].map((id) =>
+      mitxonline.factories.courses.course({
+        id,
+        courseruns: [mitxonline.factories.courses.courseRun({ id: 500 + id })],
+      }),
+    )
+    const courseEnrollments = courses
+      .filter((course) => enrolledCourseIds.includes(course.id))
+      .map((course) =>
+        mitxonline.factories.enrollment.courseEnrollment({
+          run: { ...course.courseruns[0], course },
+        }),
+      )
+    const trackIds = {
+      "General Track": general.id,
+      "Methods Track": methods.id,
+    }
+    const enrollment = mitxonline.factories.enrollment.programEnrollmentV3({
+      program: mitxonline.factories.programs.simpleProgram({ id: program.id }),
+      ...(chosen ? { track: { id: trackIds[chosen], title: chosen } } : {}),
+    })
+    setMockResponse.get(
+      mitxonline.urls.enrollment.enrollmentsListV3(),
+      courseEnrollments,
+    )
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [enrollment],
+    )
+    setMockResponse.get(
+      mitxonline.urls.programs.programDetail(program.id),
+      program,
+    )
+    setMockResponse.get(
+      mitxonline.urls.courses.coursesList({
+        id: program.courses,
+        page_size: program.courses.length,
+      }),
+      { count: courses.length, next: null, previous: null, results: courses },
+    )
+    return { program, enrollment, courseEnrollments, methodsId: methods.id }
+  }
+
+  const expectTrackSaved = async (
+    programId: number,
+    trackId: number,
+    heading: string,
+  ) => {
+    expect(makeRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "patch",
+        url: mitxonline.urls.programEnrollments.programEnrollment(programId),
+        body: { track: trackId },
+      }),
+    )
+    const trackHeading = await screen.findByRole("heading", { name: heading })
+    // The button that opened the dialog is gone, so focus moves to the heading.
+    await waitFor(() => expect(trackHeading).toHaveFocus())
+  }
+
+  test("Shows enrolled courses from another track after the capstone", async () => {
+    // Enrolled in core (1) and in Methods' course (3) while on General.
+    const { program, courseEnrollments } = setupTrackedProgram(
+      "General Track",
+      [1, 3],
+    )
+    renderWithProviders(<ProgramEnrollmentDisplay programId={program.id} />)
+
+    await screen.findByRole("heading", { name: "General Track courses" })
+    expect(
+      screen.getAllByRole("heading", { level: 2 }).map((h) => h.textContent),
+    ).toEqual([
+      "Core Courses",
+      "General Track courses",
+      "Capstone",
+      "Other courses in this program you have started",
+    ])
+    expect(screen.getByText("across all tracks")).toBeInTheDocument()
+    const other = screen.getByTestId("other-track-courses")
+    const methodsEnrollment = courseEnrollments.find(
+      (e) => e.run.course.id === 3,
+    )
+    invariant(methodsEnrollment)
+    expect(
+      within(other).getAllByText(methodsEnrollment.run.title)[0],
+    ).toBeInTheDocument()
+    // Core is shown in its own section, not repeated here.
+    const coreEnrollment = courseEnrollments.find((e) => e.run.course.id === 1)
+    invariant(coreEnrollment)
+    expect(
+      within(other).queryByText(coreEnrollment.run.title),
+    ).not.toBeInTheDocument()
+    // Only the chosen track counts: core, General and the capstone.
+    expect(screen.getByTestId("program-completion-count")).toHaveTextContent(
+      /You have completed 0 of 3/,
+    )
+  })
+
+  test("Choosing a track saves it and shows that track's courses", async () => {
+    const { program, enrollment, methodsId } = setupTrackedProgram()
+    renderWithProviders(<ProgramEnrollmentDisplay programId={program.id} />)
+
+    await screen.findByText("Not selected")
+    expect(
+      screen.getAllByRole("heading", { level: 2 }).map((h) => h.textContent),
+    ).toEqual(["Core Courses", "Track courses", "Capstone"])
+    expect(
+      screen.queryByTestId("program-completion-count"),
+    ).not.toBeInTheDocument()
+
+    const updated = {
+      ...enrollment,
+      track: { id: methodsId, title: "Methods Track" },
+    }
+    setMockResponse.patch(
+      mitxonline.urls.programEnrollments.programEnrollment(program.id),
+      updated,
+    )
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [updated],
+    )
+    await user.click(screen.getByRole("button", { name: "Choose track" }))
+    const dialog = await screen.findByRole("dialog", { name: "Choose track" })
+    const submit = within(dialog).getByRole("button", { name: "Choose track" })
+    expect(submit).toBeDisabled()
+
+    await user.click(
+      within(dialog).getByRole("radio", { name: /Methods Track/ }),
+    )
+    await user.click(
+      within(dialog).getByRole("button", { name: "Choose Methods Track" }),
+    )
+
+    await expectTrackSaved(program.id, methodsId, "Methods Track courses")
+    expect(
+      screen.getAllByRole("heading", { level: 2 }).map((h) => h.textContent),
+    ).toEqual(["Core Courses", "Methods Track courses", "Capstone"])
+    expect(screen.queryByText("Not selected")).not.toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "Change track" })).toBeVisible()
+    // Core, the chosen track and the capstone each have one course.
+    expect(screen.getByTestId("program-completion-count")).toHaveTextContent(
+      /You have completed 0 of 3/,
+    )
+  })
+
+  test("Changing tracks starts on the current track and saves a different one", async () => {
+    const { program, enrollment, methodsId } =
+      setupTrackedProgram("General Track")
+    renderWithProviders(<ProgramEnrollmentDisplay programId={program.id} />)
+
+    await screen.findByRole("heading", { name: "General Track courses" })
+    const updated = {
+      ...enrollment,
+      track: { id: methodsId, title: "Methods Track" },
+    }
+    setMockResponse.patch(
+      mitxonline.urls.programEnrollments.programEnrollment(program.id),
+      updated,
+    )
+    setMockResponse.get(
+      mitxonline.urls.programEnrollments.enrollmentsListV3(),
+      [updated],
+    )
+    await user.click(screen.getByRole("button", { name: "Change track" }))
+    const dialog = await screen.findByRole("dialog", { name: "Change track" })
+    expect(
+      within(dialog).getByRole("radio", { name: /General Track/ }),
+    ).toBeChecked()
+    expect(
+      within(dialog).getByRole("button", { name: "Switch track" }),
+    ).toBeDisabled()
+
+    await user.click(
+      within(dialog).getByRole("radio", { name: /Methods Track/ }),
+    )
+    await user.click(
+      within(dialog).getByRole("button", { name: "Switch to Methods Track" }),
+    )
+
+    await expectTrackSaved(program.id, methodsId, "Methods Track courses")
+    expect(
+      screen.queryByRole("heading", { name: "General Track courses" }),
+    ).not.toBeInTheDocument()
+  })
+})

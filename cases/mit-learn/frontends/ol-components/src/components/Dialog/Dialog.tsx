@@ -1,0 +1,211 @@
+import React, { useCallback, useId, useState } from "react"
+import styled from "@emotion/styled"
+import type { CSSObject } from "@emotion/react"
+import { theme } from "../ThemeProvider/ThemeProvider"
+import { default as MuiDialog } from "@mui/material/Dialog"
+import type { DialogProps as MuiDialogProps } from "@mui/material/Dialog"
+import { Button, ActionButton } from "@mitodl/smoot-design"
+import MuiDialogActions from "@mui/material/DialogActions"
+import { RiCloseLine } from "@remixicon/react"
+import MuiTypography from "@mui/material/Typography"
+
+const Close = styled.div`
+  position: absolute;
+  top: 11px;
+  right: 20px;
+`
+
+const Header = styled.div`
+  border-bottom: 1px solid ${theme.custom.colors.lightGray2};
+  background-color: ${theme.custom.colors.lightGray1};
+  padding: 20px 58px 20px 28px;
+`
+
+const Content = styled.div<{ css?: CSSObject }>(({ css }) => ({
+  margin: "28px",
+  minHeight: 0,
+  overflow: "auto",
+  ...css,
+}))
+
+const DialogActions = styled(MuiDialogActions)`
+  margin: 0 28px 28px;
+  padding: 0;
+  gap: 4px;
+
+  button {
+    margin-left: 0;
+  }
+`
+
+const HeaderTitle = styled(MuiTypography)`
+  display: flex;
+  align-items: center;
+  gap: 12px;
+` as typeof MuiTypography
+
+type DialogProps = {
+  className?: string
+  contentCss?: CSSObject
+  open: boolean
+  onClose: () => void
+  onConfirm?: () => void | Promise<void>
+  title?: React.ReactNode
+  message?: string
+  children?: React.ReactNode
+  /**
+   * Sets the text for the cancel button. If `null`, the cancel button is not
+   * rendered.
+   */
+  cancelText?: string | null
+  /**
+   * Sets the text for the confirm button. If `null`, the confirm button is not
+   * rendered.
+   */
+  confirmText?: string | null
+  /**
+   * Defaults to `true`. If `true`, dialog grows to `maxWidth`. See
+   * [Dialog Props](https://mui.com/material-ui/api/dialog/#props).
+   */
+  fullWidth?: boolean
+  isSubmitting?: boolean
+  PaperProps?: MuiDialogProps["PaperProps"]
+  actions?: React.ReactNode
+  disableEnforceFocus?: MuiDialogProps["disableEnforceFocus"]
+  maxWidth?: MuiDialogProps["maxWidth"]
+  disabled?: boolean
+  scroll?: MuiDialogProps["scroll"]
+  TransitionProps?: NonNullable<MuiDialogProps["slotProps"]>["transition"]
+  "aria-describedby"?: string
+  /**
+   * Id of an element whose text joins the title in the dialog's accessible
+   * name. Use when something in the content identifies what the dialog acts on
+   * and must be announced: screen readers read a dialog's name on open, but not
+   * its contents, so content-only detail is otherwise never spoken.
+   */
+  additionalLabelledBy?: string
+  role?: MuiDialogProps["role"]
+  showCloseButton?: boolean
+}
+
+/**
+ * A basic modal dialog.
+ *
+ * This is useful for things like confirmation or notifications, but not
+ * particularly good for forms, where a <form /> element should wrap the inputs
+ * and footer buttons.
+ */
+const Dialog: React.FC<DialogProps> = ({
+  title,
+  children,
+  message,
+  open,
+  onClose,
+  onConfirm,
+  cancelText = "Cancel",
+  confirmText = "Confirm",
+  fullWidth,
+  className,
+  contentCss,
+  actions,
+  isSubmitting = false,
+  PaperProps,
+  disableEnforceFocus,
+  maxWidth,
+  disabled = false,
+  scroll,
+  TransitionProps,
+  "aria-describedby": ariaDescribedBy,
+  additionalLabelledBy,
+  role,
+  showCloseButton = true,
+}) => {
+  const [confirming, setConfirming] = useState(isSubmitting)
+  const titleId = useId()
+  const labelledBy = additionalLabelledBy
+    ? `${titleId} ${additionalLabelledBy}`
+    : titleId
+
+  const handleConfirm = useCallback(async () => {
+    try {
+      setConfirming(true)
+      if (onConfirm) {
+        await onConfirm()
+      }
+      onClose()
+    } catch {
+      /**
+       * A rejected onConfirm means the action failed, so skip onClose and
+       * leave the dialog open to retry from. Swallowed rather than re-thrown:
+       * nothing can catch it (React drops the promise this click handler
+       * returns, making it an unhandled rejection), and reporting the failure
+       * belongs to the caller, which owns the request.
+       */
+    } finally {
+      setConfirming(false)
+    }
+  }, [onClose, onConfirm])
+
+  return (
+    <MuiDialog
+      className={className}
+      fullWidth={fullWidth}
+      open={open}
+      onClose={onClose}
+      disableEnforceFocus={disableEnforceFocus}
+      slotProps={{
+        paper: PaperProps,
+        transition: TransitionProps,
+      }}
+      aria-labelledby={labelledBy}
+      aria-describedby={ariaDescribedBy}
+      role={role}
+      transitionDuration={process.env.NODE_ENV === "test" ? 0 : undefined}
+      maxWidth={maxWidth}
+      scroll={scroll}
+    >
+      {showCloseButton && (
+        <Close>
+          <ActionButton variant="text" onClick={onClose} aria-label="Close">
+            <RiCloseLine />
+          </ActionButton>
+        </Close>
+      )}
+      {title && (
+        <Header>
+          <HeaderTitle id={titleId} component="h1" variant="h5">
+            {title}
+          </HeaderTitle>
+        </Header>
+      )}
+      <Content css={contentCss}>
+        {message && <MuiTypography variant="body1">{message}</MuiTypography>}
+        {children}
+      </Content>
+      {actions !== undefined ? (
+        actions
+      ) : (
+        <DialogActions>
+          {cancelText === null ? null : (
+            <Button variant="secondary" onClick={onClose}>
+              {cancelText}
+            </Button>
+          )}
+          {confirmText === null ? null : (
+            <Button
+              variant="primary"
+              type="submit"
+              onClick={onConfirm && handleConfirm}
+              disabled={confirming || isSubmitting || disabled}
+            >
+              {confirmText}
+            </Button>
+          )}
+        </DialogActions>
+      )}
+    </MuiDialog>
+  )
+}
+
+export { Dialog, DialogActions }
+export type { DialogProps }

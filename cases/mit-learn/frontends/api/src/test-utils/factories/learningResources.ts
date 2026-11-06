@@ -1,0 +1,756 @@
+import { faker } from "@faker-js/faker/locale/en"
+import { startCase } from "lodash"
+import type { Factory, PartialFactory } from "ol-test-utilities"
+import { UniqueEnforcer } from "enforce-unique"
+import { makePaginatedFactory, mergeOverrides } from "ol-test-utilities"
+import type {
+  ContentFile,
+  CourseNumber,
+  CourseResource,
+  LearningPathRelationship,
+  LearningPathResource,
+  LearningResource,
+  LearningResourceBaseDepartment,
+  LearningResourceBaseSchool,
+  LearningResourceDepartment,
+  LearningResourceImage,
+  LearningResourceInstructor,
+  LearningResourceOfferorDetail,
+  LearningResourcePlatform,
+  LearningResourcePrice,
+  LearningResourceRun,
+  LearningResourceSchool,
+  LearningResourceTopic,
+  MicroLearningPathRelationship,
+  PaginatedLearningPathRelationshipList,
+  PodcastResource,
+  PodcastEpisodeResource,
+  ProgramResource,
+  VideoPlaylistResource,
+  VideoResource,
+  LearningResourceRelationship,
+  LearningResourceSummary,
+  DocumentResource,
+} from "api"
+import {
+  AvailabilityEnum,
+  DeliveryEnum,
+  CourseResourcePaceInnerCodeEnum,
+  CourseResourceFormatInnerCodeEnum,
+  ResourceTypeEnum,
+  LearningResourceRunLevelInnerCodeEnum,
+  PlatformEnum,
+  CourseResourceCertificationTypeCodeEnum,
+  ContentFileContentTypeEnum,
+  ResourceTypeGroupEnum,
+} from "api"
+
+const uniqueEnforcerId = new UniqueEnforcer()
+const uniqueEnforcerWords = new UniqueEnforcer()
+const maybe = faker.helpers.maybe
+type RepeatOptins = { min?: number; max?: number }
+type LearningResourceFactory<T> = PartialFactory<Omit<T, "resource_type">, T>
+/**
+ * Repeat a callback a random number of times
+ */
+const repeat = <T>(cb: () => T, { min = 2, max = 4 }: RepeatOptins = {}) => {
+  const count = faker.number.int({ min, max })
+  return Array.from({ length: count }, cb)
+}
+
+const language = () =>
+  faker.helpers.arrayElement([
+    "en-us",
+    "es-es",
+    "ar-ar",
+    "zh-cn",
+    "fr-fr",
+    "pt-pt",
+  ])
+
+const learningResourceImage: Factory<LearningResourceImage> = (
+  overrides = {},
+) => ({
+  id: uniqueEnforcerId.enforce(() => faker.number.int()),
+  url: new URL(faker.internet.url()).toString(),
+  description: faker.lorem.words(),
+  alt: faker.lorem.words(),
+  ...overrides,
+})
+
+const learningResourceInstructor: Factory<LearningResourceInstructor> = (
+  overrides = {},
+) => {
+  const instructor: LearningResourceInstructor = {
+    id: uniqueEnforcerId.enforce(() => faker.number.int()),
+    first_name: maybe(faker.person.firstName),
+    last_name: maybe(faker.person.lastName),
+    full_name: maybe(faker.person.fullName),
+    ...overrides,
+  }
+  return instructor
+}
+
+const learningResourcePrice: Factory<LearningResourcePrice> = (
+  overrides = {},
+) => {
+  const resourcePrice: LearningResourcePrice = {
+    amount: faker.finance.amount({ min: 0, max: 200 }),
+    currency: "USD",
+    ...overrides,
+  }
+  return resourcePrice
+}
+
+const learningResourceBaseSchool: Factory<LearningResourceBaseSchool> = (
+  overrides = {},
+) => {
+  return {
+    id: uniqueEnforcerId.enforce(() => faker.number.int()),
+    name: faker.lorem.words(3),
+    url: faker.internet.url(),
+    ...overrides,
+  }
+}
+
+const learningResourceBaseDepartment: Factory<
+  LearningResourceBaseDepartment
+> = (overrides = {}) => {
+  return {
+    department_id: uniqueEnforcerWords.enforce(() => faker.lorem.words()),
+    name: uniqueEnforcerWords.enforce(() => faker.lorem.words()),
+    channel_url: `${faker.internet.url({ appendSlash: false })}${faker.system.directoryPath()}`,
+    ...overrides,
+  }
+}
+
+const learningResourceDepartment: Factory<LearningResourceDepartment> = (
+  overrides = {},
+) => {
+  return {
+    ...learningResourceBaseDepartment(),
+    school: maybe(learningResourceBaseSchool) ?? null,
+    ...overrides,
+  }
+}
+const departments = makePaginatedFactory(learningResourceDepartment)
+
+const learnigResourceSchool: Factory<LearningResourceSchool> = (
+  overrides = {},
+) => {
+  return {
+    id: uniqueEnforcerId.enforce(() => faker.number.int()),
+    name: faker.lorem.words(3),
+    url: faker.internet.url(),
+    departments: repeat(learningResourceBaseDepartment),
+    ...overrides,
+  }
+}
+const schools = makePaginatedFactory(learnigResourceSchool)
+
+const learningResourcePlatform: Factory<LearningResourcePlatform> = (
+  overrides = {},
+) => {
+  return {
+    code: faker.helpers.arrayElement(
+      Object.values([
+        PlatformEnum.Edx,
+        PlatformEnum.Mitxonline,
+        PlatformEnum.Xpro,
+      ]),
+    ),
+    name: uniqueEnforcerWords.enforce(() => faker.lorem.words()),
+    ...overrides,
+  }
+}
+
+const learningResourceOfferor: Factory<LearningResourceOfferorDetail> = (
+  overrides = {},
+) => {
+  return {
+    code: uniqueEnforcerWords.enforce(() => faker.lorem.words()),
+    name: uniqueEnforcerWords.enforce(() => faker.lorem.words()),
+    channel_url: faker.internet.url(),
+    offerings: repeat(faker.lorem.word),
+    audience: repeat(faker.lorem.word),
+    formats: repeat(faker.lorem.word),
+    fee: repeat(faker.lorem.word),
+    certifications: repeat(faker.lorem.word),
+    content_types: repeat(faker.lorem.word),
+    more_information: faker.internet.url(),
+    ...overrides,
+  }
+}
+const learningResourceOfferors = makePaginatedFactory(learningResourceOfferor)
+const learningResourcePlatforms = makePaginatedFactory(learningResourcePlatform)
+
+const learningResourceRun: Factory<LearningResourceRun> = (overrides = {}) => {
+  const start = overrides.start_date
+    ? new Date(overrides.start_date)
+    : faker.helpers.arrayElement([faker.date.past(), faker.date.future()])
+  const end = faker.date.future({ years: 1, refDate: start })
+
+  const run: LearningResourceRun = {
+    id: uniqueEnforcerId.enforce(() => faker.number.int()),
+    instructors: maybe(() => repeat(learningResourceInstructor)) ?? null,
+    image: maybe(learningResourceImage) ?? null,
+    run_id: uniqueEnforcerWords.enforce(() => faker.lorem.words()),
+    title: faker.lorem.words(),
+    languages: maybe(() => repeat(language, { min: 0, max: 3 })),
+    start_date: start.toISOString(),
+    end_date: end.toISOString(),
+    availability: faker.helpers.arrayElement(Object.values(AvailabilityEnum)),
+    delivery: [
+      {
+        code: faker.helpers.arrayElement(Object.values(DeliveryEnum)),
+        name: uniqueEnforcerWords.enforce(() => faker.lorem.words()),
+      },
+    ],
+    pace: [
+      {
+        code: faker.helpers.arrayElement(
+          Object.values(CourseResourcePaceInnerCodeEnum),
+        ),
+        name: uniqueEnforcerWords.enforce(() => faker.lorem.words()),
+      },
+    ],
+    format: [
+      {
+        code: faker.helpers.arrayElement(
+          Object.values(CourseResourceFormatInnerCodeEnum),
+        ),
+        name: uniqueEnforcerWords.enforce(() => faker.lorem.words()),
+      },
+    ],
+    level: [
+      {
+        code: faker.helpers.arrayElement(
+          Object.values(LearningResourceRunLevelInnerCodeEnum),
+        ),
+        name: uniqueEnforcerWords.enforce(() => faker.lorem.words()),
+      },
+    ],
+    resource_prices: repeat(learningResourcePrice, { min: 0, max: 5 }),
+    ...overrides,
+  }
+  return run
+}
+
+const contentFile: Factory<ContentFile> = (overrides = {}) => {
+  return {
+    id: uniqueEnforcerId.enforce(() => faker.number.int()),
+    departments: repeat(learningResourceDepartment, { min: 0, max: 3 }),
+    topics: repeat(learningResourceTopic, { min: 0, max: 3 }),
+    require_summaries: faker.datatype.boolean(),
+    content_feature_type: repeat(faker.lorem.word, { min: 0, max: 3 }),
+    resource_id: uniqueEnforcerId.enforce(() => faker.number.int()).toString(),
+    resource_readable_id: faker.string.alphanumeric(32).toLowerCase(),
+    course_number: repeat(faker.lorem.word, { min: 0, max: 3 }),
+    offered_by: learningResourceOfferor(),
+    platform: learningResourcePlatform(),
+    title: faker.lorem.sentence(),
+    description: faker.lorem.paragraph(),
+    key: faker.string.uuid(),
+    uid: faker.string.uuid(),
+    url: faker.internet.url(),
+    content_type: faker.helpers.arrayElement(
+      Object.values(ContentFileContentTypeEnum),
+    ),
+    content: faker.lorem.paragraph(),
+    ...overrides,
+  }
+}
+
+const learningResourceTopic: Factory<LearningResourceTopic> = (
+  overrides = {},
+) => {
+  const topic: LearningResourceTopic = {
+    id: uniqueEnforcerId.enforce(() => faker.number.int()),
+    name: uniqueEnforcerWords.enforce(() => faker.lorem.words()),
+    channel_url: `${faker.internet.url({ appendSlash: false })}${faker.system.directoryPath()}`,
+    parent: null,
+    ...overrides,
+  }
+  return topic
+}
+
+const learningResourceTopics = makePaginatedFactory(learningResourceTopic)
+
+const learningResourceType = () =>
+  faker.helpers.arrayElement(Object.values(ResourceTypeEnum))
+
+const learningResourceCourseNumber: Factory<CourseNumber> = (
+  overrides = {},
+) => {
+  return {
+    department: learningResourceDepartment(),
+    value: faker.lorem.word(),
+    listing_type: "primary",
+    primary: faker.datatype.boolean(),
+    sort_coursenum: faker.lorem.word(),
+    ...overrides,
+  }
+}
+
+/**
+ * The app origin, matching NEXT_PUBLIC_ORIGIN in the main workspace's jest
+ * setup. Hardcoded rather than randomised per call: a drawer URL is always on
+ * the same host as the site itself, and code that distinguishes internal links
+ * from external ones relies on that. A random host would hide such a bug.
+ */
+const TEST_APP_ORIGIN = "http://test.learn.odl.local:8062"
+
+/**
+ * Default `learn_url`: the drawer, the one location every resource has.
+ * Deliberately not resource-type aware — a test that cares about a dedicated
+ * page overrides it.
+ */
+const drawerLearnUrl = (id: number) =>
+  `${TEST_APP_ORIGIN}/search?resource=${id}`
+
+const _learningResourceShared = (
+  overrides: { id?: number } = {},
+): Partial<Omit<LearningResource, "resource_type">> => {
+  const free = Math.random() < 0.5
+  // Honour an overridden id, or learn_url would address a different resource
+  // than the one the factory returns. mergeOverrides applies `overrides` after
+  // this, so it cannot re-derive learn_url on its own.
+  const id = overrides.id ?? uniqueEnforcerId.enforce(() => faker.number.int())
+  return {
+    id,
+    professional: faker.datatype.boolean(),
+    certification: false,
+    departments: [learningResourceDepartment()],
+    description: faker.lorem.paragraph(),
+    position: faker.number.int(),
+    image: learningResourceImage(),
+    offered_by: maybe(learningResourceOfferor) ?? null,
+    platform: maybe(learningResourcePlatform) ?? null,
+    free,
+    prices: free ? ["0"] : [faker.finance.amount({ min: 0, max: 100 })],
+    resource_prices: free
+      ? [{ amount: "0", currency: "USD" }]
+      : [
+          {
+            amount: faker.finance.amount({ min: 0, max: 100 }).toString(),
+            currency: "USD",
+          },
+        ],
+    readable_id: faker.lorem.slug(),
+    course_feature: repeat(faker.lorem.word),
+    runs: [],
+    published: faker.datatype.boolean(),
+    title: startCase(faker.lorem.words()),
+    topics: repeat(learningResourceTopic),
+    /**
+     * In practice this is something like "Course", "Program", or "Podcast Episode",
+     * but it's just a string as far as the frontend is concerned.
+     */
+    resource_category: faker.lorem.word(),
+    url: faker.internet.url(),
+    learn_url: drawerLearnUrl(id),
+    url_slug: faker.lorem.slug(),
+  }
+}
+
+const learningResource: PartialFactory<LearningResource> = (overrides = {}) => {
+  overrides = mergeOverrides(
+    {
+      resource_type: learningResourceType(),
+    },
+    overrides,
+  )
+  switch (overrides.resource_type) {
+    case ResourceTypeEnum.Program:
+      return program(overrides)
+    case ResourceTypeEnum.Course:
+      return course(overrides)
+    case ResourceTypeEnum.LearningPath:
+      return learningPath(overrides)
+    case ResourceTypeEnum.Podcast:
+      return podcast(overrides)
+    case ResourceTypeEnum.PodcastEpisode:
+      return podcastEpisode(overrides)
+    case ResourceTypeEnum.VideoPlaylist:
+      return videoPlaylist(overrides)
+    case ResourceTypeEnum.Video:
+      return video(overrides)
+    case ResourceTypeEnum.Document:
+      return document(overrides)
+
+    default:
+      throw Error(`Invalid resource type: ${overrides.resource_type}`)
+  }
+}
+
+const learningResources = makePaginatedFactory(learningResource)
+
+// Not a LearningResourceFactory: summaries carry every resource type, so
+// resource_type has to be overridable.
+const learningResourceSummary: Factory<LearningResourceSummary> = (
+  overrides = {},
+) => {
+  const id = overrides.id ?? uniqueEnforcerId.enforce(() => faker.number.int())
+  return {
+    id,
+    last_modified: faker.date.recent().toISOString(),
+    url: faker.internet.url(),
+    title: faker.lorem.words(3),
+    resource_type: learningResourceType(),
+    canonical_parent_ids: [],
+    learn_url: drawerLearnUrl(id),
+    ...overrides,
+  }
+}
+const learningResourceSummaries = makePaginatedFactory(learningResourceSummary)
+
+const program: PartialFactory<ProgramResource> = (overrides = {}) => {
+  const certificationCode = faker.helpers.enumValue(
+    CourseResourceCertificationTypeCodeEnum,
+  )
+  return mergeOverrides<ProgramResource>(
+    _learningResourceShared(overrides),
+    {
+      resource_type: ResourceTypeEnum.Program,
+
+      resource_type_group: faker.helpers.arrayElement([
+        ResourceTypeGroupEnum.Program,
+        // some programs ingested from mitxonline have resource_type_group: course
+        ResourceTypeGroupEnum.Course,
+      ]),
+    },
+    {
+      offered_by: learningResourceOfferor(),
+      platform: learningResourcePlatform(),
+      certification: faker.datatype.boolean(),
+      program: {
+        course_count: faker.number.int({ min: 0, max: 8 }),
+      },
+      certification_type: {
+        code: certificationCode,
+        name: {
+          [CourseResourceCertificationTypeCodeEnum.Professional]:
+            "Professional Certificate",
+          [CourseResourceCertificationTypeCodeEnum.Micromasters]:
+            "MicroMasters Credential",
+          [CourseResourceCertificationTypeCodeEnum.Completion]:
+            "Certificate of Completion",
+          [CourseResourceCertificationTypeCodeEnum.None]: "No Certificate",
+        }[certificationCode],
+      },
+    },
+    overrides,
+  )
+}
+const programs = makePaginatedFactory(program)
+
+const course: LearningResourceFactory<CourseResource> = (overrides = {}) => {
+  const certificationCode = faker.helpers.enumValue(
+    CourseResourceCertificationTypeCodeEnum,
+  )
+  return mergeOverrides<CourseResource>(
+    _learningResourceShared(overrides),
+    {
+      resource_type: ResourceTypeEnum.Course,
+
+      resource_type_group: ResourceTypeGroupEnum.Course,
+    },
+    {
+      offered_by: learningResourceOfferor(),
+      platform: learningResourcePlatform(),
+      runs: repeat(learningResourceRun, { min: 1, max: 5 }),
+      certification: faker.datatype.boolean(),
+      certification_type: {
+        code: certificationCode,
+        name: {
+          [CourseResourceCertificationTypeCodeEnum.Professional]:
+            "Professional Certificate",
+          [CourseResourceCertificationTypeCodeEnum.Micromasters]:
+            "MicroMasters Credential",
+          [CourseResourceCertificationTypeCodeEnum.Completion]:
+            "Certificate of Completion",
+          [CourseResourceCertificationTypeCodeEnum.None]: "No Certificate",
+        }[certificationCode],
+      },
+      course: {
+        course_numbers:
+          maybe(() => repeat(learningResourceCourseNumber)) ?? null,
+      },
+    },
+    overrides,
+  )
+}
+const courses = makePaginatedFactory(course)
+
+const learningPath: LearningResourceFactory<LearningPathResource> = (
+  overrides = {},
+) => {
+  return mergeOverrides<LearningPathResource>(
+    _learningResourceShared(overrides),
+    {
+      resource_type: ResourceTypeEnum.LearningPath,
+
+      resource_type_group: ResourceTypeGroupEnum.LearningMaterial,
+    },
+    {
+      learning_path: {
+        id: uniqueEnforcerId.enforce(() => faker.number.int()),
+        item_count: faker.number.int({ min: 1, max: 30 }),
+      },
+    },
+    overrides,
+  )
+}
+const learningPaths = makePaginatedFactory(learningPath)
+
+const microLearningPathRelationship: Factory<MicroLearningPathRelationship> = (
+  overrides = {},
+) => {
+  return {
+    id: uniqueEnforcerId.enforce(() => faker.number.int()),
+    child: uniqueEnforcerId.enforce(() => faker.number.int()),
+    parent: uniqueEnforcerId.enforce(() => faker.number.int()),
+    ...overrides,
+  }
+}
+
+const learningResourceRelationship: Factory<LearningResourceRelationship> = (
+  overrides = {},
+) => {
+  const micro = microLearningPathRelationship()
+  const resource = learningResource({
+    id: micro.child,
+  })
+  return {
+    ...micro,
+    position: faker.number.int(),
+    resource,
+    ...overrides,
+  }
+}
+const learningResourceRelationships = ({
+  count,
+  parent,
+  pageSize,
+  next = null,
+  previous = null,
+}: {
+  count: number
+  parent: number
+  pageSize?: number
+  next?: string | null
+  previous?: string | null
+}) => {
+  const results: LearningPathRelationship[] = Array(pageSize ?? count)
+    .fill(null)
+    .map((_val, index) => {
+      return learningResourceRelationship({
+        position: index + 1,
+        parent,
+      })
+    })
+  return {
+    count,
+    next,
+    previous,
+    results,
+  } satisfies PaginatedLearningPathRelationshipList
+}
+
+const learningPathRelationship: Factory<LearningPathRelationship> = (
+  overrides = {},
+) => {
+  const micro = microLearningPathRelationship()
+  const resource = learningResource({
+    id: micro.child,
+  })
+  return {
+    ...micro,
+    position: faker.number.int(),
+    resource,
+    ...overrides,
+  }
+}
+
+const learningPathRelationships = ({
+  count,
+  parent,
+  pageSize,
+  next = null,
+  previous = null,
+}: {
+  count: number
+  parent: number
+  pageSize?: number
+  next?: string | null
+  previous?: string | null
+}) => {
+  const results: LearningPathRelationship[] = Array(pageSize ?? count)
+    .fill(null)
+    .map((_val, index) => {
+      return learningPathRelationship({
+        position: index + 1,
+        parent,
+      })
+    })
+  return {
+    count,
+    next,
+    previous,
+    results,
+  } satisfies PaginatedLearningPathRelationshipList
+}
+
+const podcast: LearningResourceFactory<PodcastResource> = (overrides = {}) => {
+  return mergeOverrides<PodcastResource>(
+    _learningResourceShared(overrides),
+    {
+      resource_type: ResourceTypeEnum.Podcast,
+
+      resource_type_group: ResourceTypeGroupEnum.LearningMaterial,
+    },
+    {
+      podcast: {
+        id: uniqueEnforcerId.enforce(() => faker.number.int()),
+        episode_count: faker.number.int({ min: 1, max: 70 }),
+      },
+    },
+    overrides,
+  )
+}
+const podcasts = makePaginatedFactory(podcast)
+
+const document: LearningResourceFactory<DocumentResource> = (
+  overrides = {},
+) => {
+  return mergeOverrides<DocumentResource>(
+    _learningResourceShared(overrides),
+    {
+      resource_type: ResourceTypeEnum.Document,
+
+      resource_type_group: ResourceTypeGroupEnum.LearningMaterial,
+    },
+    {},
+    overrides,
+  )
+}
+
+const podcastEpisode: LearningResourceFactory<PodcastEpisodeResource> = (
+  overrides = {},
+): PodcastEpisodeResource => {
+  const parentPodcastId = uniqueEnforcerId.enforce(() => faker.number.int())
+  return mergeOverrides<PodcastEpisodeResource>(
+    _learningResourceShared(overrides),
+    {
+      resource_type: ResourceTypeEnum.PodcastEpisode,
+
+      resource_type_group: ResourceTypeGroupEnum.LearningMaterial,
+    },
+    {
+      podcast_episode: {
+        id: uniqueEnforcerId.enforce(() => faker.number.int()),
+        podcasts: [parentPodcastId],
+        parent_podcasts: [
+          {
+            id: parentPodcastId,
+            title: faker.lorem.words(3),
+            readable_id: faker.string.uuid(),
+            learn_url: `${TEST_APP_ORIGIN}/podcast/${parentPodcastId}/podcast`,
+          },
+        ],
+        duration: faker.helpers.arrayElement(["PT1H13M44S", "PT2H30M", "PT1M"]),
+        audio_url: faker.internet.url(),
+        episode_link: faker.internet.url(),
+        // Most episodes have no transcript: only 9 of the 38 feeds Learn
+        // ingests publish a podcast:transcript tag. Opt in per test.
+        has_transcript: false,
+      },
+    },
+    overrides,
+  )
+}
+
+const podcastEpisodes = makePaginatedFactory(podcastEpisode)
+
+const video: LearningResourceFactory<VideoResource> = (overrides = {}) => {
+  return mergeOverrides<VideoResource>(
+    _learningResourceShared(overrides),
+    {
+      resource_type: ResourceTypeEnum.Video,
+
+      resource_type_group: ResourceTypeGroupEnum.LearningMaterial,
+    },
+    {
+      video: {
+        duration: faker.number.int({ min: 1, max: 70 }).toString(),
+      },
+    },
+    overrides,
+  )
+}
+const videos = makePaginatedFactory(video)
+
+const videoPlaylist: LearningResourceFactory<VideoPlaylistResource> = (
+  overrides = {},
+): VideoPlaylistResource => {
+  return mergeOverrides<VideoPlaylistResource>(
+    _learningResourceShared(overrides),
+    {
+      resource_type: ResourceTypeEnum.VideoPlaylist,
+
+      resource_type_group: ResourceTypeGroupEnum.LearningMaterial,
+    },
+    {
+      video_playlist: {
+        video_count: faker.number.int({ min: 1, max: 100 }),
+        channel: {
+          channel_id: uniqueEnforcerId
+            .enforce(() => faker.number.int())
+            .toString(),
+          title: faker.lorem.words(),
+        },
+      },
+    },
+    overrides,
+  )
+}
+
+const videoPlaylists = makePaginatedFactory(videoPlaylist)
+
+export {
+  learningResource as resource,
+  learningResources as resources,
+  learningResourceSummaries as resourceSummaries,
+  learningResourceSummary as resourceSummary,
+  learningResourceRun as run,
+  contentFile,
+  learningResourceImage as image,
+  learningResourceDepartment as department,
+  departments,
+  learningResourceTopic as topic,
+  learningResourceTopics as topics,
+  learningResourceOfferor as offeror,
+  learningResourceOfferors as offerors,
+  learningResourcePlatforms as platforms,
+  learningPath,
+  learningPaths,
+  microLearningPathRelationship,
+  learningPathRelationship,
+  learningPathRelationships,
+  learningResourceRelationship,
+  learningResourceRelationships,
+  program,
+  programs,
+  course,
+  courses,
+  podcast,
+  podcasts,
+  podcastEpisode,
+  podcastEpisodes,
+  video,
+  videos,
+  videoPlaylist,
+  videoPlaylists,
+  learnigResourceSchool as school,
+  schools,
+}

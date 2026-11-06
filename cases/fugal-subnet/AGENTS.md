@@ -1,0 +1,165 @@
+# AGENTS.md — AI Agent Instructions
+
+Instructions for AI coding agents working on this codebase.
+
+## Project Overview
+
+Fugal is a Bittensor subnet for continuous LLM router optimization. Miners run
+TEE-attested benchmarks inside Intel TDX confidential VMs — they load their
+trained router head, call models via a metered proxy, and produce
+hardware-attested proofs of their results. Validators verify proofs (never call
+models) and set on-chain weights proportional to routing quality. Evidence
+accumulation pools results across epochs for noise-resistant Wilson LCB scores.
+
+## Critical Constraints
+
+These are non-negotiable. Violating any of them breaks the subnet:
+
+1. **NO `from __future__ import annotations` in `neurons/miner.py`
+   or `fugal_subnet/protocol.py`.**
+   Bittensor SDK v10.x `bt.Axon.attach()` inspects type annotations at runtime.
+   Deferred annotations (PEP 563) break this introspection and the axon silently
+   fails to register the forward function. Other files are fine.
+
+2. **All `np.load()` calls MUST use `allow_pickle=False`.**
+   Miners submit `.npz` files. `allow_pickle=True` on untrusted data is remote
+   code execution. Grep for `np.load` before committing — every instance must
+   have `allow_pickle=False`.
+
+3. **Every Axon-attached Synapse `deserialize()` MUST return `self`, not a dict.**
+   Bittensor's `dendrite.call()` calls `synapse.deserialize()`. If it returns a
+   dict, the validator receives dicts instead of Synapse objects and attribute
+   access breaks silently. The mock in `tests/bt_mock.py` mirrors this contract.
+
+4. **NO API credit spend without explicit user approval.**
+   Any code path that calls OpenRouter costs real money. Tag costs in comments
+   as `[PAID ~$X]`. Never auto-run real API calls in tests or scripts without
+   `--mock` being the default. The validator is the exception: it makes no
+   model calls and defaults to `--live` (mock accepts unattested proofs); both
+   neurons refuse `--mock` when the chain's genesis hash is finney's.
+
+5. **NEVER print or log any part of `OPENROUTER_API_KEY`.**
+   Not even the last 4 characters. Log "Key is set" or "Key not set", nothing more.
+
+## SDK Version
+
+Bittensor SDK v10.x (10.0.0 - 10.x). Key behaviors:
+
+- `bt.Wallet` (capital W), `bt.Subtensor`, `bt.Dendrite`, `bt.Axon`
+- `dendrite.query()` returns a list of Synapse objects (one per axon)
+- `subtensor.set_weights()` auto-uses commit-reveal-weights when the chain enables it
+- `subtensor.query_map()` for reading on-chain storage (used by commitments.py)
+- Wallet creation: `bt.Wallet(name=coldkey, hotkey=hotkey, path=wallet_path)`
+
+## Architecture — What Each File Does
+
+### TEE pipeline (miner side, inside TDX VM)
+1. `tee/harness.py` → runs benchmark: loads head, routes questions, calls models via proxy, grades, produces proof
+2. `tee/runtime.py` → MeteringProxy (records API calls with token counts/costs) + TEERuntime (TDX attestation)
+3. `tee/provision.py` → the attested, sealed provisioning channel (head, wallet, API key in; operator-only log pull out)
+4. `tee/proof.py` → BenchmarkProof and QuestionResult data models
+5. `tee/attestation.py` → TDX v4 quote parsing + DCAP verification (forked from ThirtySpokes/Chutes)
+
+### Validator pipeline (verification, no model calls)
+1. `benchmarks/loader.py` + individual loaders → load question pool (pinned HF revisions)
+2. `benchmarks/slicer.py` → HMAC-seeded stratified question selection
+3. `protocol.py` → FugalProofSynapse wire format (epoch_id + nonce → proof_json + head_npz_b64 + proof_hash + weights_hash + event_log_json, all inline and size-capped)
+4. `commitments.py` → read/write on-chain head commitments (Commitments pallet)
+5. `tee/verify.py` → verify TEE proofs (DCAP attestation, measurement match, nonce, questions hash, cost consistency)
+6. `graders.py` → 7 deterministic mechanical checkers (consensus-critical, hash-versioned)
+7. `grading_task.py` → loader question → grader task translation (shared by the TEE harness and every validator-side consumer so grading cannot drift)
+8. `exploration.py` → nonce-derived exploration assignment (recovers the counterfactual the TEE removes)
+9. `reference_frame.py` → per-model accuracy and verbosity pooled over time from nonce-assigned exploration; the frontier is built from it
+10. `evidence.py` → EWMA-decayed evidence accumulation with Wilson LCB, effective-n capped by pool size
+11. `frontier.py` + `scoring.py` → headroom above the constant-policy frontier (upper convex hull of per-model cost/accuracy from the frame), quality floor, burn-in ramp, frontier confidence
+12. `rewards.py` → weight computation (single pool, weight capping ±0.3/epoch)
+13. `dedup.py` → dedup: behavioural (cosine on routing decisions, GLOBAL model index space), parametric (`head_distance.py`, relative weight distance), and the epsilon rule (a near-copy must beat its senior); seniority is `commitments.seniority_key` (registration block, then commitment block); v1 only, see `copy_rule.py` for v2
+14. `champion.py` / `copy_rule.py` → protocol v2: the champion seat (paired NV test) and the copy rule (first-commit seniority, coldkey ownership, ghost incumbents; a junior must beat every senior seat holder by the champion margin)
+15. `commit_reveal.py` → commit-reveal integrity + publish epoch artifacts
+
+### Orchestrators
+- `neurons/validator.py` → TEE proof verification epoch loop (block-aligned, state-persistent)
+- `neurons/miner.py` → TEE miner (runs benchmarks each epoch, produces attested proofs)
+
+### Support
+- `config.py` → all env-overridable constants (single source), including TEE config. Read the comments: several constants record *why* a value is what it is, and some (the frame prior, the frontier warm-up) are measured rather than chosen.
+- `data/models.json` → the pinned price table. Consensus-critical and hash-pinned like `graders.py`: a price change re-scores every miner.
+- `backbone.py` → Qwen3-0.6B hidden state extraction (CPU float32 only, the pinned 2048-token profile; CUDA and float16 are refused)
+- `api.py` → call models via OpenRouter (used by miner inside TEE, not by validator)
+- `consensus.py` → offline multi-validator audit tool (not used in the live loop)
+- `epoch_logger.py` → structured JSONL logging
+
+## Graders Are Consensus Rules
+
+`graders.py` checkers are NOT ordinary code. They are consensus rules — every
+validator must produce byte-identical grades. A grader change is a consensus fork.
+
+- Never "improve" a grader casually
+- A semantic change requires a new grader version (applies from next epoch only)
+- The grader version is `sha256(graders.py bytes)`, pinned in `scripts/check_safety_invariants.py`
+- Run `python -m fugal_subnet.attacks.run_attacks` after any grader change — all 22 cases must pass with 0 surprises
+- `grading_task.py` is not the grader, but it decides what the grader sees. A change there changes every grade.
+
+## The Price Table Is Also A Consensus Rule
+
+`data/models.json` is the denominator every validator prices every proof
+against. It is hash-pinned in `scripts/check_safety_invariants.py` for the same
+reason `graders.py` is: an unreviewed edit silently re-scores the whole subnet.
+Changing prices means updating the pin in the same commit and saying why.
+
+## Consensus Invariants
+
+`docs/INVARIANTS.md` states the nine properties the subnet rests on (I1-I9),
+what enforces each, and the known gaps. A consensus-affecting change means
+updating that file and adding a check that enforces the property — the reason
+it exists is that a real consensus bug survived five code reviews because the
+property was never written down.
+
+`docs/OPEN_WORK.md` is the companion: what is unfinished, what was already
+decided and should not be re-litigated, and what to do next. Read it before
+picking up the PCCS/collateral work — the decisions in it cost several sessions
+to reach.
+
+## Testing
+
+```bash
+# Unit + integration tests (no API spend, no chain needed)
+python tests/test_integration.py
+
+# Attack suite (grader verification)
+python -m fugal_subnet.attacks.run_attacks
+
+# Full dress rehearsal: the shipped neurons against a real local chain (Docker)
+python scripts/dress_rehearsal.py --scenario all
+
+# Protocol v2 flip: v1 epochs, the activation block, v2 epochs (seat, 85/10/5,
+# E'' miss, restart mid-epoch). Chain half (Docker, ~30-60 min, not in "all"):
+python scripts/dress_rehearsal.py --scenario v2_flip
+# In-process half (seconds, no Docker; also run by tests/test_rehearsal_v2.py):
+python scripts/rehearsal_v2.py
+```
+
+Both v2 rehearsals probe which v2 pieces the branch has and SKIP (never fail)
+the checks whose code has not landed. Both shorten burn-in and a few seat
+constants so they finish quickly, and print the overrides they use.
+
+There is no paid validator path: the validator never calls a model and has no
+budget flag. Real spend only happens inside a `--live` miner, with a key pushed
+over the attested provisioning channel (`scripts/provision_td.py`).
+
+## Common Gotchas
+
+- **Docker logging**: use `print(..., flush=True)` — bittensor's loguru swallows
+  Python's logging module output in Docker containers
+- **Benchmark downloads**: `datasets` library required; benchmarks download on
+  first run, or once via `scripts/export_pool.py`. GPQA (gated) and LiveCodeBench
+  are skipped by the pinned manifest. **Never set `FUGAL_SKIP_BENCHMARKS` on a
+  neuron**: it replaces the manifest's skip list and the pool diverges silently
+- **Local chain**: `scripts/dress_rehearsal.py` (the shipped neurons as real
+  processes) or `docker compose up --build` (one in-container epoch). The
+  rehearsal sets `FUGAL_POOL_UNPINNED=1` for its fixture pool; the compose demo
+  builds a synthetic pool in-process and sets `FUGAL_REQUIRE_COMMITMENT=0`
+  because in-container miners run without chain commitments
+- **Weight setting on local chain**: the chain's 100-block rate limit means
+  consecutive `--once` runs may get "weights already set" — normal at local
+  testnet cadence, not an issue at 72-minute mainnet epochs

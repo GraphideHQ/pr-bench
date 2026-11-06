@@ -1,0 +1,308 @@
+"""Pluggy plugins for learning_resources_search"""
+
+import logging
+
+from celery import chain
+from django.apps import apps
+from django.conf import settings as django_settings
+from django.db import transaction
+
+from learning_resources.etl.constants import QDRANT_RETAINED_SOURCES
+from learning_resources.models import ContentFile, LearningResource
+from learning_resources_search import tasks
+from learning_resources_search.api import get_similar_topics_qdrant
+from learning_resources_search.constants import (
+    COURSE_TYPE,
+    PERCOLATE_INDEX_TYPE,
+)
+from learning_resources_search.utils import opensearch_runs
+from main import settings
+from main.utils import chunks
+from vector_search import tasks as vector_tasks
+
+log = logging.getLogger()
+
+
+def try_with_retry_as_task(function, *args):
+    """
+    Try running the task, if it errors, run it as a celery task.
+    """
+    try:
+        function(*args)
+    except Exception:  # noqa: BLE001
+        function.delay(*args)
+
+
+class SearchIndexPlugin:
+    """Perform search index updates on learning resources"""
+
+    hookimpl = apps.get_app_config("learning_resources").hookimpl
+
+    @hookimpl
+    def percolate_query_delete(self, percolate_query):
+        try_with_retry_as_task(
+            tasks.deindex_document,
+            percolate_query.id,
+            PERCOLATE_INDEX_TYPE,
+        )
+
+    @hookimpl
+    def percolate_query_upserted(self, percolate_query):
+        """
+        Upsert a created/modified percolate_query to the search index
+
+        Args:
+            percolate_query(PercolateQuery): The Learning Resource that was upserted
+        """
+        try_with_retry_as_task(tasks.upsert_percolate_query, percolate_query.id)
+
+    @hookimpl
+    def document_percolated(self, resource, percolated_queries):
+        """
+        Call to signal when a document is percolated
+        Args:
+            resource(LearningResource): The Learning Resource that was percolated
+            percolated_queries(PercolateQuery): list of percolated queries
+        """
+        log.debug("document %i percolated - %s", resource.id, list(percolated_queries))
+
+    @hookimpl
+    def resource_upserted(self, resource, percolate, generate_embeddings):
+        """
+        Upsert a created/modified resource to the search index
+
+        Args:
+            resource(LearningResource): The Learning Resource that was upserted
+        """
+        upsert_tasks = []
+
+        upsert_tasks.append(
+            tasks.upsert_learning_resource.si(resource.id),
+        )
+        if django_settings.QDRANT_ENABLE_INDEXING_PLUGIN_HOOKS and generate_embeddings:
+            upsert_tasks.append(
+                vector_tasks.generate_embeddings.si(
+                    [resource.id], resource.resource_type, overwrite=True
+                )
+            )
+        if percolate:
+            upsert_tasks.append(tasks.percolate_learning_resource.si(resource.id))
+
+        try_with_retry_as_task(chain(*upsert_tasks))
+
+    @hookimpl
+    def resource_unpublished(self, resource):
+        """
+        Remove an unpublished resource from the search index
+
+        Args:
+            resource(LearningResource): The Learning Resource that was removed
+        """
+        unpublished_tasks = []
+        unpublished_tasks.append(
+            tasks.deindex_document.si(resource.id, resource.resource_type)
+        )
+        if django_settings.QDRANT_ENABLE_INDEXING_PLUGIN_HOOKS:
+            unpublished_tasks.append(
+                vector_tasks.remove_embeddings.si([resource.id], resource.resource_type)
+            )
+        try_with_retry_as_task(chain(*unpublished_tasks))
+
+        if not resource.test_mode:
+            self._deindex_learning_resource_content_files(
+                [resource.id], resource.resource_type
+            )
+
+        if resource.resource_type == COURSE_TYPE and not resource.test_mode:
+            for run in resource.runs.all():
+                self.resource_run_unpublished(run)
+
+    def _deindex_learning_resource_content_files(self, resource_ids, resource_type):
+        """
+        Deindex content files attached to resources via their
+        learning_resource FK (e.g. marketing pages) rather than to a run.
+        OpenSearch only; the files stay in Qdrant.
+
+        Args:
+            resource_ids(list of int): The parent Learning Resource ids
+            resource_type(str): The parent Learning Resource type
+        """
+        files_by_resource = {}
+        for file_id, resource_id in ContentFile.objects.filter(
+            learning_resource_id__in=resource_ids
+        ).values_list("id", "learning_resource_id"):
+            files_by_resource.setdefault(resource_id, []).append(file_id)
+        for resource_id, file_ids in files_by_resource.items():
+            for ids in chunks(
+                file_ids,
+                chunk_size=settings.OPENSEARCH_DOCUMENT_INDEXING_CHUNK_SIZE,
+            ):
+                try_with_retry_as_task(
+                    chain(
+                        tasks.deindex_content_files.si(
+                            ids, resource_id, resource_type=resource_type
+                        )
+                    )
+                )
+
+    @hookimpl
+    def resource_similar_topics(self, resource) -> list[dict]:
+        """
+        Get similar topics for a resource
+
+        Args:
+            resource(LearningResource): The Learning Resource to get similar topics for
+
+        Returns:
+            list: The similar topics
+        """
+        text_doc = {
+            "title": resource.title,
+            "description": resource.description,
+            "full_description": resource.full_description,
+        }
+
+        topic_names = get_similar_topics_qdrant(
+            resource,
+            text_doc,
+            settings.OPEN_VIDEO_MAX_TOPICS,
+        )
+        return [{"name": topic_name} for topic_name in topic_names]
+
+    @hookimpl
+    def bulk_resources_unpublished(self, resource_ids, resource_type):
+        """
+        Remove multiple resources from the search index
+
+        Args:
+            resource_ids(list): The Learning Resource ids that were removed
+            resource_type(str): The Learning Resource type that was removed
+        """
+        for ids in chunks(
+            resource_ids,
+            chunk_size=settings.OPENSEARCH_INDEXING_CHUNK_SIZE,
+        ):
+            unpublished_tasks = [
+                tasks.bulk_deindex_learning_resources.si(ids, resource_type),
+            ]
+            if django_settings.QDRANT_ENABLE_INDEXING_PLUGIN_HOOKS:
+                unpublished_tasks.append(
+                    vector_tasks.remove_embeddings.si(ids, resource_type)
+                )
+            try_with_retry_as_task(chain(*unpublished_tasks))
+
+        # test_mode resources keep their content files indexed, as in
+        # resource_unpublished
+        self._deindex_learning_resource_content_files(
+            LearningResource.objects.filter(
+                id__in=resource_ids, test_mode=False
+            ).values_list("id", flat=True),
+            resource_type,
+        )
+
+    @hookimpl
+    def resource_before_delete(self, resource):
+        """
+        Remove a resource from the search index and then delete the object
+        """
+        # Ensure test mode is false so the resource is removed from the search index
+        resource.test_mode = False
+        self.resource_unpublished(resource)
+        # Deletion removes the content files, so retained sources (kept in Qdrant
+        # by resource_run_unpublished) must be purged here too.
+        if (
+            django_settings.QDRANT_ENABLE_INDEXING_PLUGIN_HOOKS
+            and resource.resource_type == COURSE_TYPE
+            and resource.etl_source in QDRANT_RETAINED_SOURCES
+        ):
+            for run in resource.runs.all():
+                try_with_retry_as_task(
+                    chain(vector_tasks.remove_run_content_files.si(run.id))
+                )
+
+    @hookimpl
+    def resource_run_unpublished(self, run):
+        """
+        Deindex an unpublished run's content files. Retained sources
+        (edX + Canvas) leave OpenSearch only and stay in Qdrant;
+        all other sources leave both indexes.
+
+        Args:
+            run(LearningResourceRun): The Learning Resource run that was removed
+
+        """
+        resource = run.learning_resource
+        if not run.content_files.exists() or resource.test_mode:
+            return
+
+        keep_published = resource.etl_source in QDRANT_RETAINED_SOURCES
+        deindex_tasks = [
+            tasks.deindex_run_content_files.si(
+                run.id, unpublished_only=False, keep_published=keep_published
+            ),
+        ]
+        if not keep_published and django_settings.QDRANT_ENABLE_INDEXING_PLUGIN_HOOKS:
+            deindex_tasks.append(vector_tasks.remove_run_content_files.si(run.id))
+        try_with_retry_as_task(chain(*deindex_tasks))
+
+    @hookimpl
+    def resource_run_delete(self, run):
+        """
+        Delete a learning resource run, then remove its content files from BOTH
+        search indexes. The tasks run after the rows are gone, so they get the
+        keys to match on instead of looking the rows up.
+        """
+        run_pk, run_readable_id = run.id, run.run_id
+        resource = run.learning_resource
+        run.delete()
+
+        def deindex():
+            deindex_tasks = [
+                tasks.deindex_deleted_run_content_files.si(
+                    run_pk, resource.id, resource.resource_type
+                ),
+            ]
+            if django_settings.QDRANT_ENABLE_INDEXING_PLUGIN_HOOKS:
+                deindex_tasks.append(
+                    vector_tasks.remove_deleted_run_content_files.si(
+                        run_readable_id, resource.readable_id, resource.platform_id
+                    )
+                )
+            try_with_retry_as_task(chain(*deindex_tasks))
+
+        transaction.on_commit(deindex)
+
+    @hookimpl
+    def content_files_loaded(self, run):
+        """
+        Upsert a created/modified run's content files.
+
+        Qdrant: embed the run's published files (unchanged files exit via the
+        checksum gate in vector_search) and drop stale files. OpenSearch: index
+        only the best published non-B2B run, or any published non-variant run
+        of a test_mode course.
+
+        Args:
+            run: the LearningResourceRun that was upserted
+        """
+        if not run.content_files.exists():
+            return
+
+        index_tasks = []
+
+        resource = run.learning_resource
+        if resource.published or resource.test_mode:
+            if opensearch_runs(resource).filter(id=run.id).exists():
+                index_tasks.append(tasks.index_run_content_files.si(run.id))
+
+            if django_settings.QDRANT_ENABLE_INDEXING_PLUGIN_HOOKS:
+                # Purge before embedding so hidden files' points are removed
+                # even if embedding fails; the two tasks touch disjoint sets
+                # (hidden vs visible).
+                index_tasks.append(
+                    vector_tasks.remove_unpublished_run_content_files.si(run.id)
+                )
+                index_tasks.append(vector_tasks.embed_run_content_files.si(run.id))
+
+        if index_tasks:
+            try_with_retry_as_task(chain(*index_tasks))

@@ -1,0 +1,125 @@
+"use client"
+
+import React, { useCallback, useMemo } from "react"
+import {
+  SimpleMenu,
+  Grid2 as Grid,
+  LoadingSpinner,
+  BannerPage,
+  Container,
+  styled,
+  Typography,
+  PlainList,
+  LearningResourceListCardCondensed,
+  ListCardCondensed,
+} from "ol-components"
+import { Button } from "@mitodl/smoot-design"
+import type { SimpleMenuItem } from "ol-components"
+import { RiPencilFill, RiMore2Line, RiDeleteBinLine } from "@remixicon/react"
+
+import type { LearningPathResource } from "api"
+import { useLearningPathsList } from "api/hooks/learningPaths"
+
+import { manageListDialogs } from "@/page-components/ManageListDialogs/ManageListDialogs"
+import * as urls from "@/common/urls"
+import { useUserMe } from "api/hooks/user"
+
+const ListHeaderGrid = styled(Grid)`
+  margin-top: 1rem;
+  margin-bottom: 1rem;
+`
+
+const EditListMenu: React.FC<{ resource: LearningPathResource }> = ({
+  resource,
+}) => {
+  const items: SimpleMenuItem[] = useMemo(
+    () => [
+      {
+        key: "edit",
+        label: "Edit",
+        icon: <RiPencilFill />,
+        onClick: () => manageListDialogs.upsertLearningPath(resource),
+      },
+      {
+        key: "delete",
+        label: "Delete",
+        icon: <RiDeleteBinLine />,
+        onClick: () => manageListDialogs.destroyLearningPath(resource),
+      },
+    ],
+    [resource],
+  )
+  return (
+    <SimpleMenu
+      trigger={
+        <ListCardCondensed.Action
+          variant="secondary"
+          edge="circular"
+          color="secondary"
+          size="small"
+          aria-label={`Edit list ${resource.title}`}
+        >
+          <RiMore2Line fontSize="inherit" />
+        </ListCardCondensed.Action>
+      }
+      items={items}
+    />
+  )
+}
+
+const LearningPathListingPage: React.FC = () => {
+  const listingQuery = useLearningPathsList({ limit: 100 })
+  const { data: user } = useUserMe()
+
+  const handleCreate = useCallback(() => {
+    manageListDialogs.upsertLearningPath()
+  }, [])
+
+  const canEdit = !!user?.is_learning_path_editor
+
+  return (
+    <BannerPage
+      src="/images/backgrounds/course_search_banner.png"
+      className="learningpaths-page"
+    >
+      <Container maxWidth="md" style={{ paddingBottom: 100 }}>
+        <ListHeaderGrid container justifyContent="space-between">
+          <Grid>
+            <Typography variant="h3" component="h1">
+              Learning Paths
+            </Typography>
+          </Grid>
+          <Grid justifyContent="flex-end" alignItems="center" display="flex">
+            {canEdit ? (
+              <Button variant="primary" onClick={handleCreate}>
+                Create new list
+              </Button>
+            ) : null}
+          </Grid>
+        </ListHeaderGrid>
+        <section>
+          <LoadingSpinner loading={listingQuery.isLoading} />
+          {listingQuery.data && (
+            <PlainList itemSpacing={3}>
+              {listingQuery.data.results?.map((resource) => {
+                return (
+                  <li key={resource.id}>
+                    <LearningResourceListCardCondensed
+                      resource={resource}
+                      href={urls.learningPathsView(resource.id)}
+                      editMenu={
+                        canEdit ? <EditListMenu resource={resource} /> : null
+                      }
+                    />
+                  </li>
+                )
+              })}
+            </PlainList>
+          )}
+        </section>
+      </Container>
+    </BannerPage>
+  )
+}
+
+export default LearningPathListingPage

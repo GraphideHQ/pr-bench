@@ -1,0 +1,242 @@
+[
+  {
+    "model": "learning_resources.LearningResourcePlatform",
+    "fields": {
+      "code": "ocw",
+      "name": "MIT OpenCourseWare",
+      "is_edx": false,
+      "has_content_files": true,
+      "url": "https://ocw.mit.edu/",
+      "created_on": "2023-08-08T14:27:25.128989+00:00",
+      "updated_on": "2023-08-08T14:27:25.128989+00:00"
+    }
+  },
+  {
+    "model": "learning_resources.LearningResourcePlatform",
+    "fields": {
+      "code": "edx",
+      "name": "edX",
+      "is_edx": true,
+      "has_content_files": true,
+      "url": "https://www.edx.org/",
+      "created_on": "2023-08-08T14:27:25.128989+00:00",
+      "updated_on": "2023-08-08T14:27:25.128989+00:00"
+    }
+  },
+  {
+    "model": "learning_resources.LearningResourcePlatform",
+    "fields": {
+      "code": "mitxonline",
+      "name": "MITx Online",
+      "is_edx": true,
+      "has_content_files": true,
+      "url": "https://mitxonline.mit.edu",
+      "created_on": "2023-08-08T14:27:25.128989+00:00",
+      "updated_on": "2023-08-08T14:27:25.128989+00:00"
+    }
+  },
+  {
+    "model": "learning_resources.LearningResourcePlatform",
+    "fields": {
+      "code": "bootcamps",
+      "name": "Bootcamps",
+      "is_edx": false,
+      "has_content_files": false,
+      "url": "http://bootcamps.mit.edu",
+      "created_on": "2023-08-08T14:27:25.128989+00:00",
+      "updated_on": "2023-08-08T14:27:25.128989+00:00"
+    }
+  },
+  {
+    "model": "learning_resources.LearningResourcePlatform",
+    "fields": {
+      "code": "xpro",
+      "name": "MIT xPRO",
+      "is_edx": true,
+      "has_content_files": true,
+      "url": "https://xpro.mit.edu/",
+      "created_on": "2023-08-08T14:27:25.128989+00:00",
+      "updated_on": "2023-08-08T14:27:25.128989+00:00"
+    }
+  },
+  {
+    "model": "learning_resources.LearningResourcePlatform",
+    "fields": {
+      "code": "podcast",
+      "name": "Podcast",
+      "is_edx": false,
+      "has_content_files": false,
+      "url": "",
+      "created_on": "2023-08-08T14:27:25.128989+00:00",
+      "updated_on": "2023-08-08T14:27:25.128989+00:00"
+    }
+  },
+  {
+    "model": "learning_resources.LearningResourcePlatform",
+    "fields": {
+      "code": "csail",
+      "name": "CSAIL",
+      "is_edx": false,
+      "has_content_files": false,
+      "url": "https://cap.csail.mit.edu/",
+      "created_on": "2023-08-08T14:27:25.128989+00:00",
+      "updated_on": "2023-08-08T14:27:25.128989+00:00"
+    }
+  },
+  {
+    "model": "learning_resources.LearningResourcePlatform",
+    "fields": {
+      "code": "mitpe",
+      "name": "MIT Professional Education",
+      "is_edx": false,
+      "has_content_files": false,
+      "url": "https://professional.mit.edu/",
+      "created_on": "2023-08-08T14:27:25.128989+00:00",
+      "updated_on": "2023-08-08T14:27:25.128989+00:00"
+    }
+  },
+  {
+    "model": "learning_resources.LearningResourcePlatform",
+    "fields": {
+      "code": "see",
+      "name": "MIT Sloan Executive Education",
+      "is_edx": false,
+      "has_content_files": false,
+      "url": "https://executive.mit.edu/",
+      "created_on": "2023-08-08T14:27:25.128989+00:00",
+      "updated_on": "2023-08-08T14:27:25.128989+00:00"
+    }
+  },
+  {
+    "model": "learning_resources.LearningResourcePlatform",
+    "fields": {
+      "code": "scc",
+      "name": "Schwarzman College of Computing",
+      "is_edx": false,
+      "has_content_files": false,
+      "url": "https://computing.mit.edu/",
+      "created_on": "2023-08-08T14:27:25.128989+00:00",
+      "updated_on": "2023-08-08T14:27:25.128989+00:00"
+    }
+  },
+  {
+    "model": "learning_resources.LearningResourcePlatform",
+    "fields": {
+      "code": "ctl",
+      "name": "Center for Transportation & Logistics",
+      "is_edx": false,
+      "has_content_files": false,
+      "url": "https://ctl.mit.edu/",
+      "created_on": "2023-08-08T14:27:25.128989+00:00",
+      "updated_on": "2023-08-08T14:27:25.128989+00:00"
+    }
+  },
+  {
+    "model": "learning_resources.LearningResourcePlatform",
+    "fields": {
+      "code": "emeritus",
+      "name": "Emeritus",
+      "is_edx": false,
+      "has_content_files": false,
+      "url": "",
+      "created_on": "2023-08-08T14:27:25.128989+00:00",
+      "updated_on": "2023-08-08T14:27:25.128989+00:00"
+    }
+  },
+  {
+    "model": "learning_resources.LearningResourcePlatform",
+    "fields": {
+      "code": "simplilearn",
+      "name": "Simplilearn",
+      "is_edx": false,
+      "has_content_files": false,
+      "url": "",
+      "created_on": "2023-08-08T14:27:25.128989+00:00",
+      "updated_on": "2023-08-08T14:27:25.128989+00:00"
+    }
+  },
+  {
+    "model": "learning_resources.LearningResourcePlatform",
+    "fields": {
+      "code": "globalalumni",
+      "name": "Global Alumni",
+      "is_edx": false,
+      "has_content_files": false,
+      "url": "",
+      "created_on": "2023-08-08T14:27:25.128989+00:00",
+      "updated_on": "2023-08-08T14:27:25.128989+00:00"
+    }
+  },
+  {
+    "model": "learning_resources.LearningResourcePlatform",
+    "fields": {
+      "code": "susskind",
+      "name": "Susskind",
+      "is_edx": false,
+      "has_content_files": false,
+      "url": "",
+      "created_on": "2023-08-08T14:27:25.128989+00:00",
+      "updated_on": "2023-08-08T14:27:25.128989+00:00"
+    }
+  },
+  {
+    "model": "learning_resources.LearningResourcePlatform",
+    "fields": {
+      "code": "whu",
+      "name": "WHU",
+      "is_edx": false,
+      "has_content_files": false,
+      "url": "",
+      "created_on": "2023-08-08T14:27:25.128989+00:00",
+      "updated_on": "2023-08-08T14:27:25.128989+00:00"
+    }
+  },
+  {
+    "model": "learning_resources.LearningResourcePlatform",
+    "fields": {
+      "code": "oll",
+      "name": "Open Learning Library",
+      "is_edx": true,
+      "has_content_files": false,
+      "url": "https://openlearninglibrary.mit.edu/",
+      "created_on": "2023-08-08T14:27:25.128989+00:00",
+      "updated_on": "2023-08-08T14:27:25.128989+00:00"
+    }
+  },
+  {
+    "model": "learning_resources.LearningResourcePlatform",
+    "fields": {
+      "code": "youtube",
+      "name": "YouTube",
+      "is_edx": false,
+      "has_content_files": false,
+      "url": "https://youtube.com/",
+      "created_on": "2024-02-23T00:00:00+00:00",
+      "updated_on": "2024-02-23T00:00:00+00:00"
+    }
+  },
+  {
+    "model": "learning_resources.LearningResourcePlatform",
+    "fields": {
+      "code": "canvas",
+      "name": "Canvas",
+      "is_edx": false,
+      "has_content_files": true,
+      "url": "https://web.mit.edu/canvas/",
+      "created_on": "2025-07-10T00:00:00+00:00",
+      "updated_on": "2025-07-10T00:00:00+00:00"
+    }
+  },
+  {
+    "model": "learning_resources.LearningResourcePlatform",
+    "fields": {
+      "code": "ovs",
+      "name": "ODL Video Service",
+      "is_edx": false,
+      "has_content_files": false,
+      "url": "https://video.odl.mit.edu/",
+      "created_on": "2026-03-11T00:00:00+00:00",
+      "updated_on": "2026-03-11T00:00:00+00:00"
+    }
+  }
+]

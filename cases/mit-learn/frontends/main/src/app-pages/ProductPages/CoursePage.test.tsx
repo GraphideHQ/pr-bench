@@ -1,0 +1,825 @@
+import React from "react"
+import {
+  urls as mitxUrls,
+  factories as mitxFactories,
+  mockEnrollmentEligible,
+} from "api/mitxonline-test-utils"
+import { makeCourse } from "./test-utils/userPricing"
+import type {
+  CoursePageItem,
+  CourseWithCourseRunsSerializerV2,
+} from "@mitodl/mitxonline-api-axios/v2"
+import {
+  setMockResponse,
+  makeRequest,
+  urls as learnUrls,
+  factories as learnFactories,
+} from "api/test-utils"
+import {
+  renderWithProviders,
+  waitFor,
+  screen,
+  within,
+  act,
+  user,
+  setupLocationMock,
+} from "@/test-utils"
+import CoursePage from "./CoursePage"
+import { assertHeadings } from "ol-test-utilities"
+import { notFound } from "next/navigation"
+import {
+  STAY_UPDATED_FORM_ID,
+  withHubspotFormId,
+} from "./test-utils/stayUpdated"
+
+import { useFeatureFlagEnabled } from "posthog-js/react"
+import invariant from "tiny-invariant"
+import { getOutlineCoursewareId } from "./util"
+import { FeatureFlags } from "@/common/feature_flags"
+import { mitxonlineLegacyUrl } from "@/common/mitxonline"
+
+jest.mock("posthog-js/react", () => ({
+  ...jest.requireActual("posthog-js/react"),
+  useFeatureFlagEnabled: jest.fn(),
+  usePostHog: jest.fn(() => ({ capture: jest.fn() })),
+}))
+const mockedUseFeatureFlagEnabled = jest.mocked(useFeatureFlagEnabled)
+
+jest.mock("next-nprogress-bar", () => ({
+  useRouter: () => ({ push: jest.fn() }),
+}))
+
+jest.mock("@/common/analytics/gtm", () => ({
+  trackCourseEnrolled: jest.fn(),
+  trackStartEnrollment: jest.fn(),
+  trackBeginCheckout: jest.fn(),
+  trackViewCoursePage: jest.fn(),
+  trackCourseProgramView: jest.fn(),
+}))
+
+const makePage = mitxFactories.pages.coursePageItem
+
+const expectRawContent = (el: HTMLElement, htmlString: string) => {
+  const raw = within(el).getByTestId("raw")
+  expect(htmlString.length).toBeGreaterThan(0)
+  expect(raw.innerHTML).toBe(htmlString)
+}
+
+const setupApis = ({
+  course,
+  page,
+}: {
+  course: CourseWithCourseRunsSerializerV2
+  page: CoursePageItem
+}) => {
+  setMockResponse.get(
+    mitxUrls.courses.coursesList({
+      readable_id: course.readable_id,
+      live: true,
+    }),
+    { results: [course] },
+  )
+
+  setMockResponse.get(mitxUrls.pages.coursePages(course.readable_id), {
+    items: [page],
+  })
+  const outlineCoursewareId = getOutlineCoursewareId(course)
+  if (outlineCoursewareId) {
+    setMockResponse.get(mitxUrls.courses.courseOutline(outlineCoursewareId), {
+      course_id: course.readable_id,
+      generated_at: new Date().toISOString(),
+      modules: [
+        {
+          id: "m1",
+          title: "Introduction",
+          effort_time: 540,
+          effort_activities: 0,
+          counts: {
+            videos: 30,
+            readings: 2,
+            problems: 0,
+            assignments: 1,
+            app_items: 0,
+          },
+        },
+        {
+          id: "m2",
+          title: "Core concepts",
+          effort_time: 60,
+          effort_activities: 0,
+          counts: {
+            videos: 0,
+            readings: 0,
+            problems: 0,
+            assignments: 0,
+            app_items: 0,
+          },
+        },
+      ],
+    })
+  }
+
+  setMockResponse.get(
+    learnUrls.userMe.get(),
+    learnFactories.user.user({ is_authenticated: false }),
+  )
+  // Clicking enroll consults the MITx Online profile through the compliance
+  // gate; the factory default has nothing missing, so it passes straight through.
+  setMockResponse.get(mitxUrls.userMe.get(), mitxFactories.user.user())
+
+  const stayUpdatedFormId = page.hubspot_form_id?.trim()
+  if (stayUpdatedFormId) {
+    setMockResponse.get(
+      learnUrls.hubspot.details({ form_id: stayUpdatedFormId }),
+      learnFactories.hubspot.form({
+        id: stayUpdatedFormId,
+        name: "Stay Updated",
+      }),
+    )
+  }
+}
+
+/**
+ * Each test renders the full course page, and the header enrollment tests also
+ * drive the session select and enroll buttons. On slower CI runners that lands
+ * close enough to Jest's 5s default to time out intermittently (a different
+ * test each run, with the same code passing on a re-run).
+ */
+jest.setTimeout(15000)
+
+const waitForCoursePageToSettle = async (pageTitle: string) => {
+  await screen.findByRole("heading", { name: pageTitle })
+  await waitFor(() => {
+    expect(screen.queryAllByRole("button", { name: "Loading" })).toHaveLength(0)
+  })
+}
+
+describe("CoursePage", () => {
+  beforeEach(() => {
+    mockedUseFeatureFlagEnabled.mockReturnValue(true)
+  })
+
+  test("Page has expected headings", async () => {
+    // A non-enrollable run keeps the outline section (needs a courseware_id)
+    // while making the InfoBox render no enroll-card (h3) headings, so the
+    // page heading outline is deterministic. (makeCourse() otherwise
+    // randomizes run enrollability, injecting card h3s and flaking this test.)
+    const run = mitxFactories.courses.courseRun({ is_enrollable: false })
+    const course = makeCourse({ next_run_id: run.id, courseruns: [run] })
+    const page = makePage({ course_details: course })
+    invariant(page.faculty.length > 0)
+    setupApis({ course, page })
+    renderWithProviders(<CoursePage readableId={course.readable_id} />)
+    await waitForCoursePageToSettle(page.title)
+
+    await waitFor(() => {
+      assertHeadings([
+        { level: 1, name: page.title },
+        { level: 2, name: "Course Information" },
+        { level: 2, name: "About this Course" },
+        { level: 2, name: "What you'll learn" },
+        { level: 2, name: "Course content" },
+        { level: 2, name: "How you'll learn" },
+        { level: 2, name: "Prerequisites" },
+        { level: 2, name: "Meet your instructors" },
+        { level: 3, name: page.faculty[0].instructor_name },
+        { level: 2, name: "FAQs" },
+        ...page.faqs.map((faq) => ({ level: 3, name: faq.question })),
+        { level: 2, name: "What learners are saying" },
+      ])
+    })
+  })
+
+  // Collasping sections tested in AboutSection.test.tsx
+  test("About section has expected content", async () => {
+    const course = makeCourse()
+    const page = makePage({ course_details: course })
+    invariant(page.about)
+    setupApis({ course, page })
+    renderWithProviders(<CoursePage readableId={course.readable_id} />)
+    await waitForCoursePageToSettle(page.title)
+
+    const section = await screen.findByRole("region", {
+      name: "About this Course",
+    })
+    expectRawContent(section, page.about)
+  })
+
+  test("What You'll Learn section has expected content", async () => {
+    const course = makeCourse()
+    const page = makePage({ course_details: course })
+    invariant(page.what_you_learn)
+    setupApis({ course, page })
+    renderWithProviders(<CoursePage readableId={course.readable_id} />)
+    await waitForCoursePageToSettle(page.title)
+
+    const section = await screen.findByRole("region", {
+      name: "What you'll learn",
+    })
+    expectRawContent(section, page.what_you_learn)
+  })
+
+  // Interaction and active content are tested in InstructorsSection.test.tsx
+  test("Instructors section has expected content", async () => {
+    const course = makeCourse()
+    const page = makePage({ course_details: course })
+    invariant(page.faculty.length > 0)
+    setupApis({ course, page })
+    renderWithProviders(<CoursePage readableId={course.readable_id} />)
+    await waitForCoursePageToSettle(page.title)
+
+    const section = await screen.findByRole("region", {
+      name: "Meet your instructors",
+    })
+    const buttons = page.faculty.map((faculty) =>
+      within(section).getByRole("button", { name: faculty.instructor_name }),
+    )
+    expect(buttons.length).toBe(page.faculty.length)
+  })
+
+  test("Prerequisites section has expected content", async () => {
+    const course = makeCourse()
+    const page = makePage({ course_details: course })
+    invariant(page.prerequisites)
+    setupApis({ course, page })
+    renderWithProviders(<CoursePage readableId={course.readable_id} />)
+    await waitForCoursePageToSettle(page.title)
+
+    const section = await screen.findByRole("region", { name: "Prerequisites" })
+    expectRawContent(section, page.prerequisites)
+  })
+
+  test("Course content section renders lecture titles", async () => {
+    const course = makeCourse()
+    const page = makePage({ course_details: course })
+    setupApis({ course, page })
+    renderWithProviders(<CoursePage readableId={course.readable_id} />)
+    await waitForCoursePageToSettle(page.title)
+
+    const section = await screen.findByRole("region", {
+      name: "Course content",
+    })
+    expect(within(section).getByText("Introduction")).toBeInTheDocument()
+    expect(within(section).getByText("Core concepts")).toBeInTheDocument()
+  })
+
+  test("Hides course content section when course outline flag is disabled", async () => {
+    mockedUseFeatureFlagEnabled.mockImplementation(
+      (flag) => flag !== FeatureFlags.CourseOutlineSection,
+    )
+    const course = makeCourse()
+    const page = makePage({ course_details: course })
+    setupApis({ course, page })
+    renderWithProviders(<CoursePage readableId={course.readable_id} />)
+    await waitForCoursePageToSettle(page.title)
+    expect(
+      screen.queryByRole("region", {
+        name: "Course content",
+      }),
+    ).not.toBeInTheDocument()
+  })
+
+  test("Hides course content section when the CMS toggle is off", async () => {
+    const course = makeCourse()
+    const page = makePage({
+      course_details: course,
+      show_course_outline: false,
+    })
+    setupApis({ course, page })
+    renderWithProviders(<CoursePage readableId={course.readable_id} />)
+    await waitForCoursePageToSettle(page.title)
+
+    expect(
+      screen.queryByRole("region", {
+        name: "Course content",
+      }),
+    ).not.toBeInTheDocument()
+    const outlineCoursewareId = getOutlineCoursewareId(course)
+    invariant(outlineCoursewareId)
+    expect(makeRequest).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        url: mitxUrls.courses.courseOutline(outlineCoursewareId),
+      }),
+    )
+  })
+
+  test("Course content section shows metadata inline", async () => {
+    const course = makeCourse()
+    const page = makePage({ course_details: course })
+    setupApis({ course, page })
+    renderWithProviders(<CoursePage readableId={course.readable_id} />)
+    await waitForCoursePageToSettle(page.title)
+
+    const section = await screen.findByRole("region", {
+      name: "Course content",
+    })
+    expect(
+      within(section).getByText(
+        /Less than 1 hour to complete\s*•\s*30 Videos\s*•\s*2 Readings\s*•\s*1 Assignment/,
+      ),
+    ).toBeInTheDocument()
+    const coreConceptsCard = within(section)
+      .getByText("Core concepts")
+      .closest("article")
+    expect(coreConceptsCard).toBeInTheDocument()
+    expect(
+      within(coreConceptsCard as HTMLElement).getByText(
+        "Less than 1 hour to complete",
+      ),
+    ).toBeInTheDocument()
+    expect(
+      within(section).queryByRole("button", { name: /Introduction/i }),
+    ).not.toBeInTheDocument()
+  })
+
+  test("Renders program bundle upsell when course belongs to a program (content tested in ProgramBundleUpsell.test)", async () => {
+    const baseProgram = mitxFactories.programs.baseProgram()
+    const programDetail = mitxFactories.programs.program({
+      id: baseProgram.id,
+      readable_id: baseProgram.readable_id,
+      products: [mitxFactories.courses.product()],
+    })
+    const course = makeCourse({ programs: [baseProgram] })
+    const page = makePage({ course_details: course })
+    setupApis({ course, page })
+    setMockResponse.get(
+      mitxUrls.programs.programsList({ id: [baseProgram.id] }),
+      {
+        results: [programDetail],
+      },
+    )
+    renderWithProviders(<CoursePage readableId={course.readable_id} />)
+    await waitForCoursePageToSettle(page.title)
+
+    expect(
+      await screen.findByTestId("program-bundle-upsell"),
+    ).toBeInTheDocument()
+  })
+
+  describe("Header enrollment button", () => {
+    const freeMode = mitxFactories.courses.enrollmentMode({
+      requires_payment: false,
+    })
+    const paidMode = mitxFactories.courses.enrollmentMode({
+      requires_payment: true,
+    })
+    const product = mitxFactories.courses.product()
+
+    // The header CTA mirrors the enroll area's scenario→label mapping (which is
+    // unit tested in useCourseEnrollment.test.tsx). Here we pin that the header
+    // reflects each scenario; the "none" placeholder is additionally disabled.
+    const headerCases = [
+      {
+        name: "both → Earn Certificate",
+        run: () =>
+          mitxFactories.courses.courseRun({
+            is_enrollable: true,
+            is_upgradable: true,
+            is_archived: false,
+            enrollment_modes: [freeMode, paidMode],
+            products: [product],
+          }),
+        button: "Earn Certificate",
+        disabled: false,
+      },
+      {
+        name: "free only → Start Learning",
+        run: () =>
+          mitxFactories.courses.courseRun({
+            is_enrollable: true,
+            is_upgradable: false,
+            is_archived: false,
+            enrollment_modes: [freeMode],
+            products: [],
+          }),
+        button: "Start Learning",
+        disabled: false,
+      },
+      {
+        name: "paid only → Enroll",
+        run: () =>
+          mitxFactories.courses.courseRun({
+            is_enrollable: true,
+            is_upgradable: true,
+            is_archived: false,
+            enrollment_modes: [paidMode],
+            products: [product],
+          }),
+        button: "Enroll",
+        disabled: false,
+      },
+      {
+        name: "no runs → disabled Enroll placeholder",
+        run: () => null,
+        button: "Enroll",
+        disabled: true,
+      },
+    ]
+
+    test.each(headerCases)("$name", async ({ run, button, disabled }) => {
+      const courseRun = run()
+      const course = makeCourse(
+        courseRun
+          ? { next_run_id: courseRun.id, courseruns: [courseRun] }
+          : { courseruns: [] },
+      )
+      const page = makePage({ course_details: course })
+      setupApis({ course, page })
+      renderWithProviders(<CoursePage readableId={course.readable_id} />)
+      await waitForCoursePageToSettle(page.title)
+
+      if (disabled) {
+        // Only the header placeholder renders (the enroll area is empty), so a
+        // single button is expected.
+        expect(
+          await screen.findByRole("button", { name: button }),
+        ).toBeDisabled()
+      } else {
+        // Both the header and the InfoBox render the CTA.
+        expect(
+          (await screen.findAllByRole("button", { name: button })).length,
+        ).toBeGreaterThan(0)
+      }
+    })
+
+    test("enrolled scenario: header shows Enrolled link", async () => {
+      const run = mitxFactories.courses.courseRun({
+        is_enrollable: true,
+        is_archived: false,
+        enrollment_modes: [freeMode],
+      })
+      const course = makeCourse({ next_run_id: run.id, courseruns: [run] })
+      const page = makePage({ course_details: course })
+      setupApis({ course, page })
+
+      const enrollment = mitxFactories.enrollment.courseEnrollment({
+        run: { id: run.id },
+      })
+      setMockResponse.get(
+        learnUrls.userMe.get(),
+        learnFactories.user.user({ is_authenticated: true }),
+      )
+      setMockResponse.get(mitxUrls.enrollment.enrollmentsListV3(), [enrollment])
+
+      renderWithProviders(<CoursePage readableId={course.readable_id} />)
+      await waitForCoursePageToSettle(page.title)
+
+      expect(
+        (await screen.findAllByRole("link", { name: /Enrolled/ })).length,
+      ).toBeGreaterThan(0)
+    })
+
+    test("header CTA tracks the run selected in the InfoBox", async () => {
+      const paidRun = mitxFactories.courses.courseRun({
+        is_enrollable: true,
+        is_upgradable: true,
+        is_archived: false,
+        enrollment_modes: [paidMode],
+        products: [product],
+        start_date: "2026-07-15",
+        end_date: "2026-10-15",
+      })
+      const freeRun = mitxFactories.courses.courseRun({
+        is_enrollable: true,
+        is_upgradable: false,
+        is_archived: false,
+        enrollment_modes: [freeMode],
+        products: [],
+        start_date: "2027-03-10",
+        end_date: "2027-06-10",
+      })
+      const course = makeCourse({
+        next_run_id: paidRun.id,
+        courseruns: [paidRun, freeRun],
+      })
+      const page = makePage({ course_details: course })
+      setupApis({ course, page })
+      renderWithProviders(<CoursePage readableId={course.readable_id} />)
+      await waitForCoursePageToSettle(page.title)
+
+      const select = await screen.findByRole("combobox", { name: /Session/i })
+
+      // Select the paid run: header + InfoBox show "Enroll", none show "Start Learning"
+      await user.click(select)
+      await user.click(screen.getByRole("option", { name: /Jul 15/i }))
+      await waitFor(() => {
+        expect(
+          screen.queryByRole("button", { name: "Start Learning" }),
+        ).toBeNull()
+      })
+      expect(
+        (await screen.findAllByRole("button", { name: "Enroll" })).length,
+      ).toBeGreaterThan(0)
+
+      // Switch to the free run: the header CTA follows — no "Enroll" remains
+      await user.click(select)
+      await user.click(screen.getByRole("option", { name: /Mar 10/i }))
+      await waitFor(() => {
+        expect(screen.queryByRole("button", { name: "Enroll" })).toBeNull()
+      })
+      expect(
+        (await screen.findAllByRole("button", { name: "Start Learning" }))
+          .length,
+      ).toBeGreaterThan(0)
+    })
+
+    describe("click smoke tests", () => {
+      setupLocationMock()
+
+      test("header paid button click triggers basket replace", async () => {
+        const run = mitxFactories.courses.courseRun({
+          is_enrollable: true,
+          is_upgradable: true,
+          is_archived: false,
+          enrollment_modes: [paidMode],
+          products: [product],
+        })
+        const course = makeCourse({ next_run_id: run.id, courseruns: [run] })
+        const page = makePage({ course_details: course })
+        setupApis({ course, page })
+
+        setMockResponse.get(
+          learnUrls.userMe.get(),
+          learnFactories.user.user({ is_authenticated: true }),
+        )
+        setMockResponse.get(mitxUrls.enrollment.enrollmentsListV3(), [])
+        setMockResponse.delete(mitxUrls.baskets.clear(), undefined)
+        setMockResponse.post(mitxUrls.baskets.createFromProduct(product.id), {
+          id: 1,
+          items: [],
+        })
+        mockEnrollmentEligible()
+
+        renderWithProviders(<CoursePage readableId={course.readable_id} />)
+
+        const enrollBtns = await screen.findAllByRole("button", {
+          name: "Enroll",
+        })
+        await act(async () => {
+          enrollBtns[0].click()
+        })
+
+        await waitFor(() => {
+          expect(window.location.assign).toHaveBeenCalledWith(
+            mitxonlineLegacyUrl("/cart/"),
+          )
+        })
+      })
+
+      test("unauthenticated header click shows signup popover", async () => {
+        const run = mitxFactories.courses.courseRun({
+          is_enrollable: true,
+          is_upgradable: false,
+          is_archived: false,
+          enrollment_modes: [freeMode],
+          products: [],
+        })
+        const course = makeCourse({ next_run_id: run.id, courseruns: [run] })
+        const page = makePage({ course_details: course })
+        setupApis({ course, page })
+
+        renderWithProviders(<CoursePage readableId={course.readable_id} />)
+
+        const startBtns = await screen.findAllByRole("button", {
+          name: "Start Learning",
+        })
+        await act(async () => {
+          startBtns[0].click()
+        })
+
+        expect(screen.getByTestId("signup-popover")).toBeInTheDocument()
+      })
+
+      test("header enrollment failure shows an error alert below the header button", async () => {
+        const run = mitxFactories.courses.courseRun({
+          is_enrollable: true,
+          is_upgradable: false,
+          is_archived: false,
+          enrollment_modes: [freeMode],
+          products: [],
+        })
+        const course = makeCourse({ next_run_id: run.id, courseruns: [run] })
+        const page = makePage({ course_details: course })
+        setupApis({ course, page })
+
+        setMockResponse.get(
+          learnUrls.userMe.get(),
+          learnFactories.user.user({ is_authenticated: true }),
+        )
+        setMockResponse.get(mitxUrls.enrollment.enrollmentsListV3(), [])
+        setMockResponse.post(
+          mitxUrls.enrollment.enrollmentsListV1(),
+          undefined,
+          { code: 500 },
+        )
+
+        renderWithProviders(<CoursePage readableId={course.readable_id} />)
+
+        // Target the header instance specifically — the InfoBox renders its
+        // own "Start Learning" with its own (separate) error alert.
+        const banner = await screen.findByTestId("banner-container")
+        const startBtn = await within(banner).findByRole("button", {
+          name: "Start Learning",
+        })
+        await act(async () => {
+          startBtn.click()
+        })
+
+        expect(
+          await within(banner).findByText(
+            "There was a problem processing your enrollment. Please try again.",
+          ),
+        ).toBeInTheDocument()
+      })
+
+      test("header enrollment failure shows the server's 400 detail", async () => {
+        const run = mitxFactories.courses.courseRun({
+          is_enrollable: true,
+          is_upgradable: false,
+          is_archived: false,
+          enrollment_modes: [freeMode],
+          products: [],
+        })
+        const course = makeCourse({ next_run_id: run.id, courseruns: [run] })
+        const page = makePage({ course_details: course })
+        setupApis({ course, page })
+
+        setMockResponse.get(
+          learnUrls.userMe.get(),
+          learnFactories.user.user({ is_authenticated: true }),
+        )
+        setMockResponse.get(mitxUrls.enrollment.enrollmentsListV3(), [])
+        setMockResponse.post(
+          mitxUrls.enrollment.enrollmentsListV1(),
+          {
+            detail:
+              "Unable to complete enrollment. Please contact support. Error code: CS_700",
+          },
+          { code: 400 },
+        )
+
+        renderWithProviders(<CoursePage readableId={course.readable_id} />)
+
+        const banner = await screen.findByTestId("banner-container")
+        const startBtn = await within(banner).findByRole("button", {
+          name: "Start Learning",
+        })
+        await act(async () => {
+          startBtn.click()
+        })
+
+        expect(
+          await within(banner).findByText(
+            "Unable to complete enrollment. Please contact support. Error code: CS_700",
+          ),
+        ).toBeInTheDocument()
+        expect(
+          within(banner).getByRole("link", { name: "Contact Support" }),
+        ).toBeInTheDocument()
+        // The InfoBox's alert is a separate hook instance and never fires.
+        expect(
+          screen.queryByText(
+            "There was a problem processing your enrollment. Please try again.",
+          ),
+        ).toBeNull()
+      })
+    })
+  })
+
+  test("Shows a YouTube video in the sidebar when video_url is a YouTube URL", async () => {
+    const course = makeCourse()
+    const videoId = "abc123"
+    const page = makePage({
+      course_details: course,
+      video_url: `https://www.youtube.com/watch?v=${videoId}`,
+    })
+    setupApis({ course, page })
+    renderWithProviders(<CoursePage readableId={course.readable_id} />)
+
+    await screen.findByRole("heading", { name: page.title })
+    const iframe = document.querySelector(
+      `iframe[src="https://www.youtube.com/embed/${videoId}"]`,
+    )
+    expect(iframe).toBeInTheDocument()
+  })
+
+  test("Shows an image in the sidebar when video_url is null", async () => {
+    const course = makeCourse()
+    const page = makePage({ course_details: course, video_url: null })
+    setupApis({ course, page })
+    renderWithProviders(<CoursePage readableId={course.readable_id} />)
+
+    await screen.findByRole("heading", { name: page.title })
+    expect(
+      document.querySelector("iframe[src*='youtube.com/embed']"),
+    ).not.toBeInTheDocument()
+    expect(document.querySelector("img")).toBeInTheDocument()
+  })
+
+  test("Uses DEFAULT_RESOURCE_IMG when feature_image_src is falsy", async () => {
+    const course = makeCourse({
+      page: { feature_image_src: "" },
+    })
+    const page = makePage({ course_details: course, video_url: null })
+    setupApis({ course, page })
+    const { view } = renderWithProviders(
+      <CoursePage readableId={course.readable_id} />,
+    )
+    await waitForCoursePageToSettle(page.title)
+    const imgs = Array.from(view.container.querySelectorAll("img"))
+    expect(imgs.some((img) => img.src.includes("default_resource"))).toBe(true)
+  })
+
+  test.each([
+    { courses: [], pages: [makePage()] },
+    { courses: [makeCourse()], pages: [] },
+    { courses: [], pages: [] },
+  ])("Returns 404 if no course found", async ({ courses, pages }) => {
+    setMockResponse.get(
+      mitxUrls.courses.coursesList({ readable_id: "readable_id", live: true }),
+      { results: courses },
+    )
+    if (courses.length > 0) {
+      const outlineCoursewareId = getOutlineCoursewareId(courses[0])
+      if (outlineCoursewareId) {
+        setMockResponse.get(
+          mitxUrls.courses.courseOutline(outlineCoursewareId),
+          {
+            course_id: courses[0].readable_id,
+            generated_at: new Date().toISOString(),
+            modules: [],
+          },
+        )
+      }
+    }
+    setMockResponse.get(mitxUrls.pages.coursePages("readable_id"), {
+      items: pages,
+    })
+
+    renderWithProviders(<CoursePage readableId="readable_id" />)
+    await waitFor(() => {
+      expect(notFound).toHaveBeenCalled()
+    })
+  })
+
+  test("Returns 404 if course has live=false", async () => {
+    const course = makeCourse()
+    const page = makePage({ course_details: course })
+    // Simulate live=false: the API filters it out, returning empty results
+    setMockResponse.get(
+      mitxUrls.courses.coursesList({
+        readable_id: course.readable_id,
+        live: true,
+      }),
+      { results: [] },
+    )
+    setMockResponse.get(mitxUrls.pages.coursePages(course.readable_id), {
+      items: [page],
+    })
+    renderWithProviders(<CoursePage readableId={course.readable_id} />)
+    await waitFor(() => {
+      expect(notFound).toHaveBeenCalled()
+    })
+  })
+
+  describe("Stay Updated button", () => {
+    test("Shows button when the page has a hubspot form id", async () => {
+      const course = makeCourse()
+      const page = withHubspotFormId(
+        makePage({ course_details: course }),
+        STAY_UPDATED_FORM_ID,
+      )
+      setupApis({ course, page })
+      renderWithProviders(<CoursePage readableId={course.readable_id} />)
+
+      expect(
+        await screen.findByRole("button", { name: "Stay Updated" }),
+      ).toBeInTheDocument()
+    })
+
+    test.each([
+      { label: "the form id is blank", hubspotFormId: "" },
+      { label: "the form id is null", hubspotFormId: null },
+    ])("Hides button when $label", async ({ hubspotFormId }) => {
+      const course = makeCourse()
+      const page = withHubspotFormId(
+        makePage({ course_details: course }),
+        hubspotFormId,
+      )
+      setupApis({ course, page })
+      renderWithProviders(<CoursePage readableId={course.readable_id} />)
+      await waitForCoursePageToSettle(page.title)
+      expect(
+        screen.queryByRole("button", { name: "Stay Updated" }),
+      ).not.toBeInTheDocument()
+    })
+  })
+
+  test("Renders without crashing when course_details.page is null", async () => {
+    const course = makeCourse({ page: null })
+    const page = makePage({ course_details: course })
+    setupApis({ course, page })
+    renderWithProviders(<CoursePage readableId={course.readable_id} />)
+    await waitForCoursePageToSettle(page.title)
+  })
+})

@@ -1,0 +1,631 @@
+"""The reference frame a miner's score is measured against.
+
+A score needs a reference: what does good look like, and what does it cost?
+The critical design constraint is that the reference must be a fact about the
+*world* — this question pool, this model pool — and never a function of the
+miner population. If the frame moved with the field, a miner's score would
+change because other miners came online or went dark, which is exactly the
+non-interference property (I4) the TEE architecture exists to protect. It
+would also make scores incomparable across time.
+
+So the frame is accumulated over TIME, not over miners: exploration samples
+from every epoch decay into per-model counts, and any single miner's
+contribution to those counts is negligible.
+
+**The reference is per-model marginals, not a per-question oracle.** The
+frame feeds `frontier.py`: each model's pooled accuracy and its pinned price
+are one point, and the upper convex hull of those points is the constant-policy
+frontier a miner has to clear at its own cost. This needs only ~30 numbers
+rather than a dense question-by-model matrix (~21K x 30 cells), so it is
+well-estimated within a few epochs instead of many hundreds, and it is stable
+at any field size. A per-question oracle is the more precise measure of pure
+routing skill, but it is unreachable in practice and compresses every real
+router into a narrow low band.
+
+Cold start is handled by a Beta prior worth K pseudo-observations, not by a
+special case: with no evidence the frame reports the prior, and the prior
+washes out as samples arrive. Nothing divides by zero and there is no epoch at
+which the frame is undefined.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+from dataclasses import dataclass, field
+from statistics import median
+
+from fugal_subnet.config import (
+    EXPLORE_DISAGREE_MAX,
+    EXPLORE_DISAGREE_MIN_SAMPLES,
+    EXPLORE_DISAGREE_MIN_VOTERS,
+    FRAME_HALF_LIFE,
+    FRAME_PRIOR_ACCURACY,
+    FRAME_PRIOR_STRENGTH,
+    WILSON_CONFIDENCE,
+)
+from fugal_subnet.routing_protocol import identity, require_identity
+
+logger = logging.getLogger(__name__)
+
+_Z = {0.90: 1.645, 0.95: 1.96, 0.99: 2.576}
+
+
+@dataclass
+class ReferenceFrame:
+    """Decayed per-model evidence pooled from exploration samples."""
+
+    successes: dict[str, float] = field(default_factory=dict)
+    trials: dict[str, float] = field(default_factory=dict)
+    prompt_tokens: dict[str, float] = field(default_factory=dict)
+    completion_tokens: dict[str, float] = field(default_factory=dict)
+    epochs: int = 0
+    # Protocol v2: the same sums with each observation weighted by its
+    # benchmark's scored share over its exploration share this epoch
+    # (slicer.mix_weights), so accuracy and verbosity are estimated on the
+    # SCORED mix even when fifteen exploration slots round away from it. The
+    # raw `trials` above stay unweighted: they count how much was measured,
+    # which is what the frontier's confidence reads. Empty until the first v2
+    # epoch, and omitted from to_dict while empty, so a v1 frame serialises
+    # byte for byte as before.
+    successes_w: dict[str, float] = field(default_factory=dict)
+    trials_w: dict[str, float] = field(default_factory=dict)
+    prompt_tokens_w: dict[str, float] = field(default_factory=dict)
+    completion_tokens_w: dict[str, float] = field(default_factory=dict)
+
+    @property
+    def weighted(self) -> bool:
+        return bool(self.trials_w)
+
+    def to_dict(self) -> dict:
+        d = {
+            "routing_protocol": identity(),
+            "successes": self.successes,
+            "trials": self.trials,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "epochs": self.epochs,
+        }
+        if self.weighted:
+            d["successes_w"] = self.successes_w
+            d["trials_w"] = self.trials_w
+            d["prompt_tokens_w"] = self.prompt_tokens_w
+            d["completion_tokens_w"] = self.completion_tokens_w
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ReferenceFrame:
+        require_identity(d.get("routing_protocol"))
+        return cls(
+            successes=dict(d.get("successes") or {}),
+            trials=dict(d.get("trials") or {}),
+            prompt_tokens=dict(d.get("prompt_tokens") or {}),
+            completion_tokens=dict(d.get("completion_tokens") or {}),
+            epochs=int(d.get("epochs", 0)),
+            successes_w=dict(d.get("successes_w") or {}),
+            trials_w=dict(d.get("trials_w") or {}),
+            prompt_tokens_w=dict(d.get("prompt_tokens_w") or {}),
+            completion_tokens_w=dict(d.get("completion_tokens_w") or {}),
+        )
+
+    def _mean(self, model: str, raw: dict, weighted: dict) -> float | None:
+        """Per-trial mean of a sum: weighted when the model has weighted
+        evidence (v2), raw otherwise. None when the model is unmeasured."""
+        nw = self.trials_w.get(model, 0.0)
+        if nw > 1e-9:
+            return weighted.get(model, 0.0) / nw
+        n = self.trials.get(model, 0.0)
+        if n > 1e-9:
+            return raw.get(model, 0.0) / n
+        return None
+
+    def accuracy(self, model: str) -> float:
+        """Posterior mean accuracy under the Beta prior."""
+        s, n = self._posterior_counts(model)
+        return s / n if n > 0 else FRAME_PRIOR_ACCURACY
+
+    def accuracy_lcb(self, model: str) -> float:
+        """Lower confidence bound on accuracy.
+
+        The ceiling is selected on the LOWER bound so a model cannot become the
+        reference on a lucky handful of samples. A model has to earn the
+        position with evidence.
+        """
+        s, n = self._posterior_counts(model)
+        if n <= 0:
+            return 0.0
+        return _wilson_lcb(s / n, n, WILSON_CONFIDENCE)
+
+    def frontier_accuracy(self, model: str) -> float:
+        """The accuracy the constant-policy frontier values this model at: the
+        RAW sample mean, with no prior.
+
+        The posterior mean carried the prior's pull, and the prior is a guess:
+        a neutral 0.5 worth 20 samples read a 90% model as 78.6% after 50
+        samples, exactly where the frontier's confidence reached 1.0, and an
+        always-that-model head collected the difference (diligence 2026-10,
+        finding 3). The raw mean is unbiased, so a constant policy scored at
+        its true accuracy sits ON the frontier, and its lower bound (what a
+        miner is scored on) sits below it: zero headroom at every sample
+        count, by construction rather than in the limit. An upper bound was
+        tried first and rejected: its width (four points at 500 samples) was a
+        tax on every honest router, paid for a certainty the miner-side lower
+        bound already provides.
+
+        An unmeasured model is 1.0: nothing is known, so nothing is paid above
+        it. The confidence factor (`Frontier.confidence`) ramps payout in as
+        distinct observations arrive; the frame counts one per (question,
+        model) however many miners answered, so neither this value nor the
+        ramp depends on field size (I4). The prior still serves `accuracy`
+        and `best_model`, which are selection and reporting, not valuation.
+        """
+        mean = self._mean(model, self.successes, self.successes_w)
+        if mean is None:
+            return 1.0
+        return min(1.0, max(0.0, mean))
+
+    def avg_completion_tokens(self, model: str, default: float) -> float:
+        mean = self._mean(model, self.completion_tokens, self.completion_tokens_w)
+        return default if mean is None else mean
+
+    def _posterior_counts(self, model: str) -> tuple[float, float]:
+        # The prior's weight is against the RAW count of what was measured;
+        # the success rate it is mixed with is the weighted one in v2.
+        n = self.trials.get(model, 0.0)
+        mean = self._mean(model, self.successes, self.successes_w)
+        s = 0.0 if mean is None else mean * n
+        k = float(FRAME_PRIOR_STRENGTH)
+        return s + k * FRAME_PRIOR_ACCURACY, n + k
+
+
+def decay_factor(half_life: int) -> float:
+    return 2.0 ** (-1.0 / max(1, half_life))
+
+
+@dataclass(frozen=True)
+class Observation:
+    """One miner's answer to one exploration question on one nonce-chosen model.
+
+    `coldkey` is the voter: hotkeys under one coldkey are one operator and get
+    one vote between them. `failed` means the model call did not complete --
+    the attested proof says so -- and is distinct from a wrong answer: it tells
+    the frame nothing about the model and is dropped before aggregation.
+    """
+
+    question_id: str
+    model: str
+    correct: bool
+    prompt_tokens: int
+    completion_tokens: int
+    failed: bool = False
+    coldkey: str = ""
+
+
+def aggregate_observations(
+    observations: list[Observation],
+    exclude_coldkeys: set[str] | frozenset[str] | None = None,
+    with_question: bool = False,
+) -> list[tuple]:
+    """Collapse an epoch's shared exploration answers into ONE sample per
+    (question, model), robust to a minority of dishonest operators.
+
+    WHY. Every miner answers the same exploration questions, and the frame used
+    to add each miner's copy as a fresh trial. That had two consequences the
+    2026-10-14 diligence review rated critical and high. A coalition could pull
+    a model's measured accuracy down by exactly its share of the field, by
+    blocking its own network during exploration (a failed call graded as a
+    wrong answer) -- 10% of miners made 9 of 17 constant policies profitable.
+    And thirty identical answers counted as thirty samples, so the frontier's
+    confidence filled in a couple of epochs on two distinct questions per
+    model, long before the prior had washed out (finding 3).
+
+    WHAT. Per (question_id, model):
+      1. drop `failed` observations -- a call that did not happen says nothing;
+      2. drop excluded coldkeys (the anomaly detector's flags, finding 4);
+      3. one vote per coldkey: average that operator's hotkeys;
+      4. the MEDIAN across coldkeys is the observation's `correct` fraction,
+         and likewise for token counts.
+    The result is one trial per distinct (question, model), so `frame.trials`
+    counts what the subnet has actually measured, and a coalition below half
+    the voting coldkeys on a question cannot move its outcome at all.
+
+    THE ASSUMPTION, stated plainly: the frame is robust while honest coldkeys
+    are a majority of those answering each question. Sybils do not help -- a
+    coldkey is the unit -- and each coldkey costs a registration and a TDX VM
+    running the full benchmark.
+
+    Deterministic: output is sorted by (model, question_id) and every step is
+    order-independent, so validators seeing proofs in any order agree (I1, I9).
+    """
+    excluded = set(exclude_coldkeys or ())
+    by_key: dict[tuple[str, str], dict[str, list[Observation]]] = {}
+    for o in observations:
+        if o.failed or o.coldkey in excluded:
+            continue
+        by_key.setdefault((o.model, o.question_id), {}).setdefault(o.coldkey, []).append(o)
+
+    out: list[tuple] = []
+    for (model, qid), by_coldkey in sorted(by_key.items()):
+        votes = sorted(by_coldkey.items())
+        correct = median(sum(float(o.correct) for o in obs) / len(obs) for _, obs in votes)
+        p_tok = median(sum(o.prompt_tokens for o in obs) / len(obs) for _, obs in votes)
+        c_tok = median(sum(o.completion_tokens for o in obs) / len(obs) for _, obs in votes)
+        row = (model, float(correct), float(p_tok), float(c_tok))
+        out.append((qid, *row) if with_question else row)
+    return out
+
+
+def rebuild_from_reveals(source, half_life: int = FRAME_HALF_LIFE):
+    """Rebuild a reference frame by replaying published epoch reveals.
+
+    WHY THIS HAS TO EXIST. The frame is accumulated over time and lives in one
+    local state file. A validator that loses it, and a validator that has just
+    joined, both start from the bootstrap prior while everyone else carries
+    history — and `acc_best` is the denominator of every quality term, so their
+    scores differ from the field's. Measured: a fresh frame gives acc_best 0.500
+    where an established one gives 0.832. Without this, the subnet cannot
+    onboard a second validator or survive a lost disk without diverging.
+
+    Replay is in EPOCH ORDER and one call per epoch, because the decay is
+    applied per call. Sorting by epoch id rather than by filesystem order is
+    what makes two operators rebuilding from the same reveals reach the same
+    frame; directory listing order is not deterministic and would silently
+    produce different weights.
+
+    THE TRUST ASSUMPTION, stated plainly. A reveal is a JSON file. Replaying
+    your OWN reveals after losing state is self-trusting and safe. Replaying
+    someone else's is a snapshot: the exploration outcomes inside came from
+    attested proofs that this validator never saw and cannot re-verify, so the
+    operator is choosing to trust whoever published them. That is a real
+    assumption and it is why this is a bootstrap mechanism, not a verification
+    one. It is the same trade every chain makes when it offers a state snapshot,
+    and the honest mitigation is to rebuild from a source you would already
+    trust to run a validator.
+    """
+    import glob
+    import json
+    import os
+
+    if isinstance(source, (str, os.PathLike)):
+        paths = sorted(glob.glob(os.path.join(str(source), "*", "reveal.json")))
+    else:
+        paths = sorted(source)
+
+    epochs: list[tuple[str, list]] = []
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8") as f:
+                reveal = json.load(f)
+        except Exception as e:  # noqa: BLE001 - one bad file must not lose the rest
+            logger.warning("Skipping unreadable reveal %s: %s", path, e)
+            continue
+        require_identity(reveal.get("routing_protocol"))
+        epoch_id = str(reveal.get("epoch_id", ""))
+        if not epoch_id:
+            logger.warning("Skipping reveal with no epoch_id: %s", path)
+            continue
+        # One observation per entry, aggregated per (question, model) exactly
+        # as the live validator does. Reveals written before `coldkey` and
+        # `failed` existed treat every entry as its own voter, which is what
+        # they were: one entry per miner, no sybil grouping possible.
+        observations = [
+            Observation(
+                question_id=str(e.get("question_id", "")),
+                model=str(e.get("model", "")),
+                correct=bool(e.get("correct")),
+                prompt_tokens=int(e.get("prompt_tokens", 0)),
+                completion_tokens=int(e.get("completion_tokens", 0)),
+                failed=bool(e.get("failed", False)),
+                coldkey=str(e.get("coldkey") or f"entry-{i}"),
+            )
+            for i, e in enumerate(reveal.get("exploration", []))
+            if e.get("model")
+        ]
+        # Protocol v2 reveals publish the epoch's mix weights and each
+        # explored question's benchmark; the live epoch weighted its samples
+        # by them, so the replay does too.
+        weights = None
+        keyed = aggregate_observations(observations, with_question=True)
+        if int(reveal.get("protocol_version", 1)) >= 2 and "frame_mix_weights" in reveal:
+            mix = reveal.get("frame_mix_weights") or {}
+            bench_of = reveal.get("explore_benchmarks") or {}
+            weights = [float(mix.get(bench_of.get(row[0], ""), 1.0)) for row in keyed]
+        epochs.append((epoch_id, [row[1:] for row in keyed], weights))
+
+    frame = None
+    replayed = 0
+    for epoch_id, samples, weights in sorted(epochs, key=lambda x: x[0]):
+        frame = accumulate_exploration(frame, samples, half_life=half_life, weights=weights)
+        replayed += 1
+    logger.info(
+        "Rebuilt reference frame from %d reveals (%d models measured)",
+        replayed, len(frame.trials) if frame else 0,
+    )
+    return frame if frame is not None else load_bootstrap()
+
+
+def implausible_exploration(
+    frame: "ReferenceFrame | None",
+    per_miner: dict[int, list[tuple[str, bool]]],
+    min_samples: int = 8,
+    margin: float = 0.35,
+) -> dict[int, str]:
+    """Miners whose exploration accuracy is implausible for the models they used,
+    in EITHER direction.
+
+    NEVER A SCORE ADJUSTMENT. It returns descriptions; the caller excludes a
+    flagged miner's samples from the reference frame for the epoch and logs
+    the flag, and nothing else. I4 says a miner's score may not depend on
+    other miners; the frame is built from everyone and is already the one
+    place that is true of, so protecting the frame from a flagged miner's
+    samples does not let one miner move another's score — it stops one.
+
+    WHAT IT CATCHES. Exploration questions are answered with a model the
+    NONCE chooses, and the frame knows roughly how good each model is. A miner
+    that serves itself gold reports ~100% on models measured at 50-70%, on
+    every model, every epoch. A miner that drops its own network during
+    exploration, or returns deliberate nonsense, reports ~0% on the same
+    models. The first was always flagged; the second was not (diligence
+    2026-10, finding 4), and it is the one a coalition uses to drag the frame
+    down. `margin` applies both ways.
+
+    The comparison is against the frame as it stood BEFORE this epoch's
+    samples were folded in — the caller's responsibility, and the call order
+    in neurons/validator.py — so a miner is measured against history, not
+    against a frame it has just helped move.
+
+    It is a heuristic and it is stated as one: a lucky or unlucky epoch on few
+    samples looks the same, which is why `min_samples` exists, and a miner who
+    fakes only plausible accuracy evades it. `disagreeing_exploration` is the
+    other half, and catches that miner when the other operators do not agree
+    with it.
+    """
+    if frame is None:
+        return {}
+    flagged: dict[int, str] = {}
+    for uid, results in sorted(per_miner.items()):
+        by_model: dict[str, list[bool]] = {}
+        for model, correct in results:
+            by_model.setdefault(model, []).append(bool(correct))
+        n_total = sum(len(v) for v in by_model.values())
+        if n_total < min_samples:
+            continue
+        # Expected accuracy is the frame's estimate for the models this miner
+        # was actually assigned, weighted by how many of each it answered.
+        expected = 0.0
+        observed = 0.0
+        measured = 0
+        for model, outcomes in by_model.items():
+            if frame.trials.get(model, 0.0) < 1.0:
+                continue                      # frame has never seen it; no basis
+            expected += frame.accuracy(model) * len(outcomes)
+            observed += sum(outcomes)
+            measured += len(outcomes)
+        if measured < min_samples:
+            continue
+        exp_rate, obs_rate = expected / measured, observed / measured
+        if abs(obs_rate - exp_rate) > margin:
+            direction = "above" if obs_rate > exp_rate else "below"
+            flagged[uid] = (
+                f"exploration accuracy {obs_rate:.0%} is {direction} the reference-"
+                f"frame expectation of {exp_rate:.0%} by more than {margin:.0%} over "
+                f"{measured} samples on {len(by_model)} nonce-chosen models"
+            )
+    return flagged
+
+
+def disagreeing_exploration(
+    per_miner: dict[int, list[tuple[str, str, bool]]],
+    coldkeys: dict[int, str],
+    min_voters: int = EXPLORE_DISAGREE_MIN_VOTERS,
+    min_samples: int = EXPLORE_DISAGREE_MIN_SAMPLES,
+    max_disagreement: float = EXPLORE_DISAGREE_MAX,
+) -> dict[int, str]:
+    """Miners whose exploration answers disagree with the other operators'.
+
+    While exploration is shared, every coldkey asks the same model the same
+    question, and at temperature 0 honest answers mostly agree. That gives a
+    detector that needs no baseline at all — not the frame, which an attacker
+    may be moving, and not the prior. Per (question, model) with at least
+    `min_voters` coldkeys, the majority of per-coldkey votes is the consensus
+    (an exact tie has none and is skipped); a miner that disagrees with the
+    consensus on more than `max_disagreement` of at least `min_samples` such
+    answers is flagged. As with `implausible_exploration`, the only
+    consequence is that its samples stay out of the frame for the epoch.
+
+    `per_miner` is {uid: [(question_id, model, correct)]}; `coldkeys` maps a
+    uid to its operator so hotkeys under one coldkey are one vote. Loose by
+    design: OpenRouter serves one model id from several providers, so some
+    honest disagreement is normal (the threshold is in config.py with that
+    reason next to it). Deterministic: no ordering of `per_miner` changes the
+    result.
+    """
+    votes: dict[tuple[str, str], dict[str, list[float]]] = {}
+    for uid, answers in per_miner.items():
+        ck = coldkeys.get(uid, f"uid-{uid}")
+        for qid, model, correct in answers:
+            votes.setdefault((qid, model), {}).setdefault(ck, []).append(float(correct))
+    consensus: dict[tuple[str, str], bool] = {}
+    for key, by_ck in votes.items():
+        if len(by_ck) < min_voters:
+            continue
+        mean = sum(sum(v) / len(v) for v in by_ck.values()) / len(by_ck)
+        if abs(mean - 0.5) < 1e-9:
+            continue
+        consensus[key] = mean > 0.5
+
+    flagged: dict[int, str] = {}
+    for uid in sorted(per_miner):
+        judged = [(qid, model, correct) for qid, model, correct in per_miner[uid]
+                  if (qid, model) in consensus]
+        if len(judged) < min_samples:
+            continue
+        disagree = sum(1 for qid, model, correct in judged
+                       if bool(correct) != consensus[(qid, model)])
+        rate = disagree / len(judged)
+        if rate > max_disagreement:
+            flagged[uid] = (
+                f"disagrees with the cross-miner majority on {disagree} of "
+                f"{len(judged)} exploration answers ({rate:.0%}, limit "
+                f"{max_disagreement:.0%})"
+            )
+    return flagged
+
+
+def accumulate_exploration(
+    frame: ReferenceFrame | None,
+    samples: list[tuple[str, float, float, float]],
+    half_life: int = FRAME_HALF_LIFE,
+    weights: list[float] | None = None,
+) -> ReferenceFrame:
+    """Fold one epoch's exploration samples into the frame.
+
+    `samples` are (model_id, correct, prompt_tokens, completion_tokens) tuples:
+    on the live path the output of `aggregate_observations`, one per distinct
+    (question, model) with `correct` a fraction in [0, 1]; a plain bool is
+    accepted too, which is what tests and single-voter replays supply. Sample
+    order does not affect the result — all terms are sums — so validators
+    processing proofs in any order reach identical frames.
+
+    `weights` (protocol v2) are per-sample mix weights, aligned with
+    `samples`; they enter only the weighted sums, never the raw trial count.
+    Once a frame carries weighted sums, later epochs keep them up to date
+    (weight 1 where none is given), so the two never drift apart.
+    """
+    if weights is not None and len(weights) != len(samples):
+        raise ValueError("weights must align with samples")
+    alpha = decay_factor(half_life)
+    prev = frame or ReferenceFrame()
+
+    out = ReferenceFrame(
+        successes={m: v * alpha for m, v in prev.successes.items()},
+        trials={m: v * alpha for m, v in prev.trials.items()},
+        prompt_tokens={m: v * alpha for m, v in prev.prompt_tokens.items()},
+        completion_tokens={m: v * alpha for m, v in prev.completion_tokens.items()},
+        epochs=prev.epochs + 1,
+    )
+    keep_weighted = weights is not None or prev.weighted
+    if keep_weighted:
+        out.successes_w = {m: v * alpha for m, v in prev.successes_w.items()}
+        out.trials_w = {m: v * alpha for m, v in prev.trials_w.items()}
+        out.prompt_tokens_w = {m: v * alpha for m, v in prev.prompt_tokens_w.items()}
+        out.completion_tokens_w = {m: v * alpha for m, v in prev.completion_tokens_w.items()}
+    for i, (model, correct, p_tok, c_tok) in enumerate(samples):
+        out.trials[model] = out.trials.get(model, 0.0) + 1.0
+        out.successes[model] = out.successes.get(model, 0.0) + float(correct)
+        out.prompt_tokens[model] = out.prompt_tokens.get(model, 0.0) + float(p_tok)
+        out.completion_tokens[model] = out.completion_tokens.get(model, 0.0) + float(c_tok)
+        if keep_weighted:
+            w = 1.0 if weights is None else float(weights[i])
+            out.trials_w[model] = out.trials_w.get(model, 0.0) + w
+            out.successes_w[model] = out.successes_w.get(model, 0.0) + w * float(correct)
+            out.prompt_tokens_w[model] = out.prompt_tokens_w.get(model, 0.0) + w * float(p_tok)
+            out.completion_tokens_w[model] = (
+                out.completion_tokens_w.get(model, 0.0) + w * float(c_tok)
+            )
+    return out
+
+
+def best_model(
+    frame: ReferenceFrame,
+    prices: dict[str, tuple[float, float]],
+) -> tuple[str, float]:
+    """The reference model, and the ceiling accuracy to score against.
+
+    Selection and valuation deliberately use different statistics:
+
+    - **Selected** on the accuracy lower bound, so a model cannot be crowned
+      the reference on a lucky handful of samples. It has to earn the position.
+    - **Valued** at the posterior mean, because the ceiling is an estimate of a
+      fixed quantity — how good that model actually is.
+
+    Using the lower bound for the value too was a real bug: an LCB is
+    deliberately pessimistic, and its pessimism shrinks as evidence
+    accumulates, so the ceiling became a function of how many samples existed
+    and therefore of how many miners were online. Measured, that moved a fixed
+    head's score by 0.14 between a 3-miner and a 50-miner field — exactly the
+    non-interference property (I4) the frame exists to preserve. The posterior
+    mean is a consistent estimator of the truth and carries no such systematic
+    drift with sample count.
+
+    Ties break toward the cheaper model, which is what makes cold start
+    coherent: with no evidence every model shares the prior, and the right
+    reference for "quality per dollar" among equals is the cheapest one.
+    """
+    if not prices:
+        raise ValueError("cannot pick a reference model from an empty price table")
+
+    def rank(model: str) -> tuple[float, float]:
+        p_in, p_out = prices[model]
+        return (-frame.accuracy_lcb(model), p_in + p_out)
+
+    best = min(sorted(prices), key=rank)
+    return best, frame.accuracy(best)
+
+
+def reference_cost(
+    frame: ReferenceFrame,
+    prices: dict[str, tuple[float, float]],
+    model: str,
+    prompt_tokens: float,
+    n_questions: int,
+    default_completion_tokens: float,
+) -> float:
+    """What the reference model would have cost on this question set.
+
+    Prompt tokens come from the miner's attested counts — a property of the
+    questions, shared by any model answering them. Completion tokens come from
+    the frame's observed average for the reference model, because a different
+    model genuinely writes a different amount.
+    """
+    p_in, p_out = prices[model]
+    c_tok = frame.avg_completion_tokens(model, default_completion_tokens)
+    return p_in * prompt_tokens + p_out * c_tok * max(n_questions, 0)
+
+
+BOOTSTRAP_FRAME_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data", "reference_frame.json",
+)
+
+
+def load_bootstrap(path: str | None = None, require: bool = False) -> ReferenceFrame:
+    """Load the shipped bootstrap frame, or an empty one if absent.
+
+    The bootstrap is real measured evidence (built by
+    scripts/build_bootstrap_frame.py from testnet reveals and hash-pinned),
+    not a prior: it is decayed exploration counts, so the frontier is valued
+    from it exactly as from live samples and pays from epoch 1 instead of
+    after FRONTIER_MIN_TRIALS distinct observations per model.
+
+    `require=True` is the live validator: a missing file there is not "start
+    cold", it is one validator scoring the field against a different frame
+    from every other validator (I1), so it raises instead of returning empty.
+    """
+    if path is None:
+        path = BOOTSTRAP_FRAME_PATH
+    try:
+        with open(path, encoding="utf-8") as f:
+            return ReferenceFrame.from_dict(json.load(f))
+    except FileNotFoundError:
+        if require:
+            raise FileNotFoundError(
+                f"No bootstrap reference frame at {path}. A live validator with no "
+                "accumulated frame must start from the shipped one, or it scores the "
+                "field against a different frontier from every other validator. Build "
+                "it with scripts/build_bootstrap_frame.py, or set FUGAL_FRAME_BOOTSTRAP "
+                "to a directory of published reveals."
+            ) from None
+        logger.info("No bootstrap reference frame at %s — starting from the prior", path)
+        return ReferenceFrame()
+
+
+def _wilson_lcb(p: float, n: float, confidence: float) -> float:
+    if n < 1e-9:
+        return 0.0
+    z = _Z.get(confidence, 1.96)
+    denom = 1 + z * z / n
+    center = p + z * z / (2 * n)
+    spread = z * math.sqrt(max(0.0, (p * (1 - p) + z * z / (4 * n)) / n))
+    return max(0.0, (center - spread) / denom)

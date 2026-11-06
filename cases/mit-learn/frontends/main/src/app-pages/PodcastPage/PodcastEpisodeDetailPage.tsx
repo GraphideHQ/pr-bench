@@ -1,0 +1,421 @@
+"use client"
+
+import React, { useMemo } from "react"
+import { Typography, Skeleton, styled } from "ol-components"
+import { RiPlayFill, RiPauseFill } from "@remixicon/react"
+import {
+  useLearningResourcesDetail,
+  useInfiniteLearningResourceItems,
+  podcastEpisodeQueries,
+} from "api/hooks/learningResources"
+import { useQuery } from "@tanstack/react-query"
+
+import { ResourceTypeEnum } from "api/v1"
+import type { PodcastEpisodeResource } from "api/v1"
+import { formatDate } from "ol-utilities"
+import { HOME, absoluteUrl, podcastEpisodePath } from "@/common/urls"
+import { addExternalLinkTargets } from "@/common/utils"
+import { EpisodeItem } from "./PodcastsListingPage/EpisodeItem"
+import PodcastContainer from "./PodcastContainer"
+import PodcastBreadcrumbs from "./PodcastBreadcrumbs"
+import Link from "next/link"
+import { usePodcastPage } from "./usePodcastPage"
+import {
+  getEpisodeAudioUrl,
+  getEpisodeDurationMinutes,
+  getEpisodeParentPodcast,
+} from "./PodcastsListingPage/helpers"
+import { EPISODES_PAGE_SIZE } from "./PodcastsListingPage/constants"
+import {
+  PageSection,
+  EpisodeList,
+  PlayButton,
+  SectionMessage,
+} from "./PodcastsListingPage/styled"
+
+import PodcastShareButton from "./PodcastShareButton"
+import EpisodeContentTabs from "./EpisodeContentTabs"
+import type { TranscriptState } from "./EpisodeContentTabs"
+import { buildPodcastEpisodeStructuredData } from "./podcastEpisodeStructuredData"
+
+/* ── Layout ── */
+
+const HeaderSection = styled("div", {
+  shouldForwardProp: (prop) => prop !== "hasEpisodes",
+})<{ hasEpisodes?: boolean }>(({ theme, hasEpisodes }) => ({
+  ...(hasEpisodes && {
+    borderBottom: `1px solid ${theme.custom.colors.lightGray2}`,
+    marginBottom: "64px",
+  }),
+  paddingBottom: "64px",
+  [theme.breakpoints.down("sm")]: {
+    marginBottom: "24px",
+    paddingBottom: "24px",
+  },
+}))
+
+const EpisodeLabel = styled(Link)(({ theme }) => ({
+  color: theme.custom.colors.darkRed,
+  textTransform: "uppercase" as const,
+  ...theme.typography.body2,
+  fontWeight: theme.typography.fontWeightBold,
+  marginBottom: "32px",
+  lineHeight: "150%" /* 21px */,
+  marginTop: "64px",
+  display: "block",
+  textDecoration: "none",
+  "&:hover": {
+    textDecoration: "underline",
+  },
+  [theme.breakpoints.down("sm")]: {
+    marginTop: "32px",
+    marginBottom: "8px",
+  },
+}))
+
+const EpisodeTitle = styled(Typography)(({ theme }) => ({
+  marginBottom: "32px",
+  display: "block",
+  [theme.breakpoints.down("sm")]: {
+    ...theme.typography.h2,
+    marginBottom: "18px",
+  },
+}))
+
+const MoreItemDescription = styled(Typography)(({ theme }) => ({
+  color: theme.custom.colors.black,
+  display: "block",
+  marginBottom: "24px",
+  fontSize: "24px",
+  lineHeight: "30px",
+  fontWeight: theme.typography.fontWeightBold,
+  [theme.breakpoints.down("sm")]: {
+    marginBottom: "24px",
+    marginTop: "64px",
+  },
+}))
+
+const MetaLine = styled(Typography)(({ theme }) => ({
+  color: theme.custom.colors.darkGray2,
+  marginBottom: "32px",
+  display: "block",
+  ...theme.typography.body1,
+  fontWeight: theme.typography.fontWeightMedium,
+  lineHeight: "150%",
+  [theme.breakpoints.down("sm")]: {
+    marginBottom: "16px",
+  },
+}))
+
+const Topics = styled.span(({ theme }) => ({
+  color: theme.custom.colors.darkGray1,
+  ...theme.typography.body1,
+  lineHeight: "20px",
+  [theme.breakpoints.down("sm")]: {
+    marginBottom: "16px",
+    display: "block",
+  },
+}))
+
+const StyledPodcastShareButton = styled(PodcastShareButton)({
+  padding: "18px 12px",
+  margin: "0 0 24px",
+})
+
+const ViewAllLink = styled.a(({ theme }) => ({
+  color: theme.custom.colors.darkRed,
+  ...theme.typography.body1,
+  fontWeight: theme.typography.fontWeightMedium,
+  lineHeight: "150%",
+  textDecoration: "none",
+  display: "inline-flex",
+  alignItems: "center",
+  gap: "4px",
+  marginTop: "40px",
+  marginBottom: "64px",
+  "&:hover": {
+    textDecoration: "underline",
+  },
+  [theme.breakpoints.down("sm")]: {
+    marginBottom: "40px",
+  },
+}))
+
+const StyledButton = styled(PlayButton)(({ theme }) => ({
+  marginBottom: "32px",
+  minWidth: "175px",
+  ...theme.typography.body1,
+  [theme.breakpoints.down("sm")]: {
+    marginBottom: "16px",
+  },
+}))
+
+const PodcastShareSection = styled("div")({
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  flexWrap: "wrap",
+  gap: "8px",
+})
+
+const SkeletonLine = styled(Skeleton)({
+  marginBottom: "16px",
+})
+
+const EpisodeHeaderSkeleton = () => (
+  <div data-testid="episode-header-skeleton" aria-hidden>
+    <SkeletonLine variant="text" width={160} height={21} />
+    <SkeletonLine variant="text" width="80%" height={44} />
+    <SkeletonLine variant="text" width="50%" height={24} />
+    <SkeletonLine variant="rectangular" width={175} height={48} />
+    <SkeletonLine variant="text" width="100%" height={20} />
+    <SkeletonLine variant="text" width="95%" height={20} />
+    <SkeletonLine variant="text" width="88%" height={20} />
+  </div>
+)
+
+/* ── Component ── */
+
+type PodcastEpisodeDetailPageProps = {
+  episodeId: string
+  podcastId: string | null
+}
+
+export const PodcastEpisodeDetailPage: React.FC<
+  PodcastEpisodeDetailPageProps
+> = ({ episodeId, podcastId }) => {
+  const { isMobile, playerBar, playingEpisode, isAudioPlaying, toggle, pause } =
+    usePodcastPage()
+
+  const {
+    data: episode,
+    isLoading: episodeLoading,
+    isError: episodeError,
+  } = useLearningResourcesDetail(Number(episodeId))
+
+  // Parent podcast summary comes embedded in the episode response — prefer the
+  // one matching the URL's podcastId, else fall back to the first parent.
+  const parentPodcast = episode
+    ? getEpisodeParentPodcast(episode, Number(podcastId))
+    : null
+
+  // The transcript is served from its own endpoint because the text runs tens
+  // of kilobytes; has_transcript gates the request so episodes without one
+  // (most of them) never issue it.
+  const hasTranscript = !!(episode as PodcastEpisodeResource | undefined)
+    ?.podcast_episode?.has_transcript
+  const { data: transcriptData, isError: transcriptError } = useQuery({
+    ...podcastEpisodeQueries.transcript(Number(episodeId)),
+    enabled: hasTranscript,
+  })
+
+  // A resolved-but-empty payload counts as absent, not as still loading: the
+  // endpoint is cached, so an episode whose transcript landed after something
+  // first requested it serves "" for a while. Treating that as `loading` would
+  // leave a skeleton that never resolves.
+  const transcript: TranscriptState = !hasTranscript
+    ? { status: "absent" }
+    : transcriptError
+      ? { status: "error" }
+      : transcriptData
+        ? transcriptData.transcript
+          ? { status: "ready", text: transcriptData.transcript }
+          : { status: "absent" }
+        : { status: "loading" }
+
+  const { data: episodesData } = useInfiniteLearningResourceItems(
+    Number(podcastId),
+    { learning_resource_id: Number(podcastId), limit: EPISODES_PAGE_SIZE },
+    { enabled: !!podcastId },
+  )
+  const episodes =
+    episodesData?.pages.flatMap((page) =>
+      page.results
+        .map((rel) => rel.resource)
+        .filter(
+          (r) =>
+            r.resource_type === ResourceTypeEnum.PodcastEpisode &&
+            r.id !== Number(episodeId),
+        ),
+    ) ?? []
+  const duration = episode ? getEpisodeDurationMinutes(episode) : null
+
+  const date = episode?.last_modified
+    ? formatDate(episode.last_modified, "MMM D, YYYY")
+    : null
+
+  const topics = episode?.topics?.map((t) => t.name).filter(Boolean) ?? []
+  const topicString = topics?.join("\u00A0\u00A0\u00A0\u00A0")
+  const metaParts = [duration ? `${duration} min` : null, date].filter(Boolean)
+
+  const isCurrentEpisodePlaying =
+    !!episode && playingEpisode?.id === episode.id && isAudioPlaying
+
+  const handlePlay = () => {
+    if (!episode) return
+    toggle(episode, Number(podcastId))
+  }
+
+  // A podcast has a single page, so its `learn_url` is that page.
+  const podcastHref = parentPodcast?.learn_url ?? "/"
+
+  // Shares the page in front of the user, parent podcast included: an episode
+  // in several podcasts is viewable under any of them, and a recommendation is
+  // usually about the series it was found in.
+  const sharePageUrl =
+    episode && podcastId
+      ? absoluteUrl(
+          podcastEpisodePath(String(episode.id), podcastId, episode.url_slug),
+        )
+      : ""
+
+  // Episode descriptions are sanitized on the backend with nh3 during ETL
+  // (only <a href/title> is allowed), so the HTML is safe to render verbatim
+  // — the same trust model as resource descriptions elsewhere. Rendering it
+  // directly keeps server and client output identical, avoiding a hydration
+  // mismatch; target="_blank" is added via addExternalLinkTargets so it's
+  // part of the HTML fed to dangerouslySetInnerHTML on both server and
+  // client, keeping SSR output byte-identical to the client's first render.
+  const description = useMemo(
+    () =>
+      episode?.description ? addExternalLinkTargets(episode.description) : null,
+    [episode?.description],
+  )
+
+  // PodcastEpisode JSON-LD for search indexing. Rendered as a plain <script>
+  // tag so crawlers can read it without executing any additional JS.
+  // See: https://schema.org/PodcastEpisode
+  const structuredData = !episodeLoading
+    ? buildPodcastEpisodeStructuredData(episode as PodcastEpisodeResource)
+    : null
+
+  return (
+    <>
+      {structuredData && (
+        <script
+          type="application/ld+json"
+          // Every `<` is escaped, not just `</`. Escaping `</` alone stops
+          // `</script>` but not `<!--<script>`, which puts the parser into the
+          // script-data-escaped state it then never leaves, swallowing the rest
+          // of the document. Episode titles come straight from third-party RSS
+          // with no sanitization. \u003c is valid JSON and inert in HTML.
+          dangerouslySetInnerHTML={{
+            __html: JSON.stringify(structuredData).replace(/</g, "\\u003c"),
+          }}
+        />
+      )}
+      <PageSection variant="gray">
+        <PodcastBreadcrumbs
+          ancestors={[
+            { href: HOME, label: "Home" },
+            { href: podcastHref, label: parentPodcast?.title ?? "Podcast" },
+          ]}
+          current={episode?.title}
+        />
+        <HeaderSection hasEpisodes={episodes.length > 0}>
+          <PodcastContainer contentWidth={624} gutterBreakpoint="sm">
+            {episodeLoading ? (
+              <EpisodeHeaderSkeleton />
+            ) : episodeError ? (
+              <SectionMessage variant="body1">
+                Something went wrong loading this episode. Please try again
+                later.
+              </SectionMessage>
+            ) : !episode ? (
+              <SectionMessage variant="body1">
+                This episode is unavailable.
+              </SectionMessage>
+            ) : (
+              <>
+                {parentPodcast?.title && (
+                  <EpisodeLabel href={podcastHref}>
+                    {parentPodcast.title}
+                  </EpisodeLabel>
+                )}
+
+                <EpisodeTitle variant="h1">{episode.title}</EpisodeTitle>
+
+                {metaParts.length > 0 && (
+                  <MetaLine>
+                    {metaParts.join("   .   ")}
+                    {!isMobile && <Topics> . {topicString}</Topics>}
+                  </MetaLine>
+                )}
+                {isMobile && <Topics>{topicString}</Topics>}
+                <PodcastShareSection>
+                  {podcastId && (
+                    <StyledButton
+                      onClick={handlePlay}
+                      variant="primary"
+                      startIcon={
+                        isCurrentEpisodePlaying ? (
+                          <RiPauseFill />
+                        ) : (
+                          <RiPlayFill />
+                        )
+                      }
+                      disabled={!getEpisodeAudioUrl(episode)}
+                    >
+                      {isCurrentEpisodePlaying
+                        ? "Pause Episode"
+                        : "Play Episode"}
+                    </StyledButton>
+                  )}
+                  {podcastId && (
+                    <StyledPodcastShareButton
+                      resource={episode as PodcastEpisodeResource}
+                      title={episode.title ?? "episode"}
+                      sharePageUrl={sharePageUrl}
+                    />
+                  )}
+                </PodcastShareSection>
+                <EpisodeContentTabs
+                  descriptionHtml={description}
+                  transcript={transcript}
+                />
+              </>
+            )}
+          </PodcastContainer>
+        </HeaderSection>
+        {episodes && episodes.length > 0 && (
+          <PodcastContainer contentWidth={624} gutterBreakpoint="sm">
+            <MoreItemDescription>
+              More from {parentPodcast?.title ?? "Podcast"}
+            </MoreItemDescription>
+
+            <EpisodeList>
+              {episodes.map((episode) => (
+                <EpisodeItem
+                  key={episode.id}
+                  isMobile={isMobile}
+                  episode={episode}
+                  href={
+                    podcastId
+                      ? podcastEpisodePath(
+                          String(episode.id),
+                          podcastId,
+                          episode.url_slug,
+                        )
+                      : ""
+                  }
+                  isPlaying={
+                    playingEpisode?.id === episode.id && isAudioPlaying
+                  }
+                  onPlayClick={(ep) => toggle(ep, Number(podcastId))}
+                  onPauseClick={pause}
+                  isPlayable={Boolean(getEpisodeAudioUrl(episode))}
+                  isEpisodePage
+                />
+              ))}
+            </EpisodeList>
+            {podcastId && (
+              <ViewAllLink href={podcastHref}>View all episodes →</ViewAllLink>
+            )}
+          </PodcastContainer>
+        )}
+      </PageSection>
+
+      {playerBar}
+    </>
+  )
+}

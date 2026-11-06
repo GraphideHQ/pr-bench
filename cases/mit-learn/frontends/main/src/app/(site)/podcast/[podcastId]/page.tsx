@@ -1,0 +1,30 @@
+import type { AppPageProps } from "@/common/searchParams"
+import { getQueryClient } from "@/app/getQueryClient"
+import { ResourceTypeEnum } from "api"
+import { learningResourceQueries } from "api/hooks/learningResources"
+import { notFound, redirect } from "next/navigation"
+import { parseResourceId } from "@/common/slugs"
+import { carrySearchParams, podcastPath } from "@/common/urls"
+
+/** Bare /podcast/{id} is never canonical → 307-redirect to the slugged form. */
+const Page = async (props: AppPageProps<"/podcast/[podcastId]">) => {
+  const { podcastId } = await props.params
+  const id = parseResourceId(podcastId)
+  if (id === null) {
+    notFound()
+  }
+  const queryClient = getQueryClient()
+  const resource = await queryClient.fetchQueryOr404(
+    learningResourceQueries.detail(id),
+  )
+  if (resource.resource_type !== ResourceTypeEnum.Podcast) {
+    notFound()
+  }
+  redirect(
+    carrySearchParams(
+      podcastPath(id, resource.url_slug),
+      await props.searchParams,
+    ),
+  )
+}
+export default Page

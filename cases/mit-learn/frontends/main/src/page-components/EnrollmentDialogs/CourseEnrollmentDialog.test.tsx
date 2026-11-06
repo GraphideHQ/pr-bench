@@ -1,0 +1,782 @@
+import React from "react"
+import { act } from "@testing-library/react"
+import {
+  screen,
+  waitFor,
+  within,
+  renderWithProviders,
+  user,
+  setupLocationMock,
+} from "@/test-utils"
+import {
+  makeRequest,
+  setMockResponse,
+  urls as apiUrls,
+  factories as apiFactories,
+} from "api/test-utils"
+import {
+  urls as mitxUrls,
+  factories as mitxFactories,
+  mockEnrollmentEligible,
+} from "api/mitxonline-test-utils"
+import type {
+  CourseRunV2,
+  CourseWithCourseRunsSerializerV2,
+} from "@mitodl/mitxonline-api-axios/v2"
+import NiceModal from "@ebay/nice-modal-react"
+import CourseEnrollmentDialog from "./CourseEnrollmentDialog"
+import { faker } from "@faker-js/faker/locale/en"
+import invariant from "tiny-invariant"
+import { mitxonlineLegacyUrl } from "@/common/mitxonline"
+import * as routes from "@/common/urls"
+import { trackAddToCart, trackBeginCheckout } from "@/common/analytics/gtm"
+
+// The paid path checks enrollment eligibility before the cart.
+beforeEach(() => {
+  mockEnrollmentEligible()
+})
+
+jest.mock("@/common/analytics/gtm", () => ({
+  ...jest.requireActual("@/common/analytics/gtm"),
+  trackAddToCart: jest.fn(),
+  trackBeginCheckout: jest.fn(),
+}))
+
+const makeCourseRun = mitxFactories.courses.courseRun
+const makeProduct = mitxFactories.courses.product
+const makeCourse = mitxFactories.courses.course
+
+const bothEnrollmentModes = () => [
+  mitxFactories.courses.enrollmentMode({ requires_payment: false }),
+  mitxFactories.courses.enrollmentMode({ requires_payment: true }),
+]
+
+const freeOnlyEnrollmentModes = () => [
+  mitxFactories.courses.enrollmentMode({ requires_payment: false }),
+]
+
+/**
+ * Registers a list-price quote for each of the run's products. The dialog
+ * quotes every purchasable product for a signed-in learner, so a run without
+ * one makes unrelated tests fail on an unmocked request. Tests that care about
+ * the quote re-register their own afterwards.
+ */
+const withQuotedProducts = (run: CourseRunV2): CourseRunV2 => {
+  run.products.forEach((product) => {
+    setMockResponse.get(
+      mitxUrls.products.userPricingDetail(product.id),
+      mitxFactories.products.userPricing({
+        id: product.id,
+        price: product.price,
+      }),
+    )
+  })
+  return run
+}
+
+const enrollableRun: typeof makeCourseRun = (overrides) =>
+  withQuotedProducts(
+    makeCourseRun({
+      is_enrollable: true,
+      enrollment_start: faker.date.past().toISOString(),
+      enrollment_end: faker.date.future().toISOString(),
+      enrollment_modes: bothEnrollmentModes(),
+      ...overrides,
+    }),
+  )
+
+const upgradeableRun: typeof makeCourseRun = (overrides) =>
+  withQuotedProducts(
+    makeCourseRun({
+      is_upgradable: true,
+      is_enrollable: true,
+      is_archived: false,
+      products: [mitxFactories.courses.product()],
+      enrollment_modes: bothEnrollmentModes(),
+      ...overrides,
+    }),
+  )
+
+describe("CourseEnrollmentDialog", () => {
+  const openDialog = async (course: CourseWithCourseRunsSerializerV2) => {
+    await act(async () => {
+      NiceModal.show(CourseEnrollmentDialog, { course })
+    })
+    return await screen.findByRole("dialog")
+  }
+
+  setupLocationMock()
+
+  beforeEach(() => {
+    // Enrolling and adding to cart both consult the MITx Online profile through
+    // the compliance gate. The factory default has nothing missing, so it passes
+    // straight through; see JustInTimeDialog tests for the blocked case.
+    setMockResponse.get(mitxUrls.userMe.get(), mitxFactories.user.user())
+    setMockResponse.get(
+      apiUrls.userMe.get(),
+      apiFactories.user.user({ is_authenticated: true }),
+    )
+  })
+
+  describe("Course run dropdown", () => {
+    test("Shows one entry for each enrollable course run", async () => {
+      const run1 = enrollableRun()
+      const run2 = enrollableRun()
+      const run3 = enrollableRun()
+      const course = makeCourse({ courseruns: [run1, run2, run3] })
+
+      renderWithProviders(null)
+      await openDialog(course)
+
+      const select = screen.getByRole("combobox", { name: /choose a date/i })
+      await user.click(select)
+
+      const options = await screen.findAllByRole("option")
+      // Should have 4 options: 1 "Please Select" + 3 course runs
+      expect(options).toHaveLength(4)
+
+      // Verify the actual run options (excluding "Please Select")
+      const runOptions = options.slice(1)
+      expect(runOptions).toHaveLength(3)
+    })
+
+    test("Does NOT include non-enrollable course runs in dropdown", async () => {
+      const run1 = enrollableRun()
+      const nonEnrollableRun = makeCourseRun({ is_enrollable: false })
+      const archivedRun = makeCourseRun({
+        is_archived: true,
+        is_enrollable: true,
+      })
+      const course = makeCourse({
+        courseruns: [run1, nonEnrollableRun, archivedRun],
+      })
+
+      renderWithProviders(<div />)
+      await openDialog(course)
+
+      const select = screen.getByRole("combobox", { name: /choose a date/i })
+      await user.click(select)
+
+      const options = await screen.findAllByRole("option")
+      expect(options).toHaveLength(3) // 1 "Please Select" + 2 enrollable runs
+    })
+
+    test("Course run label indicates whether certificate upgrade is available", async () => {
+      const run1 = upgradeableRun({
+        start_date: "2024-01-01T00:00:00Z",
+        end_date: "2024-06-01T00:00:00Z",
+      })
+      const nonUpgradableRun = enrollableRun({
+        start_date: "2024-07-01T00:00:00Z",
+        end_date: "2024-12-01T00:00:00Z",
+        is_upgradable: false,
+      })
+      const course = makeCourse({ courseruns: [run1, nonUpgradableRun] })
+
+      renderWithProviders(<div />)
+      await openDialog(course)
+
+      const select = screen.getByRole("combobox", { name: /choose a date/i })
+      await user.click(select)
+
+      // Verify upgradable run does NOT have "(No certificate available)" text
+      const options = await screen.findAllByRole("option")
+      expect(options.map((opt) => opt.textContent)).toEqual([
+        "Please Select",
+        "Jan 1, 2024 - Jun 1, 2024",
+        "Jul 1, 2024 - Dec 1, 2024 (No certificate available)",
+      ])
+    })
+  })
+
+  describe("Certificate upgrade display", () => {
+    test("When upgradeable run is chosen, upgrade button is enabled with price and deadline", async () => {
+      const run = upgradeableRun({
+        upgrade_deadline: "2024-02-15T00:00:00Z",
+        products: [makeProduct({ price: "149.00" })],
+      })
+      const course = makeCourse({ courseruns: [run] })
+
+      renderWithProviders(<div />)
+      await openDialog(course)
+
+      // The single run should be auto-selected
+      const certificatePrice = await screen.findByText(/Get Certificate/)
+      expect(certificatePrice).toBeInTheDocument()
+      expect(screen.getByText(/\$149/)).toBeInTheDocument()
+
+      // Check for deadline text (date format may vary)
+      const deadline = screen.getByText(/Payment due:/)
+      expect(deadline).toBeInTheDocument()
+
+      const upgradeButton = screen.getByRole("button", {
+        name: /Add to Cart.*to get a Certificate/i,
+      })
+      expect(upgradeButton).toBeEnabled()
+    })
+
+    test("When non-upgradeable run is chosen, upgrade display is disabled with appropriate text", async () => {
+      const nonUpgradableRun = enrollableRun({
+        is_upgradable: false,
+        products: [],
+      })
+      const run2 = upgradeableRun()
+      const course = makeCourse({ courseruns: [nonUpgradableRun, run2] })
+
+      renderWithProviders(<div />)
+      await openDialog(course)
+
+      // Select the non-upgradable run
+      const select = screen.getByRole("combobox", { name: /choose a date/i })
+      await user.click(select)
+
+      const nonUpgradableOption = screen.getByRole("option", {
+        name: /No certificate available/i,
+      })
+      await user.click(nonUpgradableOption)
+
+      // Should show "Not available" text
+      const notAvailable = await screen.findByText("Not available")
+      expect(notAvailable).toBeInTheDocument()
+
+      // Upgrade button should be disabled
+      const upgradeButton = screen.getByRole("button", {
+        name: /Add to Cart.*to get a Certificate/i,
+      })
+      expect(upgradeButton).toBeDisabled()
+    })
+
+    test("Shows error alert when 'Add to Cart' basket operation fails", async () => {
+      const run = upgradeableRun({
+        products: [makeProduct({ price: "149.00" })],
+      })
+      const course = makeCourse({ courseruns: [run] })
+
+      renderWithProviders(<div />)
+      await openDialog(course)
+
+      setMockResponse.delete(mitxUrls.baskets.clear(), undefined, { code: 500 })
+
+      const upgradeButton = await screen.findByRole("button", {
+        name: /Add to Cart.*to get a Certificate/i,
+      })
+      await user.click(upgradeButton)
+
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "There was a problem processing your enrollment. Please try again.",
+      )
+    })
+
+    test("Shows the server's 400 detail when the basket add is rejected", async () => {
+      const run = upgradeableRun({
+        products: [makeProduct({ price: "149.00" })],
+      })
+      const product = run.products[0]
+      invariant(product, "Upgradeable run must have a product")
+      const course = makeCourse({ courseruns: [run] })
+
+      renderWithProviders(<div />)
+      await openDialog(course)
+
+      setMockResponse.delete(mitxUrls.baskets.clear(), undefined)
+      setMockResponse.post(
+        mitxUrls.baskets.createFromProduct(product.id),
+        { detail: "That product is no longer available." },
+        { code: 400 },
+      )
+
+      const upgradeButton = await screen.findByRole("button", {
+        name: /Add to Cart.*to get a Certificate/i,
+      })
+      await user.click(upgradeButton)
+
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "That product is no longer available.",
+      )
+    })
+
+    test("When free-only run is chosen, upsell is shown but disabled", async () => {
+      const freeOnlyRun = makeCourseRun({
+        is_enrollable: true,
+        is_upgradable: false,
+        is_archived: false,
+        products: [],
+        enrollment_modes: freeOnlyEnrollmentModes(),
+      })
+      const course = makeCourse({ courseruns: [freeOnlyRun] })
+
+      renderWithProviders(<div />)
+      await openDialog(course)
+
+      // Upsell section should be visible
+      expect(
+        screen.getByText(/Would you like to get a certificate/i),
+      ).toBeInTheDocument()
+
+      // Certificate shows "Not available" since run is not upgradable
+      expect(screen.getByText("Not available")).toBeInTheDocument()
+
+      // Add to Cart button should be disabled
+      const upgradeButton = screen.getByRole("button", {
+        name: /Add to Cart.*to get a Certificate/i,
+      })
+      expect(upgradeButton).toBeDisabled()
+
+      // Enroll button is enabled
+      const enrollButton = screen.getByRole("button", {
+        name: /Enroll for Free without a certificate/i,
+      })
+      expect(enrollButton).toBeEnabled()
+    })
+  })
+
+  describe("Initial run selection", () => {
+    test("If exactly 1 enrollable run exists, it is initially chosen", async () => {
+      const singleRun = enrollableRun({
+        start_date: "2024-01-01T00:00:00Z",
+        end_date: "2024-06-01T00:00:00Z",
+      })
+      const course = makeCourse({ courseruns: [singleRun] })
+
+      renderWithProviders(<div />)
+      await openDialog(course)
+
+      const select = screen.getByRole("combobox", { name: /choose a date/i })
+      expect(select).toHaveTextContent(/Jan 1, 2024 - Jun 1, 2024/i)
+
+      // The enroll button should be enabled
+      const enrollButton = screen.getByRole("button", {
+        name: /Enroll for Free without a certificate/i,
+      })
+      expect(enrollButton).toBeEnabled()
+    })
+
+    test("If multiple enrollable runs exist, none is initially chosen", async () => {
+      const run1 = enrollableRun()
+      const run2 = enrollableRun()
+      const course = makeCourse({ courseruns: [run1, run2] })
+
+      renderWithProviders(<div />)
+      await openDialog(course)
+
+      // The select should show "Please Select" (check the hidden input)
+      const select = screen.getByRole("combobox", { name: /choose a date/i })
+      expect(select).toHaveTextContent(/please select/i)
+
+      // Upsell is shown even with no run selected
+      expect(
+        screen.getByText(/Would you like to get a certificate/i),
+      ).toBeInTheDocument()
+
+      // Enroll button is hidden until a run is selected
+      expect(
+        screen.queryByRole("button", {
+          name: /Enroll for Free without a certificate/i,
+        }),
+      ).not.toBeInTheDocument()
+    })
+
+    test("Initial selection is reset when dialog is reopened", async () => {
+      const run1 = enrollableRun()
+      const run2 = enrollableRun()
+      const course = makeCourse({ courseruns: [run1, run2] })
+
+      renderWithProviders(<div />)
+
+      // First open: no initial selection with multiple runs
+      await openDialog(course)
+      const select = screen.getByRole("combobox", { name: /choose a date/i })
+      expect(select).toHaveTextContent(/please select/i)
+
+      // Select an option
+      await user.click(select)
+      const options = screen.getAllByRole("option")
+      await user.click(options[1]) // Select first run (index 0 is "Please Select")
+
+      // Close the dialog
+      const closeButton = screen.getByRole("button", { name: /close/i })
+      await user.click(closeButton)
+      await waitFor(() => {
+        expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+      })
+
+      // Reopen the dialog
+      await openDialog(course)
+
+      // Verify selection is reset to "Please Select"
+      const reopenedSelect = screen.getByRole("combobox", {
+        name: /choose a date/i,
+      })
+      expect(reopenedSelect).toHaveTextContent(/please select/i)
+    })
+  })
+
+  describe("Enrollment and upgrade actions", () => {
+    test("Clicking enrollment button submits enrollment form", async () => {
+      const run = enrollableRun()
+      const course = makeCourse({ courseruns: [run] })
+
+      renderWithProviders(<div />)
+      await openDialog(course)
+
+      const enrollButton = screen.getByRole("button", {
+        name: /Enroll for Free without a certificate/i,
+      })
+
+      expect(enrollButton).toBeEnabled()
+
+      setMockResponse.post(mitxUrls.enrollment.enrollmentsListV1(), {})
+      await user.click(enrollButton)
+
+      await waitFor(() => {
+        expect(makeRequest).toHaveBeenCalledWith({
+          method: "post",
+          url: mitxUrls.enrollment.enrollmentsListV1(),
+          body: { run_id: run.id },
+        })
+      })
+    })
+
+    test("Clicking upgrade link adds product to basket and redirects to cart", async () => {
+      const assign = jest.mocked(window.location.assign)
+
+      const run = upgradeableRun()
+      const product = run.products[0]
+      invariant(product, "Upgradeable run must have a product")
+      const course = mitxFactories.courses.course({ courseruns: [run] })
+
+      const clearUrl = mitxUrls.baskets.clear()
+      setMockResponse.delete(clearUrl, undefined)
+      const basketUrl = mitxUrls.baskets.createFromProduct(product.id)
+      setMockResponse.post(basketUrl, { id: 1, items: [] })
+
+      renderWithProviders(<div />)
+      await openDialog(course)
+
+      const upgradeButton = screen.getByRole("button", {
+        name: /Add to Cart.*to get a Certificate/i,
+      })
+
+      // Verify the button is enabled before clicking
+      expect(upgradeButton).toBeEnabled()
+
+      await user.click(upgradeButton)
+
+      // Verify clear basket API was called first
+      await waitFor(() => {
+        expect(makeRequest).toHaveBeenCalledWith(
+          expect.objectContaining({
+            method: "delete",
+            url: clearUrl,
+          }),
+        )
+      })
+
+      // Verify create basket API was called
+      expect(makeRequest).toHaveBeenCalledWith(
+        expect.objectContaining({
+          method: "post",
+          url: basketUrl,
+        }),
+      )
+
+      // Verify redirect to cart page
+      expect(assign).toHaveBeenCalledWith(mitxonlineLegacyUrl("/cart/"))
+
+      expect(trackAddToCart).toHaveBeenCalledWith(
+        expect.objectContaining({ courseName: course.title }),
+      )
+      expect(trackBeginCheckout).toHaveBeenCalledWith(
+        expect.objectContaining({
+          courseName: course.title,
+          value: parseFloat(product.price),
+        }),
+      )
+    })
+
+    test("Default behavior: redirects to the dashboard success URL with title in params after enrollment", async () => {
+      const run = enrollableRun()
+      const course = makeCourse({ courseruns: [run] })
+
+      const { location } = renderWithProviders(<div />)
+      await openDialog(course)
+
+      const enrollButton = screen.getByRole("button", {
+        name: /Enroll for Free without a certificate/i,
+      })
+
+      setMockResponse.post(mitxUrls.enrollment.enrollmentsListV1(), {})
+      await user.click(enrollButton)
+
+      await waitFor(() => {
+        expect(location.current.pathname).toBe(routes.DASHBOARD_HOME)
+      })
+      expect(location.current.searchParams.get("enrollment_status")).toBe(
+        "success",
+      )
+      expect(location.current.searchParams.get("enrollment_title")).toBe(
+        course.title,
+      )
+
+      // Verify dialog has closed
+      await waitFor(() => {
+        expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+      })
+    })
+
+    test("Custom onCourseEnroll: calls callback instead of redirecting", async () => {
+      const run = enrollableRun()
+      const course = makeCourse({ courseruns: [run] })
+      const onCourseEnroll = jest.fn()
+
+      const { location } = renderWithProviders(<div />)
+      await act(async () => {
+        NiceModal.show(CourseEnrollmentDialog, { course, onCourseEnroll })
+      })
+      await screen.findByRole("dialog")
+      const initialLocation = `${location.current.pathname}${location.current.search}`
+
+      const enrollButton = screen.getByRole("button", {
+        name: /Enroll for Free without a certificate/i,
+      })
+
+      setMockResponse.post(mitxUrls.enrollment.enrollmentsListV1(), {})
+      await user.click(enrollButton)
+
+      await waitFor(() => {
+        expect(onCourseEnroll).toHaveBeenCalledWith(run)
+      })
+
+      expect(`${location.current.pathname}${location.current.search}`).toBe(
+        initialLocation,
+      )
+
+      // Verify dialog has closed
+      await waitFor(() => {
+        expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+      })
+    })
+
+    test("Shows error message when enrollment fails", async () => {
+      const run = enrollableRun()
+      const course = makeCourse({ courseruns: [run] })
+
+      renderWithProviders(<div />)
+      await openDialog(course)
+
+      const enrollButton = screen.getByRole("button", {
+        name: /Enroll for Free without a certificate/i,
+      })
+
+      // Mock enrollment failure
+      setMockResponse.post(
+        mitxUrls.enrollment.enrollmentsListV1(),
+        "Enrollment failed",
+        { code: 500 },
+      )
+
+      // Click the button - the error will be caught by the mutation
+      await user.click(enrollButton)
+
+      // Check for error alert - the mutation error should be displayed
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        /There was a problem enrolling you in this course. Please try again later./i,
+      )
+    })
+
+    test("Shows the server's 400 detail when enrollment is rejected", async () => {
+      const run = enrollableRun()
+      const course = makeCourse({ courseruns: [run] })
+
+      renderWithProviders(<div />)
+      await openDialog(course)
+
+      const enrollButton = screen.getByRole("button", {
+        name: /Enroll for Free without a certificate/i,
+      })
+
+      setMockResponse.post(
+        mitxUrls.enrollment.enrollmentsListV1(),
+        {
+          detail:
+            "Unable to complete enrollment. Please contact support. Error code: CS_700",
+        },
+        { code: 400 },
+      )
+
+      await user.click(enrollButton)
+
+      const alert = await screen.findByRole("alert")
+      expect(alert).toHaveTextContent(
+        "Unable to complete enrollment. Please contact support. Error code: CS_700",
+      )
+      expect(
+        within(alert).getByRole("link", { name: "Contact Support" }),
+      ).toBeInTheDocument()
+    })
+
+    test("Keeps the generic copy when a 400 carries no detail", async () => {
+      const run = enrollableRun()
+      const course = makeCourse({ courseruns: [run] })
+
+      renderWithProviders(<div />)
+      await openDialog(course)
+
+      const enrollButton = screen.getByRole("button", {
+        name: /Enroll for Free without a certificate/i,
+      })
+
+      setMockResponse.post(
+        mitxUrls.enrollment.enrollmentsListV1(),
+        { run_id: ["This field is required."] },
+        { code: 400 },
+      )
+
+      await user.click(enrollButton)
+
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        /There was a problem enrolling you in this course. Please try again later./i,
+      )
+    })
+  })
+
+  describe("Financial Assistance", () => {
+    test.each([
+      { hasFinancialAid: true, expectLink: true },
+      { hasFinancialAid: false, expectLink: false },
+    ])(
+      "Financial aid link is displayed if and only if URL is non-empty (hasFinancialAid=$hasFinancialAid)",
+      async ({ hasFinancialAid, expectLink }) => {
+        const financialAidUrl = hasFinancialAid
+          ? `/financial-aid/${faker.string.alphanumeric(10)}`
+          : ""
+        const product = makeProduct()
+        const run = upgradeableRun({ products: [product] })
+        const course = makeCourse({
+          courseruns: [run],
+          page: { financial_assistance_form_url: financialAidUrl },
+        })
+
+        setMockResponse.get(
+          mitxUrls.products.userPricingDetail(product.id),
+          mitxFactories.products.userPricing({
+            id: product.id,
+            price: product.price,
+          }),
+        )
+
+        renderWithProviders(null)
+        await openDialog(course)
+
+        if (expectLink) {
+          const link = await screen.findByRole("link", {
+            name: /financial assistance/i,
+          })
+          const expectedUrl = mitxonlineLegacyUrl(financialAidUrl)
+          expect(link).toHaveAttribute("href", expectedUrl)
+        } else {
+          const link = screen.queryByRole("link", {
+            name: /financial assistance/i,
+          })
+          expect(link).toBeNull()
+        }
+      },
+    )
+
+    test("Displays the quoted price beside the struck original when aid is approved", async () => {
+      const product = makeProduct({ price: "100.00" })
+      const userPricing = mitxFactories.products.userPricing({
+        id: product.id,
+        price: product.price,
+        user_price: "50.00",
+        product_flexible_price: mitxFactories.products.discount(),
+      })
+      const financialAidUrl = `/financial-aid/${faker.string.alphanumeric(10)}`
+      const run = upgradeableRun({ products: [product] })
+      const course = makeCourse({
+        courseruns: [run],
+        page: { financial_assistance_form_url: financialAidUrl },
+      })
+
+      setMockResponse.get(
+        mitxUrls.products.userPricingDetail(product.id),
+        userPricing,
+      )
+
+      renderWithProviders(null)
+      await openDialog(course)
+
+      await screen.findByText("Financial assistance approved")
+      expect(screen.getByText(/\$50/)).toBeInTheDocument()
+      expect(screen.getByText(/\$100/)).toBeInTheDocument()
+    })
+
+    test("A discount that is not financial assistance still lowers the price", async () => {
+      const product = makeProduct({ price: "100.00" })
+      const run = upgradeableRun({ products: [product] })
+      const course = makeCourse({
+        courseruns: [run],
+        page: { financial_assistance_form_url: "" },
+      })
+
+      setMockResponse.get(
+        mitxUrls.products.userPricingDetail(product.id),
+        mitxFactories.products.userPricing({
+          id: product.id,
+          price: product.price,
+          user_price: "80.00",
+        }),
+      )
+
+      renderWithProviders(null)
+      await openDialog(course)
+
+      expect(await screen.findByText(/\$80/)).toBeInTheDocument()
+      expect(screen.getByText(/\$100/)).toBeInTheDocument()
+      expect(
+        screen.queryByRole("link", { name: /financial assistance/i }),
+      ).toBeNull()
+    })
+
+    test("Does NOT show financial assistance when products array is empty", async () => {
+      const financialAidUrl = `/financial-aid/${faker.string.alphanumeric(10)}`
+      const run = enrollableRun({
+        is_upgradable: false,
+        products: [],
+      })
+      const course = makeCourse({
+        courseruns: [run],
+        page: { financial_assistance_form_url: financialAidUrl },
+      })
+
+      renderWithProviders(null)
+      await openDialog(course)
+
+      // Should show "Not available" for certificate
+      expect(screen.getByText("Not available")).toBeInTheDocument()
+
+      // Financial assistance link should NOT be present (because price is null)
+      expect(
+        screen.queryByRole("link", { name: /financial assistance/i }),
+      ).toBeNull()
+    })
+
+    test("Does not crash when course page is null", async () => {
+      const run = upgradeableRun({
+        products: [makeProduct({ price: "149.00" })],
+      })
+      const course = makeCourse({
+        courseruns: [run],
+      })
+      ;(course as unknown as { page: null }).page = null
+
+      renderWithProviders(null)
+      await openDialog(course)
+
+      expect(screen.getByText(/Get Certificate/i)).toBeInTheDocument()
+      expect(
+        screen.queryByRole("link", { name: /financial assistance/i }),
+      ).toBeNull()
+    })
+  })
+})

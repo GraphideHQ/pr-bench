@@ -1,0 +1,58 @@
+import React from "react"
+import type { Meta, StoryObj } from "@storybook/nextjs"
+import { PlatformLogo, PLATFORM_LOGOS } from "./Logo"
+import Grid from "@mui/material/Grid2"
+import styled from "@emotion/styled"
+import { PlatformEnum } from "api"
+
+type StoryProps = { showIconBackground?: boolean; iconHeight?: string }
+const SizedPlatformLogo = styled(PlatformLogo)<StoryProps>(
+  ({ showIconBackground }) => [
+    {
+      height: "27px",
+    },
+    showIconBackground && {
+      backgroundColor: "pink",
+    },
+  ],
+)
+
+const meta: Meta<StoryProps> = {
+  title: "smoot-design/Logo",
+  render: ({ showIconBackground, iconHeight }) => {
+    return (
+      <Grid container rowSpacing="12px">
+        <Grid size={12}>
+          <strong>Note</strong>: the <code>showIconBackground</code> and{" "}
+          <code>iconHeight</code>
+          args are only for this story. Not applicable to the actual component.
+        </Grid>
+        {Object.entries(PLATFORM_LOGOS).map(([platformCode, platform]) => (
+          <React.Fragment key={platformCode}>
+            <Grid size={2}>
+              <code>{platformCode}</code>
+            </Grid>
+            <Grid size={2}>{platform.name}</Grid>
+            <Grid size={8}>
+              <SizedPlatformLogo
+                height={27}
+                iconHeight={iconHeight}
+                showIconBackground={showIconBackground}
+                platformCode={platformCode as PlatformEnum}
+              />
+            </Grid>
+          </React.Fragment>
+        ))}
+      </Grid>
+    )
+  },
+  args: {
+    showIconBackground: false,
+    iconHeight: "35px",
+  },
+}
+export default meta
+
+type Story = StoryObj<StoryProps>
+
+export const All: Story = {}

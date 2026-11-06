@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  # PRs and pushes that change only Markdown skip these checks; docs.yml
+  # runs the Markdown checks for them.
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Format, vet, test and build (macOS)
+    runs-on: macos-15
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Run the checks
+        run: scripts/check.sh

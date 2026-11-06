@@ -1,0 +1,160 @@
+"""
+Django settings specific to learning_resources ingestion
+"""
+
+from main.envs import get_bool, get_int, get_list_of_str, get_string
+
+# OCW settings
+OCW_LIVE_BUCKET = get_string("OCW_LIVE_BUCKET", None)
+OCW_ITERATOR_CHUNK_SIZE = get_int("OCW_ITERATOR_CHUNK_SIZE", 1000)
+OCW_SKIP_CONTENT_FILES = get_bool("OCW_SKIP_CONTENT_FILES", default=False)
+OCW_WEBHOOK_KEY = get_string("OCW_WEBHOOK_KEY", None)
+OCW_OFFLINE_DELIVERY = get_bool("OCW_OFFLINE_DELIVERY", default=False)
+MAX_S3_GET_ITERATIONS = get_int("MAX_S3_GET_ITERATIONS", 3)
+
+
+# Base URL's for courses
+OCW_BASE_URL = get_string("OCW_BASE_URL", "http://ocw.mit.edu/")
+
+
+# Iterator chunk size for MITx and xPRO courses
+LEARNING_COURSE_ITERATOR_CHUNK_SIZE = get_int("LEARNING_COURSE_ITERATOR_CHUNK_SIZE", 20)
+
+# xPRO settings for course/resource ingestion
+XPRO_COURSE_BUCKET_PREFIX = get_string(
+    "XPRO_COURSE_BUCKET_PREFIX", "xpro/openedx/raw_data/course_xml/"
+)
+XPRO_CATALOG_API_URL = get_string("XPRO_CATALOG_API_URL", None)
+XPRO_COURSES_API_URL = get_string("XPRO_COURSES_API_URL", None)
+
+# MITx Online settings for course/resource ingestion
+MITX_ONLINE_COURSE_BUCKET_PREFIX = get_string(
+    "MITX_ONLINE_COURSE_BUCKET_PREFIX", "mitxonline/openedx/raw_data/course_xml/"
+)
+MITX_ONLINE_BASE_URL = get_string("MITX_ONLINE_BASE_URL", None)
+MITX_ONLINE_PROGRAMS_API_URL = get_string("MITX_ONLINE_PROGRAMS_API_URL", None)
+MITX_ONLINE_COURSES_API_URL = get_string("MITX_ONLINE_COURSES_API_URL", None)
+# API key for the MITx Online internal-only secured endpoint. When set, it is
+# sent as an "Authorization: Api-Key <key>" header on MITx Online ETL requests.
+MITX_ONLINE_ETL_API_KEY = get_string("MITX_ONLINE_ETL_API_KEY", None)
+
+
+# Open Learning Library settings
+OLL_COURSE_BUCKET_PREFIX = get_string(
+    "OLL_COURSE_BUCKET_PREFIX", "open-learning-library/courses"
+)
+
+# Canvas course settings
+COURSE_ARCHIVE_BUCKET_NAME = get_string(
+    "COURSE_ARCHIVE_BUCKET_NAME", "ol-data-lake-landing-zone-production"
+)
+CANVAS_COURSE_BUCKET_PREFIX = get_string(
+    "CANVAS_COURSE_BUCKET_PREFIX", "canvas/course_content"
+)
+
+OCR_MODEL = get_string(name="OCR_MODEL", default=None)
+
+OCR_PROMPT = get_string(
+    "OCR_PROMPT",
+    "Transcribe this image to markdown. Properly format text, formulas, "
+    "tables, and code into markdown format. "
+    "Write every mathematical expression, inline ones included, in LaTeX "
+    "($...$ inline, $$...$$ display), even when it is printed as plain text. "
+    "Include a markdown comment for elements that cannot be transcribed such as "
+    "photos and other visual elements. "
+    "Do not include any indications your output is the result of a transcription. "
+    "Do not include extra commentary - "
+    "ONLY include the resulting transcribed markdown.",
+)
+# Do not OCR if the PDF has exceeds this many pages
+OCR_PDF_MAX_PAGE_THRESHOLD = get_int(name="OCR_PDF_MAX_PAGE_THRESHOLD", default=10)
+
+# OCR the entire page if the density of math formulas exceeds this threshold
+OCR_MATH_DENSITY_THRESHOLD = get_int(name="OCR_MATH_DENSITY_THRESHOLD", default=5)
+OCR_DEBUG_DIRECTORY = get_string(name="OCR_DEBUG_DIRECTORY", default="ocr_debug")
+# Timeout in seconds and number of retries for each OCR request
+OCR_REQUEST_TIMEOUT = get_int(name="OCR_REQUEST_TIMEOUT", default=180)
+OCR_REQUEST_NUM_RETRIES = get_int(name="OCR_REQUEST_NUM_RETRIES", default=2)
+
+
+# More MIT URLs
+SEE_API_URL = get_string("SEE_API_URL", None)
+SEE_API_ACCESS_TOKEN_URL = get_string("SEE_API_ACCESS_TOKEN_URL", None)
+SEE_API_CLIENT_ID = get_string("SEE_API_CLIENT_ID", None)
+SEE_API_CLIENT_SECRET = get_string("SEE_API_CLIENT_SECRET", None)
+
+
+# MIT Climate API endpoints
+
+MIT_CLIMATE_BASE_URL = "https://climate.mit.edu"
+MIT_CLIMATE_EXPLAINERS_API_URL = f"{MIT_CLIMATE_BASE_URL}/feeds/explainers"
+ASK_MIT_CLIMATE_API_URL = f"{MIT_CLIMATE_BASE_URL}/feeds/ask-mit-climate"
+
+CSAIL_BASE_URL = get_string("CSAIL_BASE_URL", None)
+SEE_BASE_URL = get_string("SEE_BASE_URL", None)
+MITPE_BASE_URL = get_string("MITPE_BASE_URL", "https://professional.mit.edu/")
+
+# course catalog video etl settings
+OPEN_VIDEO_DATA_BRANCH = get_string("OPEN_VIDEO_DATA_BRANCH", "master")
+OPEN_VIDEO_USER_LIST_OWNER = get_string("OPEN_VIDEO_USER_LIST_OWNER", None)
+OPEN_VIDEO_MAX_TOPICS = get_int("OPEN_VIDEO_MAX_TOPICS", 2)
+OPEN_VIDEO_MIN_TERM_FREQ = get_int("OPEN_VIDEO_MIN_TERM_FREQ", 1)
+OPEN_VIDEO_MIN_DOC_FREQ = get_int("OPEN_VIDEO_MIN_DOC_FREQ", 15)
+
+YOUTUBE_DEVELOPER_KEY = get_string("YOUTUBE_DEVELOPER_KEY", None)
+YOUTUBE_CONFIG_URL = get_string("YOUTUBE_CONFIG_URL", None)
+
+# OVS (ODL Video Service) settings — public API, no auth required
+OVS_API_BASE_URL = get_string(
+    "OVS_API_BASE_URL",
+    None,
+)
+# Hosts that OVS media urls (thumbnails, streaming sources, subtitles) may point
+# at. OVS payloads arrive over a webhook, so any url in them is untrusted input:
+# without an allowlist a forged payload could point our requests at an arbitrary
+# (possibly internal) host. The OVS_API_BASE_URL host is always allowed. An entry
+# beginning with a "." matches any subdomain of that domain.
+OVS_ALLOWED_MEDIA_HOSTS = get_list_of_str(
+    "OVS_ALLOWED_MEDIA_HOSTS",
+    [],
+)
+
+# course catalog podcast etl settings
+OPEN_PODCAST_DATA_BRANCH = get_string("OPEN_PODCAST_DATA_BRANCH", "master")
+
+# Tika settings
+TIKA_ACCESS_TOKEN = get_string("TIKA_ACCESS_TOKEN", None)
+TIKA_TIMEOUT = get_int("TIKA_TIMEOUT", 60)
+TIKA_OCR_STRATEGY = get_string("TIKA_OCR_STRATEGY", "no_ocr")
+SKIP_TIKA = get_bool("SKIP_TIKA", default=False)
+
+
+# Base content URLs for different sources
+CONTENT_BASE_URL_MITXONLINE = get_string(
+    "CONTENT_BASE_URL_MITXONLINE", "https://courses.mitxonline.mit.edu"
+)
+CONTENT_BASE_URL_XPRO = get_string(
+    "CONTENT_BASE_URL_XPRO", "https://courses.xpro.mit.edu"
+)
+CONTENT_BASE_URL_OLL = get_string(
+    "CONTENT_BASE_URL_OLL", "https://openlearninglibrary.mit.edu"
+)
+
+# Warehouse-pull settings for Cohort 1 catalog ETL, used to query the
+# integrations schema views exposed by the OL Data Platform. WAREHOUSE_BACKEND
+# selects the connector without touching ETL task code (see
+# learning_resources.lib.warehouse). Backend-specific credentials are
+# namespaced (e.g. STARROCKS_*) so future backends (e.g. a DuckDB-based
+# local/offline mode) can sit alongside without colliding.
+WAREHOUSE_BACKEND = get_string("WAREHOUSE_BACKEND", "starrocks")
+STARROCKS_HOST = get_string("STARROCKS_HOST", None)
+STARROCKS_PORT = get_int("STARROCKS_PORT", 9030)
+STARROCKS_USER = get_string("STARROCKS_USER", None)
+STARROCKS_PASSWORD = get_string("STARROCKS_PASSWORD", None)
+# Where the integrations__learn__* views live. BaseWarehouseETLTask composes
+# these with each task's table_name, so QA can read ol_data_lake_qa instead of
+# production learner data. The defaults are the production pair.
+WAREHOUSE_CATALOG = get_string("WAREHOUSE_CATALOG", "ol_data_lake_production")
+WAREHOUSE_SCHEMA = get_string(
+    "WAREHOUSE_SCHEMA", "ol_warehouse_production_integrations"
+)

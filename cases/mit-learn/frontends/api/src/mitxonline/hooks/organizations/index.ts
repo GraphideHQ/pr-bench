@@ -1,0 +1,169 @@
+import { useMutation, useQueryClient } from "@tanstack/react-query"
+import { b2bApi } from "../../clients"
+import {
+  B2bApiB2bAttachCreateRequest,
+  B2bApiB2bDataConsentCreateRequest,
+  B2bApiB2bManagerOrganizationsContractsCodesBulkAssignCreateRequest,
+  B2bApiB2bManagerOrganizationsContractsCodesReassignUpdateRequest,
+  B2bApiB2bManagerOrganizationsContractsCodesRemindCreateRequest,
+  B2bApiB2bManagerOrganizationsContractsCodesRevokeDestroyRequest,
+  B2bApiB2bManagerOrganizationsContractsCodesSendTestEmailCreateRequest,
+} from "@mitodl/mitxonline-api-axios/v0"
+import { managerOrganizationQueries, managerOrganizationKeys } from "./queries"
+import { mitxUserQueries } from "../user"
+import type { MutationHookOptions } from "../../../mutations/mutationMeta"
+
+const useB2BAttachMutation = (
+  opts: B2bApiB2bAttachCreateRequest,
+  { meta }: MutationHookOptions = {},
+) => {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async () => {
+      const response = await b2bApi.b2bAttachCreate(opts)
+      return response
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["mitxonline"] })
+    },
+    meta,
+  })
+}
+
+const useDataConsentMutation = ({ meta }: MutationHookOptions = {}) => {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (opts: B2bApiB2bDataConsentCreateRequest) =>
+      b2bApi.b2bDataConsentCreate(opts),
+    // Returned so the mutation stays pending until users/me has the new value.
+    onSuccess: () =>
+      queryClient.invalidateQueries({
+        queryKey: mitxUserQueries.me().queryKey,
+      }),
+    meta,
+  })
+}
+
+/**
+ * Bulk-assign available enrollment codes to a list of email addresses. Codes are
+ * auto-allocated by the backend (one per record); the response reports which
+ * addresses were assigned and which failed.
+ */
+const useBulkAssignSeats = ({ meta }: MutationHookOptions = {}) => {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (
+      opts: B2bApiB2bManagerOrganizationsContractsCodesBulkAssignCreateRequest,
+    ) => b2bApi.b2bManagerOrganizationsContractsCodesBulkAssignCreate(opts),
+    meta,
+    onSettled: (_data, _err, vars) => {
+      queryClient.invalidateQueries({
+        queryKey: managerOrganizationKeys.contractCodesForContract(
+          vars.id,
+          vars.parent_lookup_organization,
+        ),
+      })
+      // Assigning seats moves them from unassigned to assigned, which changes
+      // the header stat counts on the contract admin page.
+      queryClient.invalidateQueries({
+        queryKey: managerOrganizationKeys.contractDetail({
+          id: vars.id,
+          parent_lookup_organization: vars.parent_lookup_organization,
+        }),
+      })
+    },
+  })
+}
+
+/** Resend the claim email for an assigned-but-unredeemed enrollment code. */
+const useRemindCode = ({ meta }: MutationHookOptions = {}) => {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (
+      opts: B2bApiB2bManagerOrganizationsContractsCodesRemindCreateRequest,
+    ) => b2bApi.b2bManagerOrganizationsContractsCodesRemindCreate(opts),
+    meta,
+    onSettled: (_data, _err, vars) => {
+      queryClient.invalidateQueries({
+        queryKey: managerOrganizationKeys.contractCodesForContract(
+          vars.id,
+          vars.parent_lookup_organization,
+        ),
+      })
+    },
+  })
+}
+
+/** Revoke a code assignment, returning the code to the unassigned pool. */
+const useRevokeCode = ({ meta }: MutationHookOptions = {}) => {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (
+      opts: B2bApiB2bManagerOrganizationsContractsCodesRevokeDestroyRequest,
+    ) => b2bApi.b2bManagerOrganizationsContractsCodesRevokeDestroy(opts),
+    meta,
+    onSettled: (_data, _err, vars) => {
+      queryClient.invalidateQueries({
+        queryKey: managerOrganizationKeys.contractCodesForContract(
+          vars.id,
+          vars.parent_lookup_organization,
+        ),
+      })
+      // Revoking returns the seat to the unassigned pool, which changes the
+      // header stat counts on the contract admin page.
+      queryClient.invalidateQueries({
+        queryKey: managerOrganizationKeys.contractDetail({
+          id: vars.id,
+          parent_lookup_organization: vars.parent_lookup_organization,
+        }),
+      })
+    },
+  })
+}
+
+/**
+ * Reassign an assigned-but-unredeemed enrollment code to a new email address.
+ * The backend updates the existing assignment in place and re-sends the claim
+ * email. Returns 409 if the code has already been redeemed.
+ */
+const useReassignCode = ({ meta }: MutationHookOptions = {}) => {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (
+      opts: B2bApiB2bManagerOrganizationsContractsCodesReassignUpdateRequest,
+    ) => b2bApi.b2bManagerOrganizationsContractsCodesReassignUpdate(opts),
+    meta,
+    onSettled: (_data, _err, vars) => {
+      queryClient.invalidateQueries({
+        queryKey: managerOrganizationKeys.contractCodesForContract(
+          vars.id,
+          vars.parent_lookup_organization,
+        ),
+      })
+    },
+  })
+}
+
+/** Send a test enrollment code to the given email address. */
+const useSendTestEmail = ({ meta }: MutationHookOptions = {}) =>
+  useMutation({
+    mutationFn: (
+      opts: B2bApiB2bManagerOrganizationsContractsCodesSendTestEmailCreateRequest,
+    ) => b2bApi.b2bManagerOrganizationsContractsCodesSendTestEmailCreate(opts),
+    meta,
+  })
+
+export {
+  managerOrganizationQueries,
+  useB2BAttachMutation,
+  useDataConsentMutation,
+  useBulkAssignSeats,
+  useReassignCode,
+  useRemindCode,
+  useRevokeCode,
+  useSendTestEmail,
+}
+export type {
+  ManagerEnrollmentCode,
+  PaginatedManagerEnrollmentCodeList,
+} from "@mitodl/mitxonline-api-axios/v0"

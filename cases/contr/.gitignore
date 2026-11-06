@@ -1,0 +1,8 @@
+# Build output and local scratch files.
+/tmp/
+/dist/
+/contr
+*.prof
+*.test
+.DS_Store
+/mygo.json

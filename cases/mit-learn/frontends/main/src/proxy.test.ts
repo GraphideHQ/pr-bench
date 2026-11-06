@@ -1,0 +1,219 @@
+import { NextRequest } from "next/server"
+import { isPageRoute, mitxonlineSurrogateKey, proxy } from "./proxy"
+
+describe("isPageRoute", () => {
+  test.each([
+    "/",
+    "/about",
+    "/search",
+    // Course/program readable ids legitimately contain dots and can end in a
+    // dotted suffix (e.g. 5.601x). These are HTML pages, not static assets.
+    "/courses/course-v1:MITxT+5.601x",
+    "/programs/program-v1:MITxT+18.01x",
+    // Sitemaps are dynamically generated and tagged for purge-on-deploy.
+    "/sitemaps/resources/sitemap/0.xml",
+    "/sitemaps/sitemap-index.xml",
+  ])("treats %s as a page route", (pathname) => {
+    expect(isPageRoute(pathname)).toBe(true)
+  })
+
+  test.each([
+    // JSON healthcheck
+    "/healthcheck",
+    // Static assets served as immutable files
+    "/favicon.ico",
+    "/images/mit-dome-2.jpg",
+    "/static/app.css",
+    // Anything under the Next.js internals tree, regardless of extension —
+    // including extensionless endpoints like the image optimizer.
+    "/_next/static/chunk.js",
+    "/_next/image",
+  ])("treats %s as a non-page route", (pathname) => {
+    expect(isPageRoute(pathname)).toBe(false)
+  })
+})
+
+describe("mitxonlineSurrogateKey", () => {
+  describe("course pages — /courses/:readable_id", () => {
+    it("returns mitxonline:course key", () => {
+      expect(
+        mitxonlineSurrogateKey("/courses/course-v1:MITx+6.00.1x+3T2019"),
+      ).toBe("mitxonline:course:course-v1:MITx+6.00.1x+3T2019")
+    })
+
+    it("handles URL-encoded readable_id", () => {
+      const encoded = encodeURIComponent("course-v1:MITx+6.00.1x+3T2019")
+      expect(mitxonlineSurrogateKey(`/courses/${encoded}`)).toBe(
+        "mitxonline:course:course-v1:MITx+6.00.1x+3T2019",
+      )
+    })
+  })
+
+  describe("program pages — /programs/:readable_id and /courses/p/:readable_id", () => {
+    it("returns mitxonline:program key for /programs/:readable_id", () => {
+      expect(mitxonlineSurrogateKey("/programs/program-v1:MITx+SDS")).toBe(
+        "mitxonline:program:program-v1:MITx+SDS",
+      )
+    })
+
+    it("returns mitxonline:program key for /courses/p/:readable_id (ProgramAsCoursePage)", () => {
+      // /courses/p/ renders ProgramAsCoursePage — the readable_id belongs to a
+      // program, so the surrogate key must use the program namespace so that
+      // MITxOnline's program-save signal purges this page correctly.
+      expect(mitxonlineSurrogateKey("/courses/p/program-v1:MITx+SDS")).toBe(
+        "mitxonline:program:program-v1:MITx+SDS",
+      )
+    })
+  })
+
+  describe("non-product pages", () => {
+    it.each(["/", "/search", "/about", "/courses", "/programs"])(
+      "returns null for %s",
+      (pathname) => {
+        expect(mitxonlineSurrogateKey(pathname)).toBeNull()
+      },
+    )
+  })
+
+  describe("hostile URL segments — regression: Headers.set() crash on control characters", () => {
+    it("returns null without throwing on malformed percent-encoding in course path", () => {
+      // %GG is not valid percent-encoding — decodeURIComponent would throw URIError
+      expect(() => mitxonlineSurrogateKey("/courses/%GG")).not.toThrow()
+      expect(mitxonlineSurrogateKey("/courses/%GG")).toBeNull()
+    })
+
+    it("returns null without throwing on malformed percent-encoding in program path", () => {
+      expect(() => mitxonlineSurrogateKey("/programs/%GG")).not.toThrow()
+      expect(mitxonlineSurrogateKey("/programs/%GG")).toBeNull()
+    })
+
+    it("returns null on CRLF in course path (%0D%0A decodes to \\r\\n)", () => {
+      // Without safeDecodeSegment, passing this to Headers.set() would throw TypeError
+      expect(() =>
+        mitxonlineSurrogateKey("/courses/foo%0D%0AX-Injected%3A+yes"),
+      ).not.toThrow()
+      expect(
+        mitxonlineSurrogateKey("/courses/foo%0D%0AX-Injected%3A+yes"),
+      ).toBeNull()
+    })
+
+    it("returns null on CRLF in program path", () => {
+      expect(() =>
+        mitxonlineSurrogateKey("/programs/foo%0D%0AX-Injected%3A+yes"),
+      ).not.toThrow()
+      expect(
+        mitxonlineSurrogateKey("/programs/foo%0D%0AX-Injected%3A+yes"),
+      ).toBeNull()
+    })
+
+    it("returns null on null byte in course path", () => {
+      expect(() => mitxonlineSurrogateKey("/courses/foo%00bar")).not.toThrow()
+      expect(mitxonlineSurrogateKey("/courses/foo%00bar")).toBeNull()
+    })
+
+    it("returns null on null byte in program path", () => {
+      expect(() => mitxonlineSurrogateKey("/programs/foo%00bar")).not.toThrow()
+      expect(mitxonlineSurrogateKey("/programs/foo%00bar")).toBeNull()
+    })
+  })
+})
+
+describe("proxy", () => {
+  const makeRequest = (pathname: string) =>
+    new NextRequest(new URL(pathname, "https://learn.mit.edu"))
+
+  const S_MAXAGE_SECONDS = 7200
+  const originalEnv = process.env
+
+  beforeEach(() => {
+    process.env = {
+      ...originalEnv,
+      NEXT_PUBLIC_CACHE_S_MAXAGE_SECONDS: String(S_MAXAGE_SECONDS),
+    }
+  })
+  afterEach(() => {
+    process.env = originalEnv
+  })
+
+  test("tags generic page routes with Cache-Control and html-pages Surrogate-Key", () => {
+    const response = proxy(makeRequest("/about"))
+    expect(response.headers.get("Surrogate-Key")).toBe("html-pages")
+    // s-maxage is in seconds, and comes from the configured CDN TTL.
+    expect(response.headers.get("Cache-Control")).toBe(
+      `s-maxage=${S_MAXAGE_SECONDS}, stale-if-error=86400, stale-while-revalidate=86400`,
+    )
+  })
+
+  test("appends per-item surrogate key for MITxOnline course pages", () => {
+    const response = proxy(makeRequest("/courses/course-v1:MITxT+5.601x"))
+    expect(response.headers.get("Surrogate-Key")).toBe(
+      "html-pages mitxonline:course:course-v1:MITxT+5.601x",
+    )
+  })
+
+  test("appends per-item surrogate key for MITxOnline program pages (/programs/)", () => {
+    const response = proxy(makeRequest("/programs/program-v1:MITxT+18.01x"))
+    expect(response.headers.get("Surrogate-Key")).toBe(
+      "html-pages mitxonline:program:program-v1:MITxT+18.01x",
+    )
+  })
+
+  test("appends mitxonline:program surrogate key for /courses/p/ (ProgramAsCoursePage)", () => {
+    const response = proxy(makeRequest("/courses/p/program-v1:MITxT+18.01x"))
+    expect(response.headers.get("Surrogate-Key")).toBe(
+      "html-pages mitxonline:program:program-v1:MITxT+18.01x",
+    )
+  })
+
+  test("keeps program letters out of the shared cache", () => {
+    // A revoked letter must stop being served right away, and nothing purges
+    // a letter's cached HTML.
+    const response = proxy(
+      makeRequest("/program_letter/5de96fc0-449e-4668-be89-a119dbdcab79/view"),
+    )
+    expect(response.headers.get("Cache-Control")).toBe("private, no-store")
+    expect(response.headers.get("Surrogate-Key")).toBeNull()
+  })
+
+  test("leaves non-page routes untagged", () => {
+    const response = proxy(makeRequest("/healthcheck"))
+    expect(response.headers.get("Surrogate-Key")).toBeNull()
+    expect(response.headers.get("Cache-Control")).toBeNull()
+  })
+
+  test("does not throw on CRLF in course path and falls back to html-pages only", () => {
+    // Regression: without safeDecodeSegment, Headers.set() would throw TypeError
+    // when the decoded segment contains \r\n (%0D%0A).
+    expect(() =>
+      proxy(makeRequest("/courses/foo%0D%0AX-Injected%3A+yes")),
+    ).not.toThrow()
+    const response = proxy(makeRequest("/courses/foo%0D%0AX-Injected%3A+yes"))
+    expect(response.headers.get("Surrogate-Key")).toBe("html-pages")
+  })
+
+  /**
+   * Regression: the image optimizer fetches local images by routing an
+   * internal request through proxy with no Host or X-Forwarded-Proto header.
+   * In Oct 2025 an https redirect in the old middleware.ts answered those with
+   * a 301, so every local image failed with "isn't a valid image ... received
+   * null". That redirect only ran when NODE_ENV was "production", so this
+   * test sets it.
+   */
+  describe("image optimizer's internal fetches", () => {
+    beforeEach(() => {
+      process.env = { ...process.env, NODE_ENV: "production" }
+    })
+
+    test.each([
+      "/images/hero/hero-1.png",
+      "/static/images/hero/hero-1.png",
+      "/_next/static/media/graduate.05tvlwc2-um9z.png",
+    ])("passes %s through without redirecting", (pathname) => {
+      const response = proxy(
+        new NextRequest(new URL(pathname, "http://localhost:3000")),
+      )
+      expect(response.headers.get("x-middleware-next")).toBe("1")
+      expect(response.headers.get("Location")).toBeNull()
+    })
+  })
+})

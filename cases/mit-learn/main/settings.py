@@ -1,0 +1,1101 @@
+"""
+Django settings for main.
+
+
+For more information on this file, see
+https://docs.djangoproject.com/en/1.10/topics/settings/
+
+For the full list of settings and their values, see
+https://docs.djangoproject.com/en/1.10/ref/settings/
+
+"""
+
+# pylint:disable=wildcard-import,unused-wildcard-import)
+import datetime
+import logging
+import os
+import platform
+from urllib.parse import urljoin
+
+import dj_database_url
+from django.core.exceptions import ImproperlyConfigured
+from mitol.keycloak.settings.keycloak import *  # noqa: F403
+from mitol.scim.settings.scim import *  # noqa: F403
+
+from main.envs import (
+    get_bool,
+    get_float,
+    get_int,
+    get_list_of_str,
+    get_string,
+)
+from main.middleware.cookie_tombstones import parse_cookie_tombstones
+from main.sentry import init_sentry
+from main.settings_celery import *  # noqa: F403
+from main.settings_course_etl import *  # noqa: F403
+from main.settings_pluggy import *  # noqa: F403
+from openapi.settings_spectacular import open_spectacular_settings
+
+VERSION = "0.85.5"
+
+log = logging.getLogger()
+
+ENVIRONMENT = get_string("MITOL_ENVIRONMENT", "dev")
+DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
+
+# litellm imports the Opik SDK whenever it is installed (ol-llm brings it in). The
+# SDK then starts its own Sentry client, replacing ours, and reports usage analytics
+# to Comet. Importing ol_llm here, which disables the Sentry client on import, would
+# put opik on the boot path, and litellm imports opik before ol_llm anyway.
+os.environ.setdefault("OPIK_SENTRY_ENABLE", "false")
+os.environ.setdefault("OPIK_ANALYTICS_ENABLE", "false")
+
+# initialize Sentry before doing anything else so we capture any config errors
+SENTRY_DSN = get_string("SENTRY_DSN", "")
+SENTRY_LOG_LEVEL = get_string("SENTRY_LOG_LEVEL", "ERROR")
+SENTRY_TRACES_SAMPLE_RATE = get_float("SENTRY_TRACES_SAMPLE_RATE", 0)
+SENTRY_PROFILES_SAMPLE_RATE = get_float("SENTRY_PROFILES_SAMPLE_RATE", 0)
+init_sentry(
+    dsn=SENTRY_DSN,
+    environment=ENVIRONMENT,
+    version=VERSION,
+    log_level=SENTRY_LOG_LEVEL,
+    traces_sample_rate=SENTRY_TRACES_SAMPLE_RATE,
+    profiles_sample_rate=SENTRY_PROFILES_SAMPLE_RATE,
+)
+
+BASE_DIR = os.path.dirname(  # noqa: PTH120
+    os.path.dirname(os.path.abspath(__file__))  # noqa: PTH100, PTH120
+)
+
+# Quick-start development settings - unsuitable for production
+# See https://docs.djangoproject.com/en/1.8/howto/deployment/checklist/
+
+# SECURITY WARNING: keep the secret key used in production secret!
+SECRET_KEY = get_string("SECRET_KEY", "terribly_unsafe_default_secret_key")
+
+# SECURITY WARNING: don't run with debug turned on in production!
+DEBUG = get_bool("DEBUG", False)  # noqa: FBT003
+
+ALLOWED_HOSTS = ["*"]
+ALLOWED_REDIRECT_HOSTS = get_list_of_str(
+    "ALLOWED_REDIRECT_HOSTS",
+    [
+        "open.odl.local:8062",
+        "ocw.mit.edu",
+    ],
+)
+
+AUTH_USER_MODEL = "users.User"
+
+SECURE_SSL_REDIRECT = get_bool("MITOL_SECURE_SSL_REDIRECT", True)  # noqa: FBT003
+if get_bool("MITOL_SECURE_PROXY_SSL_HEADER", True):  # noqa: FBT003
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+SECURE_REDIRECT_EXEMPT = [
+    "^health/startup/$",
+    "^health/liveness/$",
+    "^health/readiness/$",
+    "^health/full/$",
+]
+
+SITE_ID = 1
+APP_BASE_URL = get_string("MITOL_APP_BASE_URL", None)
+if not APP_BASE_URL:
+    msg = "MITOL_APP_BASE_URL is not set"
+    raise ImproperlyConfigured(msg)
+MITOL_TITLE = get_string("MITOL_TITLE", "MIT Learn")
+
+
+# Application definition
+
+INSTALLED_APPS = (
+    "django.contrib.admin",
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
+    "django.contrib.humanize",
+    "django.contrib.sites",
+    "django_removals",
+    "django_scim",
+    "rest_framework",
+    "corsheaders",
+    "anymail",
+    "guardian",
+    "imagekit",
+    "django_json_widget",
+    "django_filters",
+    "drf_spectacular",
+    "safedelete",
+    "mitol.observability.apps.ObservabilityConfig",
+    # Put our apps after this point
+    "main",
+    "users.apps.UsersConfig",
+    "authentication",
+    "channels",
+    "profiles",
+    "webhooks",
+    "widgets",
+    "learning_resources",
+    "learning_resources_search",
+    "website_content.apps.WebsiteContentConfig",
+    "openapi",
+    "oauth2_provider",
+    "news_events",
+    "testimonials",
+    "content_feedback",
+    "data_fixtures",
+    "vector_search",
+    "ol_hubspot",
+    "mitol.scim.apps.ScimApp",
+    "mitol.keycloak.apps.KeycloakApp",
+    "health_check",
+)
+
+WEBHOOK_SECRET = get_string("WEBHOOK_SECRET", None)
+if not WEBHOOK_SECRET or WEBHOOK_SECRET == "please-change-this":  # noqa: S105
+    msg = "WEBHOOK_SECRET is not set to a non-default value"
+    raise ImproperlyConfigured(msg)
+
+if not get_bool("RUN_DATA_MIGRATIONS", default=False):
+    MIGRATION_MODULES = {"data_fixtures": None}
+
+SCIM_SERVICE_PROVIDER["USER_ADAPTER"] = "users.adapters.LearnUserAdapter"  # noqa: F405
+
+# OAuth2TokenMiddleware must be before SCIMAuthCheckMiddleware
+# in order to insert request.user into the request.
+# OAuth2ExtraTokenMiddleware exposes request.access_token, which
+# SCIMScopeCheckMiddleware uses to require the "scim" scope.
+MIDDLEWARE = (
+    "django.middleware.security.SecurityMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "main.middleware.apisix_user.ApisixUserMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    "corsheaders.middleware.CorsMiddleware",
+    "authentication.middleware.BlockedIPMiddleware",
+    "oauth2_provider.middleware.OAuth2TokenMiddleware",
+    "oauth2_provider.middleware.OAuth2ExtraTokenMiddleware",
+    "main.middleware.scim_scope.SCIMScopeCheckMiddleware",
+    "django_scim.middleware.SCIMAuthCheckMiddleware",
+)
+
+OAUTH2_PROVIDER = {
+    "SCOPES": {
+        "read": "Read access",
+        "write": "Write access",
+        "scim": "SCIM user provisioning",
+    },
+    # The default is every scope; "scim" must be requested explicitly.
+    "DEFAULT_SCOPES": ["read", "write"],
+}
+
+ZEAL_ENABLE = get_bool("ZEAL_ENABLE", False)  # noqa: FBT003
+
+# enable the zeal nplusone profiler only in debug mode or under pytest
+if ZEAL_ENABLE or ENVIRONMENT == "pytest":
+    INSTALLED_APPS += ("zeal",)
+    # this should be the first middleware so we catch any issues in our own middleware
+    MIDDLEWARE += ("zeal.middleware.zeal_middleware",)
+
+ZEAL_RAISE = False
+ZEAL_ALLOWLIST = []
+
+# CORS
+CORS_ALLOWED_ORIGINS = get_list_of_str("CORS_ALLOWED_ORIGINS", [])
+CORS_ALLOWED_ORIGIN_REGEXES = get_list_of_str("CORS_ALLOWED_ORIGIN_REGEXES", [])
+
+CORS_ALLOW_CREDENTIALS = get_bool("CORS_ALLOW_CREDENTIALS", True)  # noqa: FBT003
+CORS_ALLOW_HEADERS = (
+    # defaults
+    "accept",
+    "authorization",
+    "content-type",
+    "user-agent",
+    "x-csrftoken",
+    "x-requested-with",
+    # sentry tracing
+    "baggage",
+    "sentry-trace",
+)
+
+SECURE_CROSS_ORIGIN_OPENER_POLICY = get_string(
+    "SECURE_CROSS_ORIGIN_OPENER_POLICY",
+    "same-origin",
+)
+
+CSRF_COOKIE_SECURE = get_bool("CSRF_COOKIE_SECURE", True)  # noqa: FBT003
+CSRF_COOKIE_DOMAIN = get_string("CSRF_COOKIE_DOMAIN", None)
+CSRF_COOKIE_NAME = get_string("CSRF_COOKIE_NAME", "csrftoken")
+COOKIE_TOMBSTONES = parse_cookie_tombstones(get_string("COOKIE_TOMBSTONES", "[]"))
+
+CSRF_HEADER_NAME = get_string("CSRF_HEADER_NAME", "HTTP_X_CSRFTOKEN")
+
+CSRF_TRUSTED_ORIGINS = get_list_of_str("CSRF_TRUSTED_ORIGINS", [])
+
+SESSION_COOKIE_DOMAIN = get_string("SESSION_COOKIE_DOMAIN", None)
+SESSION_COOKIE_NAME = get_string("SESSION_COOKIE_NAME", "sessionid")
+SESSION_COOKIE_SECURE = get_bool("SESSION_COOKIE_SECURE", True)  # noqa: FBT003
+
+if COOKIE_TOMBSTONES:
+    tombstone_middleware = "main.middleware.cookie_tombstones.CookieTombstoneMiddleware"
+    MIDDLEWARE = (tombstone_middleware, *MIDDLEWARE)
+
+# enable the nplusone profiler only in debug mode
+if DEBUG:
+    INSTALLED_APPS += ("nplusone.ext.django",)
+    MIDDLEWARE += ("nplusone.ext.django.NPlusOneMiddleware",)
+
+SESSION_ENGINE = "django.contrib.sessions.backends.signed_cookies"
+MITOL_NEW_USER_LOGIN_URL = get_string(
+    "MITOL_NEW_USER_LOGIN_URL", "http://open.odl.local:8062/onboarding"
+)
+LOGIN_REDIRECT_URL = "/app"
+LOGIN_URL = "/login"
+LOGIN_ERROR_URL = "/login"
+LOGOUT_REDIRECT_URL = "/app"
+MITOL_API_BASE_URL = get_string("MITOL_API_BASE_URL", "")
+OIDC_LOGOUT_URL = get_string(
+    # urljoin might lead to wrong outputs with url rewrites like
+    # https://api.learn.mit.edu/learn/, so using rstrip('/') instead.
+    "OIDC_LOGOUT_URL",
+    f"{MITOL_API_BASE_URL.rstrip('/')}/logout/oidc",
+)
+
+MITOL_TOS_URL = get_string(
+    "MITOL_TOS_URL", urljoin(APP_BASE_URL, "/terms-and-conditions/")
+)
+
+ROOT_URLCONF = "main.urls"
+
+TEMPLATES = [
+    {
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "DIRS": [
+            BASE_DIR + "/templates/",
+        ],
+        "APP_DIRS": True,
+        "OPTIONS": {
+            "context_processors": [
+                "django.template.context_processors.debug",
+                "django.template.context_processors.request",
+                "django.contrib.auth.context_processors.auth",
+                "django.contrib.messages.context_processors.messages",
+            ]
+        },
+    }
+]
+
+WSGI_APPLICATION = "main.wsgi.application"
+
+# Database
+# https://docs.djangoproject.com/en/1.8/ref/settings/#databases
+# Uses DATABASE_URL to configure with sqlite default:
+# For URL structure:
+# https://github.com/kennethreitz/dj-database-url
+DEFAULT_DATABASE_CONFIG = dj_database_url.parse(
+    get_string(
+        "DATABASE_URL",
+        "sqlite:///{}".format(os.path.join(BASE_DIR, "db.sqlite3")),  # noqa: PTH118
+    )
+)
+DEFAULT_DATABASE_CONFIG["DISABLE_SERVER_SIDE_CURSORS"] = get_bool(
+    "MITOL_DB_DISABLE_SS_CURSORS",
+    True,  # noqa: FBT003
+)
+DEFAULT_DATABASE_CONFIG["CONN_MAX_AGE"] = get_int("MITOL_DB_CONN_MAX_AGE", 0)
+
+if get_bool("MITOL_DB_DISABLE_SSL", False):  # noqa: FBT003
+    DEFAULT_DATABASE_CONFIG["OPTIONS"] = {}
+else:
+    DEFAULT_DATABASE_CONFIG["OPTIONS"] = {"sslmode": "require"}
+
+DATABASES = {"default": DEFAULT_DATABASE_CONFIG}
+
+DATABASE_ROUTERS = ["main.routers.ExternalSchemaRouter"]
+
+# "programcertificate" was removed from here deliberately (was
+# EXTERNAL_MODELS = ["programcertificate"]): this app is now the writer of
+# that table (profiles.tasks.SyncProgramCertificatesTask, replacing the
+# Hightouch sync per mitodl/hq#12954) rather than a read-only consumer of
+# rows Hightouch wrote. If another external-schema, write-once-elsewhere
+# model needs the same protection in the future, add it here.
+EXTERNAL_MODELS = []
+
+# Internationalization
+# https://docs.djangoproject.com/en/1.8/topics/i18n/
+
+LANGUAGE_CODE = "en-us"
+
+TIME_ZONE = "UTC"
+
+USE_I18N = True
+
+USE_TZ = True
+
+AUTHENTICATION_BACKENDS = (
+    "oauth2_provider.backends.OAuth2Backend",
+    # the following needs to stay here to allow login of local users
+    "django.contrib.auth.backends.ModelBackend",
+    "guardian.backends.ObjectPermissionBackend",
+)
+
+APISIX_USERDATA_MAP = {
+    "users.User": {
+        "email": "email",
+        "global_id": "sub",
+        "username": "preferred_username",
+        "first_name": "given_name",
+        "last_name": "family_name",
+        "name": "name",
+        "organizations": "organization",
+    },
+    "profiles.Profile": {
+        "name": "name",
+        "email_optin": "emailOptIn",
+    },
+}
+DISABLE_APISIX_USER_MIDDLEWARE = get_bool(
+    name="DISABLE_APISIX_USER_MIDDLEWARE",
+    default=False,
+)
+
+# Set to True to create users that we see but aren't aware of.
+# Set to False if you're managing that elsewhere (like with SCIM).
+# Named to match mitol-django-apigateway, which we intend to port to.
+MITOL_APIGATEWAY_USERINFO_CREATE = get_bool(
+    name="MITOL_APIGATEWAY_USERINFO_CREATE",
+    default=True,
+)
+
+# Set to True to update users we've seen before. If you set this to False, make
+# sure there's a backchannel way to update the user data (SCIM, etc) or user
+# info will fall out of sync with the IdP pretty quickly.
+MITOL_APIGATEWAY_USERINFO_UPDATE = get_bool(
+    name="MITOL_APIGATEWAY_USERINFO_UPDATE",
+    default=False,
+)
+
+# Static files (CSS, JavaScript, Images)
+# https://docs.djangoproject.com/en/1.8/howto/static-files/
+
+STATIC_URL = "/static/"
+
+STATIC_ROOT = "staticfiles"
+
+# Important to define this so DEBUG works properly
+INTERNAL_IPS = (get_string("HOST_IP", "127.0.0.1"),)
+
+NOTIFICATION_ATTEMPT_RATE_LIMIT = "600/m"
+
+NOTIFICATION_ATTEMPT_CHUNK_SIZE = 100
+
+# Configure e-mail settings
+EMAIL_BACKEND = get_string(
+    "MITOL_EMAIL_BACKEND", "django.core.mail.backends.smtp.EmailBackend"
+)
+EMAIL_HOST = get_string("MITOL_EMAIL_HOST", "localhost")
+EMAIL_PORT = get_int("MITOL_EMAIL_PORT", 25)
+EMAIL_HOST_USER = get_string("MITOL_EMAIL_USER", "")
+EMAIL_HOST_PASSWORD = get_string("MITOL_EMAIL_PASSWORD", "")
+EMAIL_USE_TLS = get_bool("MITOL_EMAIL_TLS", False)  # noqa: FBT003
+EMAIL_SUPPORT = get_string("MITOL_SUPPORT_EMAIL", "support@example.com")
+DEFAULT_FROM_EMAIL = get_string("MITOL_FROM_EMAIL", "webmaster@localhost")
+
+MAILGUN_SENDER_DOMAIN = get_string("MAILGUN_SENDER_DOMAIN", None)
+if not MAILGUN_SENDER_DOMAIN:
+    msg = "MAILGUN_SENDER_DOMAIN not set"
+    raise ImproperlyConfigured(msg)
+MAILGUN_KEY = get_string("MAILGUN_KEY", None)
+if not MAILGUN_KEY:
+    msg = "MAILGUN_KEY not set"
+    raise ImproperlyConfigured(msg)
+MAILGUN_RECIPIENT_OVERRIDE = get_string("MAILGUN_RECIPIENT_OVERRIDE", None)
+MAILGUN_FROM_EMAIL = get_string("MAILGUN_FROM_EMAIL", "no-reply@example.com")
+MAILGUN_BCC_TO_EMAIL = get_string("MAILGUN_BCC_TO_EMAIL", None)
+
+ANYMAIL = {
+    "MAILGUN_API_KEY": MAILGUN_KEY,
+    "MAILGUN_SENDER_DOMAIN": MAILGUN_SENDER_DOMAIN,
+}
+
+NOTIFICATION_EMAIL_BACKEND = get_string(
+    "MITOL_NOTIFICATION_EMAIL_BACKEND", "anymail.backends.test.EmailBackend"
+)
+# e-mail configurable admins
+ADMIN_EMAIL = get_string("MITOL_ADMIN_EMAIL", "")
+ADMINS = (("Admins", ADMIN_EMAIL),) if ADMIN_EMAIL != "" else ()
+
+# configuration for CKEditor token endpoint
+CKEDITOR_ENVIRONMENT_ID = get_string("CKEDITOR_ENVIRONMENT_ID", None)
+CKEDITOR_SECRET_KEY = get_string("CKEDITOR_SECRET_KEY", None)
+CKEDITOR_UPLOAD_URL = get_string("CKEDITOR_UPLOAD_URL", None)
+
+# Logging configuration
+LOG_LEVEL = get_string("MITOL_LOG_LEVEL", "INFO")
+DJANGO_LOG_LEVEL = get_string("DJANGO_LOG_LEVEL", "INFO")
+OS_LOG_LEVEL = get_string("OS_LOG_LEVEL", "INFO")
+
+HOSTNAME = platform.node().split(".")[0]
+
+# nplusone profiler logger configuration
+NPLUSONE_LOGGER = logging.getLogger("nplusone")
+NPLUSONE_LOG_LEVEL = logging.ERROR
+
+# LOGGING is provided by mitol-django-observability (structlog-based, JSON in prod)
+from mitol.observability.settings.logging import LOGGING  # noqa: E402, F401
+
+STATUS_TOKEN = get_string("STATUS_TOKEN", "")
+
+GA_TRACKING_ID = get_string("GA_TRACKING_ID", "")
+GA_G_TRACKING_ID = get_string("GA_G_TRACKING_ID", "")
+
+REACT_GA_DEBUG = get_bool("REACT_GA_DEBUG", False)  # noqa: FBT003
+
+RECAPTCHA_SITE_KEY = get_string("RECAPTCHA_SITE_KEY", "")
+RECAPTCHA_SECRET_KEY = get_string("RECAPTCHA_SECRET_KEY", "")
+
+# Fastly CDN settings
+FASTLY_API_KEY = get_string("FASTLY_API_KEY", "")
+FASTLY_URL = get_string("FASTLY_URL", "https://api.fastly.com")
+
+MEDIA_ROOT = get_string("MEDIA_ROOT", "/var/media/")
+MEDIA_URL = "/media/"
+MITOL_USE_S3 = get_bool("MITOL_USE_S3", False)  # noqa: FBT003
+AWS_S3_CUSTOM_DOMAIN = get_string("AWS_S3_CUSTOM_DOMAIN", None)
+AWS_S3_PREFIX = get_string("AWS_S3_PREFIX", None)
+
+if MITOL_USE_S3:
+    STORAGES = {
+        "default": {"BACKEND": "storages.backends.s3boto3.S3Boto3Storage"},
+        "staticfiles": {
+            "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"
+        },
+    }
+    OPTIONS = {}
+    if AWS_S3_CUSTOM_DOMAIN:
+        OPTIONS["custom_domain"] = AWS_S3_CUSTOM_DOMAIN
+    if AWS_S3_PREFIX:
+        OPTIONS["location"] = AWS_S3_PREFIX
+    if OPTIONS:
+        STORAGES["default"]["OPTIONS"] = OPTIONS
+
+AWS_ACCESS_KEY_ID = get_string("AWS_ACCESS_KEY_ID", False)  # noqa: FBT003
+AWS_SECRET_ACCESS_KEY = get_string("AWS_SECRET_ACCESS_KEY", False)  # noqa: FBT003
+AWS_STORAGE_BUCKET_NAME = get_string("AWS_STORAGE_BUCKET_NAME", False)  # noqa: FBT003
+AWS_QUERYSTRING_AUTH = get_string("AWS_QUERYSTRING_AUTH", False)  # noqa: FBT003
+# Provide nice validation of the configuration
+if MITOL_USE_S3 and (
+    not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY or not AWS_STORAGE_BUCKET_NAME
+):
+    msg = "You have enabled S3 support, but are missing one of AWS_ACCESS_KEY_ID, \
+    AWS_SECRET_ACCESS_KEY, or AWS_STORAGE_BUCKET_NAME"
+    raise ImproperlyConfigured(msg)
+
+
+IMAGEKIT_SPEC_CACHEFILE_NAMER = "imagekit.cachefiles.namers.source_name_dot_hash"
+IMAGEKIT_CACHEFILE_DIR = get_string("IMAGEKIT_CACHEFILE_DIR", "")
+IMAGEKIT_CACHE_BACKEND = "imagekit"
+
+
+# django cache back-ends
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "local-in-memory-cache",
+    },
+    # cache specific to widgets
+    "external_assets": {
+        "BACKEND": "django.core.cache.backends.db.DatabaseCache",
+        "LOCATION": "external_asset_cache",
+    },
+    # general durable cache (redis should be considered ephemeral)
+    "durable": {
+        "BACKEND": "django.core.cache.backends.db.DatabaseCache",
+        "LOCATION": "durable_cache",
+    },
+    # its own table: DatabaseCache culls by key order once a table passes
+    # MAX_ENTRIES, whatever the timeout, and "durable" holds per-user flags
+    "release_sweep": {
+        "BACKEND": "django.core.cache.backends.db.DatabaseCache",
+        "LOCATION": "release_sweep_cache",
+    },
+    "redis": {
+        "BACKEND": "django_redis.cache.RedisCache",
+        "LOCATION": REDIS_URL,  # noqa: F405
+        "OPTIONS": {"CLIENT_CLASS": "django_redis.client.DefaultClient"},
+    },
+    # imagekit caching
+    "imagekit": {
+        "BACKEND": "main.cache.backends.FallbackCache",
+        "LOCATION": [
+            "imagekit_redis",
+            "imagekit_db",
+        ],
+    },
+    # This uses FallbackCache but it's basically a proxy to the redis cache
+    # so that we can reuse the client and not create another pile of connections.
+    # The main purpose of this is to set TIMEOUT without specifying it on
+    # the global redis cache.
+    "imagekit_redis": {
+        "BACKEND": "main.cache.backends.FallbackCache",
+        "LOCATION": [
+            "redis",
+        ],
+        "TIMEOUT": 60 * 60,
+    },
+    "imagekit_db": {
+        "BACKEND": "django.core.cache.backends.db.DatabaseCache",
+        "LOCATION": "imagekit_cache",
+        "TIMEOUT": None,
+    },
+}
+
+# OpenSearch
+OPENSEARCH_DEFAULT_PAGE_SIZE = get_int("OPENSEARCH_DEFAULT_PAGE_SIZE", 10)
+OPENSEARCH_URL = get_string("OPENSEARCH_URL", None)
+if not OPENSEARCH_URL:
+    msg = "Missing OPENSEARCH_URL"
+    raise ImproperlyConfigured(msg)
+OPENSEARCH_INDEX = get_string("OPENSEARCH_INDEX", None)
+if not OPENSEARCH_INDEX:
+    msg = "Missing OPENSEARCH_INDEX"
+    raise ImproperlyConfigured(msg)
+OPENSEARCH_HTTP_AUTH = get_string("OPENSEARCH_HTTP_AUTH", None)
+OPENSEARCH_CONNECTIONS_PER_NODE = get_int("OPENSEARCH_CONNECTIONS_PER_NODE", 10)
+OPENSEARCH_DEFAULT_TIMEOUT = get_int("OPENSEARCH_DEFAULT_TIMEOUT", 10)
+OPENSEARCH_INDEXING_CHUNK_SIZE = get_int("OPENSEARCH_INDEXING_CHUNK_SIZE", 100)
+OPENSEARCH_DOCUMENT_INDEXING_CHUNK_SIZE = get_int(
+    "OPENSEARCH_DOCUMENT_INDEXING_CHUNK_SIZE",
+    get_int("OPENSEARCH_INDEXING_CHUNK_SIZE", 100),
+)
+# learning resources per dispatch_content_files reindex batch
+OPENSEARCH_REINDEX_DISPATCH_CHUNK_SIZE = get_int(
+    "OPENSEARCH_REINDEX_DISPATCH_CHUNK_SIZE", 100
+)
+# how long finished TaskJobs (and their batches) are kept before cleanup
+TASK_JOB_RETENTION_DAYS = get_int("TASK_JOB_RETENTION_DAYS", 7)
+OPENSEARCH_MIN_QUERY_SIZE = get_int("OPENSEARCH_MIN_QUERY_SIZE", 2)
+OPENSEARCH_MAX_SUGGEST_HITS = get_int("OPENSEARCH_MAX_SUGGEST_HITS", 1)
+OPENSEARCH_MAX_SUGGEST_RESULTS = get_int("OPENSEARCH_MAX_SUGGEST_RESULTS", 1)
+OPENSEARCH_SHARD_COUNT = get_int("OPENSEARCH_SHARD_COUNT", 2)
+OPENSEARCH_REPLICA_COUNT = get_int("OPENSEARCH_REPLICA_COUNT", 2)
+OPENSEARCH_MAX_REQUEST_SIZE = get_int("OPENSEARCH_MAX_REQUEST_SIZE", 10485760)
+INDEXING_ERROR_RETRIES = get_int("INDEXING_ERROR_RETRIES", 1)
+CONTENT_FILE_RETENTION_DAYS = get_int("CONTENT_FILE_RETENTION_DAYS", 14)
+CONTENT_FILE_CLEANUP_CHUNK_SIZE = get_int("CONTENT_FILE_CLEANUP_CHUNK_SIZE", 1000)
+
+# JWT authentication settings
+MITOL_JWT_SECRET = get_string(
+    "MITOL_JWT_SECRET", "terribly_unsafe_default_jwt_secret_key"
+)
+
+MITOL_COOKIE_NAME = get_string("MITOL_COOKIE_NAME", None)
+if not MITOL_COOKIE_NAME:
+    msg = "MITOL_COOKIE_NAME is not set"
+    raise ImproperlyConfigured(msg)
+MITOL_COOKIE_DOMAIN = get_string("MITOL_COOKIE_DOMAIN", None)
+if not MITOL_COOKIE_DOMAIN:
+    msg = "MITOL_COOKIE_DOMAIN is not set"
+    raise ImproperlyConfigured(msg)
+
+MITOL_UNSUBSCRIBE_TOKEN_MAX_AGE_SECONDS = get_int(
+    "MITOL_UNSUBSCRIBE_TOKEN_MAX_AGE_SECONDS",
+    60 * 60 * 24 * 7,  # 7 days
+)
+
+JWT_AUTH = {
+    "JWT_SECRET_KEY": MITOL_JWT_SECRET,
+    "JWT_VERIFY": True,
+    "JWT_VERIFY_EXPIRATION": True,
+    "JWT_EXPIRATION_DELTA": datetime.timedelta(seconds=60 * 60),
+    "JWT_ALLOW_REFRESH": True,
+    "JWT_REFRESH_EXPIRATION_DELTA": datetime.timedelta(days=7),
+    "JWT_AUTH_COOKIE": MITOL_COOKIE_NAME,
+    "JWT_AUTH_HEADER_PREFIX": "Bearer",
+}
+
+# Similar resources settings
+MITOL_SIMILAR_RESOURCES_COUNT = get_int("MITOL_SIMILAR_RESOURCES_COUNT", 3)
+OPEN_RESOURCES_MIN_DOC_FREQ = get_int("OPEN_RESOURCES_MIN_DOC_FREQ", 1)
+OPEN_RESOURCES_MIN_TERM_FREQ = get_int("OPEN_RESOURCES_MIN_TERM_FREQ", 1)
+
+
+# features flags
+def get_all_config_keys():
+    """
+    Returns all the configuration keys from both
+    environment and configuration files
+    """  # noqa: D401
+    return list(os.environ.keys())
+
+
+MITOL_FEATURES_PREFIX = get_string("MITOL_FEATURES_PREFIX", "FEATURE_")
+MITOL_FEATURES_DEFAULT = get_bool("MITOL_FEATURES_DEFAULT", False)  # noqa: FBT003
+FEATURES = {
+    key[len(MITOL_FEATURES_PREFIX) :]: get_bool(key, False)  # noqa: FBT003
+    for key in get_all_config_keys()
+    if key.startswith(MITOL_FEATURES_PREFIX)
+}
+
+MIDDLEWARE_FEATURE_FLAG_QS_PREFIX = get_string(
+    "MIDDLEWARE_FEATURE_FLAG_QS_PREFIX", None
+)
+MIDDLEWARE_FEATURE_FLAG_COOKIE_NAME = get_string(
+    "MIDDLEWARE_FEATURE_FLAG_COOKIE_NAME", "MITOL_FEATURE_FLAGS"
+)
+MIDDLEWARE_FEATURE_FLAG_COOKIE_MAX_AGE_SECONDS = get_int(
+    "MIDDLEWARE_FEATURE_FLAG_COOKIE_MAX_AGE_SECONDS", 60 * 60
+)
+REDIS_VIEW_CACHE_DURATION = get_int("REDIS_VIEW_CACHE_DURATION", 60 * 60 * 24)
+
+
+if MIDDLEWARE_FEATURE_FLAG_QS_PREFIX:
+    MIDDLEWARE = (
+        *MIDDLEWARE,
+        "main.middleware.feature_flags.QueryStringFeatureFlagMiddleware",
+        "main.middleware.feature_flags.CookieFeatureFlagMiddleware",
+    )
+
+REST_FRAMEWORK = {
+    "DEFAULT_PERMISSION_CLASSES": ("rest_framework.permissions.IsAuthenticated",),
+    "DEFAULT_AUTHENTICATION_CLASSES": (
+        "rest_framework.authentication.SessionAuthentication",
+    ),
+    "DEFAULT_PAGINATION_CLASS": "main.pagination.DefaultPagination",
+    "EXCEPTION_HANDLER": "main.exceptions.api_exception_handler",
+    "TEST_REQUEST_DEFAULT_FORMAT": "json",
+    "TEST_REQUEST_RENDERER_CLASSES": [
+        "rest_framework.renderers.JSONRenderer",
+        "rest_framework.renderers.MultiPartRenderer",
+    ],
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+    "DEFAULT_VERSIONING_CLASS": "rest_framework.versioning.NamespaceVersioning",
+    "ALLOWED_VERSIONS": ["v0", "v1"],
+    "ORDERING_PARAM": "sortby",
+    # Trusted reverse-proxy hops in front of the app (APISIX + nginx). Anonymous
+    # throttles identify the client via the Nth-from-last X-Forwarded-For entry;
+    # without this DRF keys on the whole header, which a client can spoof to
+    # bypass the limit (mitodl/hq#12775). nginx appends, so only the rightmost
+    # NUM_PROXIES entries are added by our infrastructure and can be trusted.
+    "NUM_PROXIES": get_int("NUM_PROXIES", 2),
+    "DEFAULT_THROTTLE_RATES": {
+        # Rate format is "<count>/<period>" (e.g. "10/min", "30/hour"); a blank
+        # env value -> "" or None -> None -> throttle is a no-op (kill switch).
+        "content_feedback": get_string("CONTENT_FEEDBACK_THROTTLE_RATE", "10/min")
+        or None,
+    },
+}
+
+USE_X_FORWARDED_PORT = get_bool("USE_X_FORWARDED_PORT", False)  # noqa: FBT003
+USE_X_FORWARDED_HOST = get_bool("USE_X_FORWARDED_HOST", False)  # noqa: FBT003
+
+
+# Guardian
+# disable the anonymous user creation
+ANONYMOUS_USER_NAME = None
+
+# x509 filenames
+MIT_WS_CERTIFICATE_FILE = os.path.join(STATIC_ROOT, "mit_x509.cert")  # noqa: PTH118
+MIT_WS_PRIVATE_KEY_FILE = os.path.join(STATIC_ROOT, "mit_x509.key")  # noqa: PTH118
+
+RSS_FEED_EPISODE_LIMIT = get_int("RSS_FEED_EPISODE_LIMIT", 100)
+RSS_FEED_CACHE_MINUTES = get_int("RSS_FEED_CACHE_MINUTES", 15)
+
+REQUESTS_TIMEOUT = get_int("REQUESTS_TIMEOUT", 30)
+
+
+if DEBUG:
+    # allow for all IPs to be routable, including localhost, for testing
+    IPWARE_PRIVATE_IP_PREFIX = ()
+
+SPECTACULAR_SETTINGS = open_spectacular_settings
+
+# drf extension settings
+DRF_NESTED_PARENT_LOOKUP_PREFIX = get_string("DRF_NESTED_PARENT_LOOKUP_PREFIX", "")
+REST_FRAMEWORK_EXTENSIONS = {
+    "DEFAULT_PARENT_LOOKUP_KWARG_NAME_PREFIX": DRF_NESTED_PARENT_LOOKUP_PREFIX
+}
+
+# Keycloak API settings
+KEYCLOAK_BASE_URL = get_string(
+    name="KEYCLOAK_BASE_URL",
+    default="http://mit-keycloak-base-url.edu",
+)
+KEYCLOAK_REALM_NAME = get_string(
+    name="KEYCLOAK_REALM_NAME",
+    default="olapps",
+)
+# The OIDC client used to start Keycloak "application initiated actions"
+# (update email / update password) and to exchange the resulting authorization
+# code. Deliberately has no default: the account action callback URL has to be a
+# registered redirect URI on this client, so guessing a client here fails at
+# Keycloak with an opaque error. Deployed environments must set it (mitxonline
+# does the same with `ol-mitxonline-client`).
+KEYCLOAK_CLIENT_ID = get_string(
+    name="KEYCLOAK_CLIENT_ID",
+    default=None,
+)
+
+MICROMASTERS_CMS_API_URL = get_string("MICROMASTERS_CMS_API_URL", None)
+
+OPENSEARCH_VECTOR_MODEL_BASE_NAME = get_string(
+    name="OPENSEARCH_VECTOR_MODEL_BASE_NAME",
+    default="hybrid_search_model",
+)
+POSTHOG_PROJECT_API_KEY = get_string(
+    name="POSTHOG_PROJECT_API_KEY",
+    default="",
+)
+POSTHOG_PERSONAL_API_KEY = get_string(
+    name="POSTHOG_PERSONAL_API_KEY",
+    default=None,
+)
+POSTHOG_API_HOST = get_string(
+    name="POSTHOG_API_HOST",
+    default="https://us.posthog.com",
+)
+POSTHOG_TIMEOUT_MS = get_int(
+    name="POSTHOG_TIMEOUT_MS",
+    default=3000,
+)
+POSTHOG_PROJECT_ID = get_int(
+    name="POSTHOG_PROJECT_ID",
+    default=None,
+)
+POSTHOG_EVENT_S3_BUCKET = get_string(name="POSTHOG_EVENT_S3_BUCKET", default="None")
+POSTHOG_EVENT_S3_PREFIX = get_string(name="POSTHOG_EVENT_S3_PREFIX", default="None")
+
+# Search defaults settings - adjustable throught the admin ui
+DEFAULT_SEARCH_MODE = get_string(name="DEFAULT_SEARCH_MODE", default="phrase")
+DEFAULT_SEARCH_SLOP = get_int(name="DEFAULT_SEARCH_SLOP", default=6)
+DEFAULT_SEARCH_STALENESS_PENALTY = get_float(
+    name="DEFAULT_SEARCH_STALENESS_PENALTY", default=2.5
+)
+DEFAULT_SEARCH_MINIMUM_SCORE_CUTOFF = get_float(
+    name="DEFAULT_SEARCH_MINIMUM_SCORE_CUTOFF", default=5
+)
+DEFAULT_SEARCH_MAX_INCOMPLETENESS_PENALTY = get_float(
+    name="DEFAULT_SEARCH_MAX_INCOMPLETENESS_PENALTY", default=90
+)
+DEFAULT_SEARCH_CONTENT_FILE_SCORE_WEIGHT = get_float(
+    name="DEFAULT_SEARCH_CONTENT_FILE_SCORE_WEIGHT", default=1
+)
+
+
+SEARCH_PROGRAM_INDEX_BOOST = get_float(name="SEARCH_PROGRAM_INDEX_BOOST", default=3)
+"""
+the schedule (in minutes) for the embeddings task
+the lookback window for getting items to embed
+will be a constant 60 minutes greater more than the schedule frequency
+"""
+EMBEDDING_SCHEDULE_MINUTES = get_int(name="EMBEDDING_SCHEDULE_MINUTES", default=60)
+OPEN_AI_EMBEDDING_MODELS = get_list_of_str(
+    "OPEN_AI_EMBEDDING_MODELS",
+    [
+        "text-embedding-3-small",
+        "text-embedding-3-large",
+    ],
+)
+QDRANT_EMBEDDINGS_TASK_LOOKBACK_WINDOW = EMBEDDING_SCHEDULE_MINUTES + 60
+
+QDRANT_ENABLE_INDEXING_PLUGIN_HOOKS = get_bool(
+    name="QDRANT_ENABLE_INDEXING_PLUGIN_HOOKS", default=False
+)
+
+QDRANT_API_KEY = get_string(name="QDRANT_API_KEY", default="")
+QDRANT_HOST = get_string(name="QDRANT_HOST", default="http://qdrant:6333")
+
+# 1 week default query cache ttl
+QDRANT_QUERY_EMBEDDING_CACHE_TTL = get_int(
+    name="QDRANT_QUERY_EMBEDDING_CACHE_TTL", default=60 * 60 * 24 * 7
+)
+QDRANT_BASE_COLLECTION_NAME = get_string(
+    name="QDRANT_COLLECTION_NAME", default="resource_embeddings"
+)
+QDRANT_DENSE_MODEL = get_string(name="QDRANT_DENSE_MODEL", default=None)
+QDRANT_SPARSE_MODEL = get_string(
+    name="QDRANT_SPARSE_MODEL_V2", default="sklearn/hashing_vectorizer_sparse_model"
+)
+QDRANT_SPARSE_ENCODER = get_string(
+    name="QDRANT_SPARSE_ENCODER_V2",
+    default="vector_search.encoders.sparse_hash.SparseHashEncoder",
+)
+
+QDRANT_CHUNK_SIZE = get_int(
+    name="QDRANT_CHUNK_SIZE",
+    default=10,
+)
+
+QDRANT_ENCODER = get_string(
+    name="QDRANT_ENCODER", default="vector_search.encoders.gensim.GensimEncoder"
+)
+
+# Max Sentry alerts the embeddings healthcheck sends per alert type per run. The
+# healthcheck reports per resource, so an environment that is simply behind on
+# embedding (e.g. RC) would otherwise burn thousands of events in one run.
+# Production should set this high (a large backlog there is a real incident, not
+# expected drift); 0 or less disables the cap entirely. The default is deliberately
+# low so an unconfigured environment can't spend the quota, and the cap sends one
+# explicit notice when it engages, so a capped run is never mistaken for a clean one.
+EMBEDDINGS_HEALTHCHECK_ALERT_CAP = get_int(
+    name="EMBEDDINGS_HEALTHCHECK_ALERT_CAP",
+    default=20,
+)
+
+QDRANT_POINT_UPLOAD_BATCH_SIZE = get_int(
+    name="QDRANT_POINT_UPLOAD_BATCH_SIZE", default=1000
+)
+
+QDRANT_BATCH_SIZE_BYTES = get_int(
+    name="QDRANT_BATCH_SIZE_BYTES", default=10 * 1024 * 1024
+)  # default 10 MB limit for batch processing
+
+QDRANT_CONTENT_FILE_SERIALIZATION_CHUNK_SIZE = get_int(
+    name="QDRANT_CONTENT_FILE_SERIALIZATION_CHUNK_SIZE", default=5
+)
+
+QDRANT_CLIENT_TIMEOUT = get_int(name="QDRANT_CLIENT_TIMEOUT", default=10)
+
+VECTOR_HYBRID_SEARCH_PREFETCH_MULTIPLIER = get_int(
+    name="VECTOR_HYBRID_SEARCH_PREFETCH_MULTIPLIER", default=5
+)
+VECTOR_HYBRID_SEARCH_PREFETCH_MAX_LIMIT = get_int(
+    name="VECTOR_HYBRID_SEARCH_PREFETCH_MAX_LIMIT", default=500
+)
+
+
+# Absolute score floors, now only a backstop for a query that matched nothing
+# -- the primary gate is the relative cutoff below. As the primary gate these
+# sized the candidate set by how high a query's scores happened to reach, which
+# swung ~50x across rewordings of the same question.
+#
+# Low enough that a query matching nothing real ("asdkjhqwe") comes back with a
+# page of unrelated resources where 0.3 returned none. Deliberate: embedding
+# similarity puts gibberish in the same band as a legitimate one-word query
+# (q="dance" returned nothing at 0.3), so an absolute floor cannot separate the
+# two, and returning something for "dance" is worth more than an empty page for
+# a typo.
+DENSE_VECTOR_SEARCH_MIN_SCORE = get_float(
+    name="DENSE_VECTOR_SEARCH_MIN_SCORE", default=0.15
+)
+
+# RRF scores by rank, not similarity: 1/(2 + rank) per arm a hit appears in,
+# so 1.0 at best and ~0.004 at the tail of a 500-candidate prefetch.
+HYBRID_VECTOR_SEARCH_MIN_SCORE = get_float(
+    name="HYBRID_VECTOR_SEARCH_MIN_SCORE", default=0.01
+)
+
+# Keep hits scoring at least this fraction of the query's own best hit, so the
+# candidate set is sized by how fast relevance falls off within the query.
+# PROVISIONAL: both ratios want a sweep over real query logs, which the
+# `score_cutoff_ratio` request param allows without a deploy.
+DENSE_VECTOR_SEARCH_MIN_SCORE_RATIO = get_float(
+    name="DENSE_VECTOR_SEARCH_MIN_SCORE_RATIO", default=0.8
+)
+
+# On RRF's rank-derived scores this is close to the absolute floor it replaces
+# (~the top 18 fused ranks), but adapts when the best fused score is below 1.0.
+HYBRID_VECTOR_SEARCH_MIN_SCORE_RATIO = get_float(
+    name="HYBRID_VECTOR_SEARCH_MIN_SCORE_RATIO", default=0.1
+)
+
+# Hits the relative cutoff may never trim below, so a query with one standout
+# hit still returns a usable page. 0 disables the exemption.
+VECTOR_SEARCH_MIN_CANDIDATES = get_int(name="VECTOR_SEARCH_MIN_CANDIDATES", default=10)
+
+# hard limit for special cases where we need to return all results without pagination
+VECTOR_SEARCH_PAGE_MAX_LIMIT = get_int("VECTOR_SEARCH_PAGE_MAX_LIMIT", 200)
+
+# Fraction of its own score a completeness = 0 resource gives up in vector
+# search, scaled linearly by incompleteness. 0 disables the penalty.
+#
+# A bounded fraction of the score, not a multiplication *by* completeness --
+# that would make completeness the primary sort key. Fixed score units are
+# what it replaces: 0.05 is a fifth of the spread across a result page, so the
+# two penalties together outweighed relevance.
+VECTOR_SEARCH_INCOMPLETENESS_PENALTY_WEIGHT = get_float(
+    name="VECTOR_SEARCH_INCOMPLETENESS_PENALTY_WEIGHT", default=0.05
+)
+
+# Fraction of its own score a resource gives up once it is
+# VECTOR_SEARCH_STALENESS_HORIZON_YEARS or more old in vector search, ramped
+# linearly by age. Resources with an upcoming run are exempt. 0 disables the
+# penalty.
+VECTOR_SEARCH_STALENESS_PENALTY_WEIGHT = get_float(
+    name="VECTOR_SEARCH_STALENESS_PENALTY_WEIGHT", default=0.05
+)
+
+# Age at which a resource takes the full VECTOR_SEARCH_STALENESS_PENALTY_WEIGHT;
+VECTOR_SEARCH_STALENESS_HORIZON_YEARS = get_float(
+    name="VECTOR_SEARCH_STALENESS_HORIZON_YEARS", default=20
+)
+
+# serve learning resource search hits from the Qdrant payload instead of
+# re-hydrating them from the database. Set to False to fall back to database
+# hydration without a deploy.
+VECTOR_SEARCH_RESOURCES_FROM_PAYLOAD = get_bool(
+    name="VECTOR_SEARCH_RESOURCES_FROM_PAYLOAD", default=True
+)
+
+# toggle to use requests (default for local) or webdriver which renders js elements
+EMBEDDINGS_EXTERNAL_FETCH_USE_WEBDRIVER = get_bool(
+    "EMBEDDINGS_EXTERNAL_FETCH_USE_WEBDRIVER", default=False
+)
+WEBDRIVER_WAIT_SECONDS = get_int(name="WEBDRIVER_WAIT_SECONDS", default=10)
+LITELLM_TOKEN_ENCODING_NAME = get_string(
+    name="LITELLM_TOKEN_ENCODING_NAME", default=None
+)
+LITELLM_CUSTOM_PROVIDER = get_string(name="LITELLM_CUSTOM_PROVIDER", default="openai")
+LITELLM_API_BASE = get_string(name="LITELLM_API_BASE", default=None)
+
+OPENAI_API_KEY = get_string(
+    name="OPENAI_API_KEY",
+    default=None,
+)
+
+# Azure OpenAI is used only for chat and embedding models configured with an
+# "azure/" prefix (e.g. "azure/gpt-4o", where the part after the prefix is the
+# deployment name). It authenticates with an Entra ID token, never an API key.
+AZURE_OPENAI_ENDPOINT = get_string(name="AZURE_OPENAI_ENDPOINT", default="")
+AZURE_OPENAI_API_VERSION = get_string(name="AZURE_OPENAI_API_VERSION", default="")
+
+# Hedged embedding requests: if the first request for a search query has not
+# come back within EMBEDDING_HEDGE_DELAY_SECONDS, send backup requests and use
+# whichever finishes first. The delay keeps the extra backend load proportional
+# to the tail rather than doubling it on every query - set it to 0 to always
+# send the backups immediately.
+EMBEDDING_REQUEST_HEDGING_ENABLED = get_bool(
+    name="EMBEDDING_REQUEST_HEDGING_ENABLED", default=True
+)
+EMBEDDING_HEDGE_COUNT = get_int(name="EMBEDDING_HEDGE_COUNT", default=2)
+EMBEDDING_HEDGE_DELAY_SECONDS = get_float(
+    name="EMBEDDING_HEDGE_DELAY_SECONDS", default=0.45
+)
+# Primary and speculative query embedding requests run in separate, bounded
+# thread pools so abandoned hedges cannot starve later primary requests. Both
+# pools reject work when full: a saturated primary pool falls back to running
+# the request inline, a saturated hedge pool skips the backups.
+EMBEDDING_QUERY_MAX_WORKERS = get_int(name="EMBEDDING_QUERY_MAX_WORKERS", default=16)
+EMBEDDING_HEDGE_MAX_WORKERS = get_int(name="EMBEDDING_HEDGE_MAX_WORKERS", default=16)
+# Explicit per-request timeout for hedged query embeddings, so a losing request
+# releases its worker instead of occupying it for the life of the connection.
+EMBEDDING_HEDGE_REQUEST_TIMEOUT_SECONDS = get_float(
+    name="EMBEDDING_HEDGE_REQUEST_TIMEOUT_SECONDS", default=10.0
+)
+
+# Embedding requests are traced to Opik through ol-llm. OL_LLM_ENVIRONMENT goes on
+# every trace. Tracing is off unless OPIK_URL_OVERRIDE names an Opik instance, since
+# the SDK would otherwise send to Comet's hosted Opik.
+OL_LLM_ENVIRONMENT = get_string(name="OL_LLM_ENVIRONMENT", default=ENVIRONMENT)
+OPIK_URL_OVERRIDE = get_string(name="OPIK_URL_OVERRIDE", default=None)
+
+CONTENT_FILE_EMBEDDING_CHUNK_SIZE_OVERRIDE = get_int(
+    name="CONTENT_FILE_EMBEDDING_CHUNK_SIZE", default=512
+)
+CONTENT_FILE_EMBEDDING_CHUNK_OVERLAP = get_int(
+    name="CONTENT_FILE_EMBEDDING_CHUNK_OVERLAP",
+    default=0,  # default that the tokenizer uses
+)
+
+CONTENT_FILE_SUMMARIZER_BATCH_SIZE = get_int("CONTENT_FILE_SUMMARIZER_BATCH_SIZE", 20)
+# number of flashcards to generate
+CONTENT_SUMMARIZER_FLASHCARD_QUANTITY = get_int(
+    "CONTENT_SUMMARIZER_FLASHCARD_QUANTITY", 10
+)
+
+CONTENT_SUMMARIZER_FLASHCARD_PROMPT = get_string(
+    "CONTENT_SUMMARIZER_FLASHCARD_PROMPT",
+    (
+        f"""
+        You are an expert instructor creating study flashcards.
+        Generate exactly {CONTENT_SUMMARIZER_FLASHCARD_QUANTITY}
+        high-quality flashcards from the transcript below.
+        """
+        """
+        Rules:
+        - Use the same language as the transcript for both questions and answers.
+        - Focus ONLY on core concepts, methods, definitions,
+          reasoning, and cause-effect relationships.
+        - Questions must test understanding or application,
+          not recall of names, timestamps, or anecdotes.
+        - Avoid trivia, meta information
+        - avoid details about the speaker or course logistics.
+        - Prefer "why", "how", "compare", "explain", or "apply" style questions.
+        - Each answer should be concise but complete (1-3 sentences).
+
+        Transcript:
+        {content}
+        """
+    ),
+)
+# Credential metadata generation (learning_resources/credentials.py). The
+# prompts, models and the content retrieval query are admin-editable rows of
+# CredentialMetadataConfiguration; what is left is how much it retrieves.
+CREDENTIAL_METADATA_CONTENT_CHUNK_LIMIT = get_int(
+    name="CREDENTIAL_METADATA_CONTENT_CHUNK_LIMIT", default=50
+)
+# Chunks shorter than this are dropped: near-empty OLX stub blocks are common
+# (`prerequisites` at 4 characters median) and only crowd out real content.
+CREDENTIAL_METADATA_MIN_CHUNK_CHARS = get_int(
+    name="CREDENTIAL_METADATA_MIN_CHUNK_CHARS", default=200
+)
+# How long one field's LLM call may take. litellm's own default is 6000
+# seconds, so without this a hung provider connection outlives every proxy in
+# front of it by a wide margin: the client gets a 504 while the request goes on
+# burning spend and holding its pending log write open.
+#
+# 120s is sized for the models production runs -- gpt-5 and Claude take 25-46s
+# per field, against 1-4s for the gpt-4o-mini the configurations are seeded
+# with -- and sits under the 180s read timeout the deployed path allows. That
+# ceiling is not configured from this repo: CI/QA/production reach Django
+# through an APISIX route defined in ol-infrastructure, where this path has a
+# `credential-metadata` route raising it from the 60s default the rest of the
+# application uses. Fields are generated concurrently, so this bounds the whole
+# run, and the remaining margin covers retrieval and the log write.
+CREDENTIAL_METADATA_LLM_TIMEOUT = get_int(
+    name="CREDENTIAL_METADATA_LLM_TIMEOUT", default=120
+)
+
+# Resource profile LLM calls read up to ~100k tokens of course material and
+# return tens of claims with evidence, so they take minutes, not seconds.
+RESOURCE_PROFILE_LLM_TIMEOUT = get_int(name="RESOURCE_PROFILE_LLM_TIMEOUT", default=600)
+
+# OpenTelemetry configuration (consumed by mitol-django-observability).
+# Telemetry turns on when any of OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+# OTEL_EXPORTER_OTLP_METRICS_ENDPOINT or OTEL_EXPORTER_OTLP_ENDPOINT is set in
+# the environment, or the OPENTELEMETRY_ENDPOINT setting below is. Per signal
+# the environment is read most-specific-first, and the setting applies only
+# when the environment supplies nothing. There is no flag to disable it.
+OPENTELEMETRY_SERVICE_NAME = get_string("OPENTELEMETRY_SERVICE_NAME", "learn")
+OPENTELEMETRY_INSECURE = get_bool("OPENTELEMETRY_INSECURE", default=True)
+OPENTELEMETRY_ENDPOINT = get_string("OPENTELEMETRY_ENDPOINT", None)
+# Name must match what mitol.observability.telemetry looks up, or the default
+# silently applies instead.
+OPENTELEMETRY_BATCH_SIZE = get_int("OPENTELEMETRY_BATCH_SIZE", 512)
+OPENTELEMETRY_EXPORT_TIMEOUT_MS = get_int("OPENTELEMETRY_EXPORT_TIMEOUT_MS", 5000)
+CANVAS_TUTORBOT_FOLDER = get_string("CANVAS_TUTORBOT_FOLDER", "web_resources/ai/tutor/")
+
+
+# Hubspot settings
+MITOL_HUBSPOT_API_PRIVATE_TOKEN = get_string("MITOL_HUBSPOT_API_PRIVATE_TOKEN", None)
+
+# Create all learning material resources for OCW courses
+# Extra learning material resources are behind show_ocw_files flag in search
+# If false only learning materials in OCW_VISIBLE_TAGS will be created
+CREATE_HIDDEN_OCW_LEARNING_MATERIALS = get_bool(
+    "CREATE_HIDDEN_OCW_LEARNING_MATERIALS", default=False
+)
+
+# separate secret keys for unsubscribe
+UNSUBSCRIBE_SECRET_KEY = get_string("UNSUBSCRIBE_SECRET_KEY", None)
+if not UNSUBSCRIBE_SECRET_KEY:
+    msg = "UNSUBSCRIBE_SECRET_KEY is not set"
+    raise ImproperlyConfigured(msg)
+UNSUBSCRIBE_SECRET_KEY_FALLBACKS = get_list_of_str(
+    "UNSUBSCRIBE_SECRET_KEY_FALLBACKS", []
+)

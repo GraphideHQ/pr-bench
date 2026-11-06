@@ -1,0 +1,47 @@
+version: 2
+updates:
+  # `uv`, not `pip`: the pip ecosystem edits pyproject.toml and leaves uv.lock
+  # alone, and every CI job installs with `uv sync --locked` — so each pip PR
+  # arrived red by construction and could never be merged as opened.
+  - package-ecosystem: uv
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    labels: [dependencies, python]
+    ignore:
+      # Bittensor v11 changes runtime contracts used by Axon/Dendrite. Upgrade
+      # only through a deliberate compatibility release, never an automated PR.
+      - dependency-name: bittensor
+        update-types: ["version-update:semver-major"]
+      # Exact pins on the consensus path (pyproject.toml says why each one is
+      # pinned): the embedding profile, the DCAP and TPM verifiers, the price
+      # of a float. A version bump here is a consensus change and arrives
+      # through a reviewed PR with the gate run on both environments, never
+      # through a weekly bot PR that sat red for a month (#52, #53, #54).
+      # Security advisories against these pins still surface: pip-audit in CI
+      # fails the lockfile, as it did for aiohttp and setuptools in 2026-10.
+      - dependency-name: torch
+      - dependency-name: transformers
+      - dependency-name: numpy
+      - dependency-name: dcap-qvl
+      - dependency-name: cryptography
+      - dependency-name: datasets
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:30"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    labels: [dependencies, github-actions]
+    groups:
+      # init and analyze must be the same release; CodeQL refuses to run on a
+      # mismatch. Bumped one per PR, both PRs are red and neither can land.
+      codeql-action:
+        patterns: ["github/codeql-action/*"]

@@ -1,0 +1,12 @@
+import { env } from "@/env"
+const VERSION = env("NEXT_PUBLIC_VERSION") || "unknown"
+export async function GET() {
+  return Response.json(
+    {
+      status: "ok",
+      version: VERSION,
+      timestamp: new Date().toISOString(), // easily tell if response is cached
+    },
+    { status: 200, headers: { "Cache-Control": "no-store, s-maxage=0" } },
+  )
+}

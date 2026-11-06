@@ -1,0 +1,1802 @@
+"""
+learning_resources tasks
+"""
+
+import datetime as datetime_module
+import logging
+import uuid
+from datetime import UTC, datetime
+
+import boto3
+import celery
+from celery.exceptions import Ignore
+from django.conf import settings
+from django.core.cache import caches
+from django.db import OperationalError
+from django.db.models import Q
+from django.utils import timezone
+
+from learning_resources.api import (
+    sync_website_content_to_learning_resource,
+    unpublish_website_content_learning_resource,
+)
+from learning_resources.constants import (
+    CREDENTIAL_METADATA_RESOURCE_TYPES,
+    LearningResourceType,
+    PlatformType,
+)
+from learning_resources.credentials_store import (
+    active_credential_metadata_fields,
+    incomplete_credential_metadata_query,
+    missing_credential_metadata_fields,
+)
+from learning_resources.etl import (
+    loaders,
+    ovs,
+    pipelines,
+    podcast,
+    shadow,
+    warehouse_media,
+    warehouse_mitxonline,
+    warehouse_ocw,
+    warehouse_xpro,
+    youtube,
+)
+from learning_resources.etl.canvas import (
+    sync_canvas_archive,
+)
+from learning_resources.etl.canvas_utils import canvas_course_folder
+from learning_resources.etl.constants import (
+    MARKETING_PAGE_FILE_TYPE,
+    RESOURCE_FILE_ETL_SOURCES,
+    ETLSource,
+)
+from learning_resources.etl.edx_shared import (
+    get_most_recent_course_archives,
+    sync_edx_archive,
+    sync_edx_course_files,
+    unpublish_excluded_content_files,
+)
+from learning_resources.etl.loaders import (
+    load_learning_materials,
+    load_run_dependent_values,
+)
+from learning_resources.etl.ownership import (
+    CONTENT_FILE,
+    TRANSCRIPT,
+    Pipeline,
+    is_shadow_run,
+    may_write,
+    writing_as,
+)
+from learning_resources.etl.pipelines import ocw_courses_etl
+from learning_resources.etl.utils import (
+    get_bucket_by_name,
+    get_s3_prefix_for_source,
+)
+from learning_resources.lib.warehouse import (
+    WAREHOUSE_STATE_CACHE,
+    BaseWarehouseETLTask,
+    iter_rows,
+)
+from learning_resources.models import (
+    ContentFile,
+    LearningResource,
+    LearningResourceRun,
+    VideoChannel,
+)
+from learning_resources.site_scrapers.utils import scraper_for_site
+from learning_resources.utils import (
+    build_program_children_content_bulk,
+    content_files_loaded_actions,
+    html_to_markdown,
+    programs_needing_children_heal,
+    resource_unpublished_actions,
+    resource_upserted_actions,
+    strip_markdown_images,
+)
+from learning_resources_search.constants import (
+    CONTENT_FILE_TYPE,
+    SEARCH_CONN_EXCEPTIONS,
+)
+from learning_resources_search.exceptions import RetryError
+from main.celery import app
+from main.constants import ISOFORMAT
+from main.decorators import cooldown_task
+from main.utils import chunks, clear_views_cache, now_in_utc, run_on_worker_loop
+
+log = logging.getLogger(__name__)
+
+CLEANUP_RETRY_EXCEPTIONS = (*SEARCH_CONN_EXCEPTIONS, OperationalError)
+
+# Lives in a DB-backed cache of its own (Redis is ephemeral, "durable" is
+# culled) so a beat outage of any length is caught up by the next sweep.
+RELEASED_CONTENT_FILES_WATERMARK_KEY = "released_content_files:swept_through"
+
+
+@app.task(acks_late=True, reject_on_worker_lost=True)
+def update_next_start_date_and_prices():
+    """Update expired next start dates and prices"""
+    resources = LearningResource.objects.filter(next_start_date__lt=timezone.now())
+    for resource in resources:
+        load_run_dependent_values(resource)
+        if resource.published:
+            resource_upserted_actions(
+                resource, percolate=False, generate_embeddings=True
+            )
+    return len(resources)
+
+
+@app.task(acks_late=True, reject_on_worker_lost=True)
+def reindex_released_content_files() -> int:
+    """
+    Reindex runs with content files released since the last sweep (watermark
+    minus OVERLAP, or LOOKBACK without one). The watermark only advances once
+    every hook is dispatched, and now is read first so no release falls
+    between two windows.
+    """
+    sweep_cache = caches["release_sweep"]
+    now = now_in_utc()
+    watermark = sweep_cache.get(RELEASED_CONTENT_FILES_WATERMARK_KEY)
+    since = (
+        watermark - settings.RELEASED_CONTENT_FILES_SWEEP_OVERLAP
+        if watermark
+        else now - settings.RELEASED_CONTENT_FILES_LOOKBACK
+    )
+    # visible() keeps the scan on contentfile_published_date_idx; the upper
+    # bound repeats visible()'s so the index range stops at now
+    run_ids = (
+        ContentFile.objects.visible(now)
+        .filter(release_date__gt=since, release_date__lte=now)
+        .values_list("run_id", flat=True)
+        .distinct()
+    )
+    runs = LearningResourceRun.objects.filter(id__in=run_ids)
+    for run in runs:
+        content_files_loaded_actions(run)
+    sweep_cache.set(RELEASED_CONTENT_FILES_WATERMARK_KEY, now, timeout=None)
+    return len(runs)
+
+
+@app.task(acks_late=True, reject_on_worker_lost=True)
+@cooldown_task(wait_time=900)
+def get_mitxonline_data() -> int | None:
+    """Execute the MITX Online ETL pipeline"""
+    courses = pipelines.mitxonline_courses_etl()
+    programs = pipelines.mitxonline_programs_etl()
+    return len(courses) + len(programs)
+
+
+@app.task
+@cooldown_task(
+    wait_time=900,
+    key_func=lambda *, sheets_id=None: f"sheets_id={sheets_id}",
+)
+def get_oll_data(sheets_id=None) -> int | None:
+    """Execute the OLL ETL pipeline.
+
+    Args:
+        sheets_id (str): If provided, retrieved data from the
+        google spreadsheet with this id.
+
+    """
+    courses = pipelines.oll_etl(sheets_id)
+    return len(courses)
+
+
+@app.task(acks_late=True, reject_on_worker_lost=True)
+def get_mitpe_data():
+    """Execute the Professional Education ETL pipeline"""
+    courses, programs = pipelines.mitpe_etl()
+    return len(courses) + len(programs)
+
+
+@app.task(acks_late=True, reject_on_worker_lost=True)
+def get_sloan_data():
+    """Execute the Sloan ETL pipelines"""
+    courses = pipelines.sloan_courses_etl()
+    return len(courses)
+
+
+@app.task(acks_late=True, reject_on_worker_lost=True)
+@cooldown_task(wait_time=900)
+def get_xpro_data() -> int | None:
+    """Execute the xPro ETL pipeline"""
+    courses = pipelines.xpro_courses_etl()
+    programs = pipelines.xpro_programs_etl()
+    return len(courses) + len(programs)
+
+
+@app.task(acks_late=True, reject_on_worker_lost=True)
+def get_mit_climate_data():
+    """Execute the MIT Climate ETL pipeline"""
+    articles = pipelines.mit_climate_etl()
+    return len(articles)
+
+
+@app.task(acks_late=True, reject_on_worker_lost=True)
+def get_content_files(
+    ids: list[int],
+    etl_source: str,
+    keys: list[str],
+    *,
+    overwrite: bool = False,
+    overwrite_units: bool = False,
+):
+    """
+    Task to sync edX course content files with database
+    """
+    if not (
+        settings.AWS_ACCESS_KEY_ID
+        and settings.AWS_SECRET_ACCESS_KEY
+        and settings.COURSE_ARCHIVE_BUCKET_NAME is not None
+    ):
+        log.warning("Required settings missing for %s files", etl_source)
+        return
+    # the fan-out checked before queueing this, but the task can run after the
+    # ownership row changes (a long fan-out, a redelivered message)
+    if not may_write(etl_source, CONTENT_FILE):
+        return
+    sync_edx_course_files(
+        etl_source, ids, keys, overwrite=overwrite, overwrite_units=overwrite_units
+    )
+
+
+def get_content_tasks(
+    etl_source: str,
+    *,
+    chunk_size: int | None = None,
+    overwrite: bool = False,
+    overwrite_units: bool = False,
+    learning_resource_ids: list[int] | None = None,
+) -> celery.group:
+    """
+    Return a list of grouped celery tasks for indexing edx content
+    """
+    if chunk_size is None:
+        chunk_size = settings.LEARNING_COURSE_ITERATOR_CHUNK_SIZE
+
+    archive_keys = get_most_recent_course_archives(etl_source)
+    learning_resources = _content_file_resource_ids(etl_source, learning_resource_ids)
+
+    return celery.group(
+        [
+            get_content_files.si(
+                ids,
+                etl_source,
+                archive_keys,
+                overwrite=overwrite,
+                overwrite_units=overwrite_units,
+            )
+            for ids in chunks(
+                learning_resources,
+                chunk_size=chunk_size,
+            )
+        ]
+    )
+
+
+def _content_file_resource_ids(etl_source: str, learning_resource_ids):
+    """Course ids whose archives should be processed for an edX source"""
+    if learning_resource_ids:
+        return (
+            LearningResource.objects.filter(
+                id__in=learning_resource_ids, etl_source=etl_source
+            )
+            .order_by("-id")
+            .values_list("id", flat=True)
+        )
+    return (
+        LearningResource.objects.filter(Q(published=True) | Q(test_mode=True))
+        .filter(course__isnull=False, etl_source=etl_source)
+        .order_by("-id")
+        .values_list("id", flat=True)
+    )
+
+
+@app.task(acks_late=True, reject_on_worker_lost=True)
+def unpublish_excluded_files(
+    ids: list[int], etl_source: str, keys: list[str], *, dry_run: bool = False
+):
+    """Unpublish excluded content files and date unreleased ones for some courses"""
+    if not may_write(etl_source, CONTENT_FILE):
+        return []
+    return unpublish_excluded_content_files(etl_source, ids, keys, dry_run=dry_run)
+
+
+@app.task(bind=True)
+def unpublish_all_excluded_files(
+    self, *, etl_source, chunk_size=None, learning_resource_ids=None, dry_run=False
+):
+    """Fan out unpublish_excluded_files over an edX source's current archives"""
+    if not may_write(etl_source, CONTENT_FILE):
+        return None
+    if chunk_size is None:
+        chunk_size = settings.LEARNING_COURSE_ITERATOR_CHUNK_SIZE
+    archive_keys = get_most_recent_course_archives(etl_source)
+    # drops whole courses with nothing to unpublish; the runs of the ones that
+    # remain are guarded in unpublish_excluded_content_files, as a course keeps
+    # runs whose archives would otherwise be downloaded for no rows. Not applied
+    # to the ingestion fan-out, where a course with no content files yet is
+    # exactly the one that needs its archive read.
+    resource_ids = (
+        _content_file_resource_ids(etl_source, learning_resource_ids)
+        .filter(runs__content_files__isnull=False)
+        .distinct()
+    )
+    return self.replace(
+        celery.group(
+            [
+                unpublish_excluded_files.si(
+                    ids, etl_source, archive_keys, dry_run=dry_run
+                )
+                for ids in chunks(resource_ids, chunk_size=chunk_size)
+            ]
+        )
+    )
+
+
+def _replace_with_content_tasks(task, etl_source: str, **kwargs):
+    """
+    Replace a task with the content-file fan-out for an edX source, if the legacy
+    ETL still owns that source's content files.
+
+    The check comes before get_content_tasks, which lists the archive bucket.
+    """
+    if not may_write(etl_source, CONTENT_FILE):
+        return None
+    return task.replace(get_content_tasks(etl_source, **kwargs))
+
+
+@app.task(bind=True)
+def import_all_oll_files(
+    self,
+    *,
+    chunk_size=None,
+    overwrite=False,
+    overwrite_units=False,
+    learning_resource_ids=None,
+):
+    """Ingest MIT edX files from an S3 bucket"""
+    return _replace_with_content_tasks(
+        self,
+        ETLSource.oll.name,
+        chunk_size=chunk_size,
+        overwrite=overwrite,
+        overwrite_units=overwrite_units,
+        learning_resource_ids=learning_resource_ids,
+    )
+
+
+@app.task(bind=True)
+def import_all_mitxonline_files(
+    self,
+    *,
+    chunk_size=None,
+    overwrite=False,
+    overwrite_units=False,
+    learning_resource_ids=None,
+):
+    """Ingest MITx Online files from an S3 bucket"""
+    return _replace_with_content_tasks(
+        self,
+        ETLSource.mitxonline.name,
+        chunk_size=chunk_size,
+        overwrite=overwrite,
+        overwrite_units=overwrite_units,
+        learning_resource_ids=learning_resource_ids,
+    )
+
+
+@app.task(bind=True)
+def import_all_xpro_files(
+    self,
+    *,
+    chunk_size=None,
+    overwrite=False,
+    overwrite_units=False,
+    learning_resource_ids=None,
+):
+    """Ingest xPRO OLX files from an S3 bucket"""
+    return _replace_with_content_tasks(
+        self,
+        ETLSource.xpro.name,
+        chunk_size=chunk_size,
+        overwrite=overwrite,
+        overwrite_units=overwrite_units,
+        learning_resource_ids=learning_resource_ids,
+    )
+
+
+@app.task(bind=True)
+def import_content_files(  # noqa: PLR0913
+    self,
+    etl_source,
+    *,
+    chunk_size=None,
+    overwrite=False,
+    overwrite_units=False,
+    learning_resource_ids=None,
+):
+    """Import content files for any edX-based ETL source.
+
+    This task wraps get_content_tasks so that the S3 archive listing and
+    task-group construction happen asynchronously in a Celery worker, rather
+    than blocking the calling task.
+    """
+    return _replace_with_content_tasks(
+        self,
+        etl_source,
+        chunk_size=chunk_size,
+        overwrite=overwrite,
+        overwrite_units=overwrite_units,
+        learning_resource_ids=learning_resource_ids,
+    )
+
+
+@app.task(acks_late=True, reject_on_worker_lost=True)
+def get_podcast_data():
+    """
+    Execute the Podcast ETL pipeline
+
+    Returns:
+        int:
+            The number of results that were fetched
+    """
+    results = pipelines.podcast_etl()
+    return len(list(results))
+
+
+@app.task(acks_late=True)
+def get_ovs_data():
+    """
+    Execute the OVS ETL pipeline
+
+    Returns:
+        int:
+            The number of results that were fetched
+    """
+    results = pipelines.ovs_etl()
+    return len(list(results))
+
+
+@app.task(acks_late=True)
+def get_ocw_courses(
+    *,
+    url_paths,
+    force_overwrite,
+    utc_start_timestamp=None,
+    skip_content_files=settings.OCW_SKIP_CONTENT_FILES,
+):
+    """
+    Task to sync a batch of OCW Next courses
+    """
+    if utc_start_timestamp:
+        utc_start_timestamp = datetime.strptime(  # noqa: DTZ007
+            utc_start_timestamp, ISOFORMAT
+        )
+        utc_start_timestamp = utc_start_timestamp.replace(tzinfo=UTC)
+
+    ocw_courses_etl(
+        url_paths=url_paths,
+        force_overwrite=force_overwrite,
+        start_timestamp=utc_start_timestamp,
+        skip_content_files=skip_content_files,
+    )
+
+
+@app.task(bind=True, acks_late=True)
+def update_ocw_learning_material_resources(self):  # noqa: ARG001
+    """
+    Task to update OCW learning materials resources without updating
+    ocw courses or content files
+    """
+
+    for course in LearningResource.objects.filter(
+        published=True, etl_source=ETLSource.ocw.name, resource_type="course"
+    ):
+        course_run = course.runs.filter(published=True).first()
+        if not course_run:
+            log.warning(
+                "Published course %s has no published run; "
+                "skipping learning materials update",
+                course.readable_id,
+            )
+            continue
+        content_file_ids = course_run.content_files.filter(published=True).values_list(
+            "id", flat=True
+        )
+
+        try:
+            load_learning_materials(course_run, content_file_ids)
+        except Exception as e:
+            error = (
+                f"Error loading learning materials for course run {course_run.id}: {e}"
+            )
+            log.exception(error)
+
+
+@app.task(bind=True, acks_late=True)
+def get_ocw_data(  # noqa: PLR0913
+    self,
+    *,
+    force_overwrite: bool | None = False,
+    course_url_substring: str | None = None,
+    utc_start_timestamp: datetime | None = None,
+    prefix: str | None = None,
+    skip_content_files: bool | None = settings.OCW_SKIP_CONTENT_FILES,
+):
+    """
+    Task to sync OCW Next course data with database
+    """
+    if not (
+        settings.AWS_ACCESS_KEY_ID
+        and settings.AWS_SECRET_ACCESS_KEY
+        and settings.OCW_LIVE_BUCKET
+    ):
+        log.warning("Required settings missing for get_ocw_data")
+        return None
+
+    if not may_write(ETLSource.ocw.name, LearningResourceType.course.name):
+        return None
+
+    # get all the courses prefixes we care about
+    raw_data_bucket = boto3.resource(
+        "s3",
+        aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+    ).Bucket(name=settings.OCW_LIVE_BUCKET)
+
+    ocw_courses = set()
+    log.info("Assembling list of courses...")
+
+    if not prefix:
+        prefix = "courses/"
+
+    if course_url_substring:
+        prefix = prefix + course_url_substring + "/"
+
+    for bucket_file in raw_data_bucket.objects.filter(Prefix=prefix):
+        key_pieces = bucket_file.key.split("/")
+        if "/".join(key_pieces[:2]) != "":
+            path = "/".join(key_pieces[:2]) + "/"
+            ocw_courses.add(path)
+
+    if len(ocw_courses) == 0:
+        log.info("No courses matching url substring")
+        return None
+
+    log.info("Backpopulating %d OCW courses...", len(ocw_courses))
+
+    ocw_tasks = celery.group(
+        [
+            get_ocw_courses.si(
+                url_paths=url_path,
+                force_overwrite=force_overwrite,
+                utc_start_timestamp=utc_start_timestamp,
+                skip_content_files=skip_content_files,
+            )
+            for url_path in chunks(
+                ocw_courses, chunk_size=settings.OCW_ITERATOR_CHUNK_SIZE
+            )
+        ]
+    )
+    return self.replace(ocw_tasks)
+
+
+@app.task(acks_late=True, reject_on_worker_lost=True)
+def get_youtube_playlist_data(
+    channel_id, playlist_data, offered_by_code, *, create_videos
+):
+    """
+    Load a single youtube playlist and its videos
+
+    Args:
+        channel_id (str): youtube's id for the playlist's channel
+        playlist_data (dict): the raw playlist data from the youtube api
+        offered_by_code (str): the offered_by code for the playlist
+        create_videos (bool): whether to create videos from this playlist
+            or match to existing videos without creating new ones
+    """
+    # get_youtube_data checked before queueing this, but the task can run after
+    # the ownership row changes (a long fan-out, a redelivered message)
+    if not warehouse_media.may_write_youtube():
+        return
+
+    video_channel = VideoChannel.objects.filter(channel_id=channel_id).first()
+    if video_channel is None:
+        # the channel task upserts the channel before fanning out, so this only
+        # happens if the channel was deleted mid-run
+        log.error("No VideoChannel for channel_id=%s", channel_id)
+        return
+
+    youtube_client = youtube.get_youtube_client()
+    playlist_id = playlist_data["id"]
+    loaders.load_playlist(
+        video_channel,
+        youtube.transform_playlist(
+            playlist_data,
+            youtube.extract_playlist_items(youtube_client, playlist_id),
+            offered_by_code,
+            create_videos=create_videos,
+        ),
+    )
+
+
+@app.task(acks_late=True, reject_on_worker_lost=True)
+def get_youtube_channel_data(channel_config):
+    """
+    Load a single youtube channel and fan its playlists out into their own tasks.
+
+    The channel row is upserted before the playlist tasks are queued so they
+    can find it, and the channel's full playlist listing is resolved before
+    anything is unpublished, so a failed extraction can't unpublish a live
+    playlist.
+
+    Args:
+        channel_config (dict): the channel's configuration
+    """
+    if not warehouse_media.may_write_youtube():
+        return
+
+    channel_id = channel_config["channel_id"]
+    youtube_client = youtube.get_youtube_client()
+
+    channel_data = youtube.extract_channel(youtube_client, channel_id)
+    if channel_data is None:
+        log.warning("No youtube data for channel_id=%s", channel_id)
+        return
+
+    create_videos = channel_config.get("create_videos", True)
+    playlists = list(
+        youtube.extract_playlist_metadata(
+            youtube_client,
+            channel_config.get("playlists", []),
+            channel_id,
+            create_videos_channel_setting=create_videos,
+        )
+    )
+
+    video_channel = loaders.upsert_video_channel(
+        youtube.transform_channel(channel_data)
+    )
+    loaders.unpublish_removed_playlists(
+        video_channel, [playlist_data["id"] for playlist_data, _ in playlists]
+    )
+
+    log.info(
+        "Queueing %d playlists for youtube channel_id=%s", len(playlists), channel_id
+    )
+    for playlist_data, playlist_create_videos in playlists:
+        get_youtube_playlist_data.delay(
+            channel_id,
+            playlist_data,
+            channel_config.get("offered_by", None),
+            create_videos=playlist_create_videos,
+        )
+
+
+@app.task(acks_late=True, reject_on_worker_lost=True)
+def get_youtube_data(*, channel_ids=None):
+    """
+    Fan the YouTube ETL out into one task per channel, each of which fans out
+    into one task per playlist.
+
+    Nothing waits on the fan-out: no worker holds more than a single playlist's
+    worth of work, so a culled pod costs only the playlist it was loading and
+    the redelivered message picks it back up.
+
+    Args:
+        channel_ids (list of str or None):
+            if a list the extraction is limited to those channels
+
+    Returns:
+        int: the number of channels queued
+    """
+    if not warehouse_media.may_write_youtube():
+        return 0
+
+    missing = [
+        setting
+        for setting in ("YOUTUBE_CONFIG_URL", "YOUTUBE_DEVELOPER_KEY")
+        if not getattr(settings, setting)
+    ]
+    if missing:
+        log.error("Missing required settings: %s", ", ".join(missing))
+        return 0
+
+    channel_configs = youtube.get_youtube_channel_configs(channel_ids=channel_ids)
+    if not channel_configs:
+        # an empty config would unpublish every channel below, so treat it as a
+        # failure rather than as "youtube offers nothing"
+        log.error("No youtube channel configs found")
+        return 0
+
+    if not channel_ids:
+        # only a full run knows the complete set of configured channels; a run
+        # filtered to specific channels must not unpublish the rest
+        loaders.unpublish_removed_youtube_channels(
+            [channel_config["channel_id"] for channel_config in channel_configs]
+        )
+
+    log.info("Queueing %d youtube channels", len(channel_configs))
+    for channel_config in channel_configs:
+        get_youtube_channel_data.delay(channel_config)
+
+    return len(channel_configs)
+
+
+@app.task
+def get_youtube_transcripts(
+    *, created_after=None, created_minutes=None, overwrite=False
+):
+    """
+    Fetch transcripts for Youtube videos
+
+    Args:
+        created_after (date or None):
+            if str, transcripts are pulled only for videos added after date
+        created_minutes (int or None):
+            if str, transcripts are pulled only from videos added >= created_minutes ago
+        overwrite (bool):
+            if true, transcripts are updated for videos that already have transcripts
+    """
+    if not may_write(ETLSource.youtube.name, TRANSCRIPT):
+        return
+
+    videos = youtube.get_youtube_videos_for_transcripts_job(
+        created_after=created_after,
+        created_minutes=created_minutes,
+        overwrite=overwrite,
+    )
+
+    log.info("Updating transcripts for %i videos", videos.count())
+    youtube.get_youtube_transcripts(videos)
+
+
+@app.task(acks_late=True)
+def get_ovs_transcripts(*, overwrite=False):
+    """
+    Fetch transcripts for OVS videos from their caption URLs.
+
+    Args:
+        overwrite (bool):
+            if true, transcripts are updated for videos that already have transcripts
+    """
+    if not may_write(ETLSource.ovs.name, TRANSCRIPT):
+        return
+
+    videos = ovs.get_ovs_videos_for_transcripts_job(overwrite=overwrite)
+
+    log.info("Updating OVS transcripts for %i videos", videos.count())
+    ovs.get_ovs_transcripts(videos)
+
+
+@app.task(acks_late=True)
+def get_podcast_transcripts(*, overwrite=False):
+    """
+    Fetch transcripts for podcast episodes from their podcast:transcript urls.
+
+    Args:
+        overwrite (bool):
+            if true, transcripts are updated for episodes that already have one
+    """
+    if not may_write(ETLSource.podcast.name, TRANSCRIPT):
+        return
+
+    episodes = podcast.get_podcast_episodes_for_transcripts_job(overwrite=overwrite)
+
+    log.info("Updating podcast transcripts for %i episodes", episodes.count())
+    podcast.get_podcast_transcripts(episodes)
+
+
+@app.task(acks_late=True, reject_on_worker_lost=True)
+def get_learning_resource_views():
+    """Load learning resource views from the PostHog ETL."""
+
+    pipelines.posthog_etl()
+
+
+@app.task(acks_late=True)
+def summarize_content_files_task(
+    content_file_ids: list[int], *, overwrite: bool = False
+):
+    """Process a batch of content files to generate summary and flashcards.
+    Args:
+        - content_file_ids (list[int]): List of content file ids to process
+        - overwrite (bool): Whether to overwrite existing summary and flashcards
+    Returns:
+        - None
+    """
+    from learning_resources.content_summarizer import ContentSummarizer
+
+    summarizer = ContentSummarizer()
+    return summarizer.summarize_content_files_by_ids(content_file_ids, overwrite)
+
+
+@app.task(bind=True, acks_late=True)
+def summarize_unprocessed_content(
+    self,
+    *,
+    batch_size=None,
+    unprocessed_content_ids: list[int],
+    overwrite: bool = False,
+):
+    """Summarize the unprocessed content files.
+
+    Args:
+        - batch_size (int): Batch size for batch import task
+        - unprocessed_content_ids (list[int]): List of resource ids to process
+        - overwrite (bool): Force overwrite existing embeddings
+
+    Returns:
+        - None
+    """
+
+    if batch_size is None:
+        batch_size = settings.CONTENT_FILE_SUMMARIZER_BATCH_SIZE
+
+    summarizer_tasks = celery.group(
+        [
+            summarize_content_files_task.si(
+                content_file_ids=content_ids, overwrite=overwrite
+            )
+            for content_ids in chunks(
+                unprocessed_content_ids,
+                chunk_size=batch_size,
+            )
+        ]
+    )
+    return self.replace(summarizer_tasks)
+
+
+@app.task(acks_late=True, reject_on_worker_lost=True)
+def ingest_canvas_course(archive_path, overwrite):
+    # reached from sync_canvas_courses and from the content_files webhook. The
+    # archive is both the course's metadata and its content files.
+    if not may_write(
+        ETLSource.canvas.name, [LearningResourceType.course.name, CONTENT_FILE]
+    ):
+        return None
+    bucket = get_bucket_by_name(settings.COURSE_ARCHIVE_BUCKET_NAME)
+    return sync_canvas_archive(bucket, archive_path, overwrite=overwrite)
+
+
+@app.task(acks_late=True)
+def ingest_edx_run_archive(
+    etl_source: str,
+    archive_path: str,
+    *,
+    run_id: str | None = None,
+    overwrite: bool = False,
+):
+    if not may_write(etl_source, CONTENT_FILE):
+        return None
+    return sync_edx_archive(
+        etl_source, archive_path, run_id=run_id, overwrite=overwrite
+    )
+
+
+def unpublish_removed_canvas_courses(course_folders: list[str]) -> int:
+    """
+    Unpublish and delete canvas courses that no longer have an archive in S3.
+
+    A canvas readable id is f"{course_folder}-{course_code}", so the archive's
+    S3 folder identifies its resource on its own - the same mapping the canvas
+    delete webhook uses to find a resource from a canvas course id. That means
+    the S3 listing already knows which courses are still offered and the sweep
+    doesn't have to wait on the imports to report back.
+
+    Args:
+        course_folders (list of str): folders of every archive currently in S3
+
+    Returns:
+        int: the number of stale courses deleted
+    """
+    if not course_folders:
+        log.error("No canvas archives listed, skipping stale course cleanup")
+        return 0
+
+    current_folders = set(course_folders)
+    stale_ids = [
+        resource_id
+        for resource_id, readable_id in LearningResource.objects.filter(
+            etl_source=ETLSource.canvas.name
+        ).values_list("id", "readable_id")
+        if readable_id.split("-", 1)[0] not in current_folders
+    ]
+    if not stale_ids:
+        log.info("No stale canvas courses to delete")
+        return 0
+
+    stale_courses = LearningResource.objects.filter(id__in=stale_ids)
+    stale_courses.update(test_mode=False, published=False)
+
+    for resource in stale_courses:
+        resource_unpublished_actions(resource)
+    log.info("Unpublished %d stale canvas courses", len(stale_ids))
+    return len(stale_ids)
+
+
+@app.task(acks_late=True, reject_on_worker_lost=True)
+def sync_canvas_courses(canvas_course_ids=None, overwrite=False):  # noqa: FBT002
+    """
+    Sync all canvas courses from the S3 bucket, queuing an ingestion task per course.
+
+    Each course is ingested by its own independent task; nothing waits on them,
+    so this returns as soon as the archives are queued.
+
+    Args:
+        canvas_course_ids (list or None): If set, sync only these canvas course
+            ids. If None, sync every course and unpublish stale ones.
+        overwrite (bool): Whether to overwrite existing content files
+
+    Returns:
+        int or None: the number of courses queued, or None if no archives were found
+    """
+    # every archive it queues is ingested by ingest_canvas_course, which needs
+    # both pairs, so with either one moved there is nothing to queue
+    if not may_write(
+        ETLSource.canvas.name, [LearningResourceType.course.name, CONTENT_FILE]
+    ):
+        return None
+
+    bucket = get_bucket_by_name(settings.COURSE_ARCHIVE_BUCKET_NAME)
+    s3_prefix = get_s3_prefix_for_source(ETLSource.canvas.name)
+    exports = bucket.objects.filter(Prefix=s3_prefix)
+    log.info("syncing all canvas courses")
+    latest_archives = {}
+
+    for archive in exports:
+        key = archive.key
+        course_folder = canvas_course_folder(key)
+        log.info("processing course folder %s", course_folder)
+
+        if (
+            key.endswith("imscc")
+            and (not canvas_course_ids or course_folder in canvas_course_ids)
+            and (
+                (course_folder not in latest_archives)
+                or max(
+                    archive.last_modified, latest_archives[course_folder].last_modified
+                )
+                == archive.last_modified
+            )
+        ):
+            latest_archives[course_folder] = archive
+
+    if not latest_archives:
+        # an empty listing would sweep every canvas course away, so treat it as
+        # a failed run rather than as "canvas offers nothing"
+        log.error("No canvas archives found under %s", s3_prefix)
+        return None
+
+    if not canvas_course_ids:
+        # only a full run lists every archive; a run filtered to specific
+        # courses must not unpublish the rest. Sweeping before the fan-out
+        # means a culled import can't hold up (or lose) the cleanup.
+        unpublish_removed_canvas_courses(list(latest_archives.keys()))
+
+    log.info("Queueing %d canvas course archives", len(latest_archives))
+    for archive in latest_archives.values():
+        ingest_canvas_course.delay(archive.key, overwrite)
+    return len(latest_archives)
+
+
+@app.task(bind=True)
+def scrape_marketing_pages(self):
+    """
+    Scrape marketing pages for programs and courses and store them as content
+    files. Child courses are scraped before their parent programs so a program's
+    children section is built from child marketing pages that already exist.
+    Programs whose stored page is missing its children section (and whose
+    children content is now available) are re-scraped to heal them.
+    """
+    log.info("Running scrape_marketing_pages task")
+    resource_types = dict(
+        LearningResource.objects.filter(
+            published=True, resource_type__in=["course", "program"]
+        ).values_list("id", "resource_type")
+    )
+    # Unpublished pages don't count as existing, so a resource whose page was
+    # unpublished along with it gets re-scraped (and republished) if the
+    # resource comes back.
+    existing_page_resource_ids = set(
+        ContentFile.objects.filter(
+            file_type=MARKETING_PAGE_FILE_TYPE, published=True
+        ).values_list("learning_resource_id", flat=True)
+    )
+
+    missing_ids = set(resource_types) - existing_page_resource_ids
+    missing_course_ids = sorted(
+        rid for rid in missing_ids if resource_types[rid] == "course"
+    )
+    program_ids_with_pages = {
+        rid
+        for rid in existing_page_resource_ids
+        if resource_types.get(rid) == "program"
+    }
+    program_ids = {rid for rid in missing_ids if resource_types[rid] == "program"}
+    program_ids |= programs_needing_children_heal(program_ids_with_pages)
+
+    course_tasks = [
+        marketing_page_for_resources.si(ids)
+        for ids in chunks(missing_course_ids, chunk_size=settings.QDRANT_CHUNK_SIZE)
+    ]
+    program_tasks = [
+        marketing_page_for_resources.si(ids)
+        for ids in chunks(sorted(program_ids), chunk_size=settings.QDRANT_CHUNK_SIZE)
+    ]
+
+    if course_tasks and program_tasks:
+        scrape_tasks = celery.chain(
+            celery.group(course_tasks), celery.group(program_tasks)
+        )
+    elif course_tasks:
+        scrape_tasks = celery.group(course_tasks)
+    elif program_tasks:
+        scrape_tasks = celery.group(program_tasks)
+    else:
+        return None
+    return self.replace(scrape_tasks)
+
+
+@app.task(
+    acks_late=True,
+    reject_on_worker_lost=True,
+    autoretry_for=(RetryError,),
+    retry_backoff=True,
+    rate_limit=settings.CELERY_RATE_LIMIT,
+)
+def marketing_page_for_resources(resource_ids):
+    from learning_resources_search.tasks import upsert_content_file
+    from vector_search.tasks import generate_embeddings
+
+    content_file_ids = []
+    resources = list(LearningResource.objects.filter(id__in=resource_ids))
+    program_resources = [
+        resource
+        for resource in resources
+        if resource.resource_type == LearningResourceType.program.name
+    ]
+    program_children_content = (
+        build_program_children_content_bulk(program_resources)
+        if program_resources
+        else {}
+    )
+
+    for learning_resource in resources:
+        marketing_page_url = learning_resource.url
+        try:
+            scraper = scraper_for_site(marketing_page_url)
+            page_content = scraper.scrape()
+        except Exception:
+            # Isolate per-resource failures so one bad page can't fail the whole
+            # chunk. When these tasks are chained (course group -> program group),
+            # a failed task poisons the chord header and the program group never
+            # runs, so keep this batch succeeding for pages that do scrape.
+            log.exception(
+                "Failed to scrape marketing page for resource %s (%s)",
+                learning_resource.id,
+                marketing_page_url,
+            )
+            continue
+        if page_content:
+            content_file, _ = ContentFile.objects.update_or_create(
+                learning_resource=learning_resource,
+                file_type=MARKETING_PAGE_FILE_TYPE,
+                defaults={
+                    "file_extension": ".md",
+                    "key": marketing_page_url,
+                    "url": marketing_page_url,
+                },
+            )
+            content = strip_markdown_images(html_to_markdown(page_content))
+            if learning_resource.resource_type == LearningResourceType.program.name:
+                children_content = program_children_content.get(
+                    learning_resource.id, ""
+                )
+                if children_content:
+                    content += children_content
+            content_file.content = content
+            content_file.published = learning_resource.published
+            content_file.save()
+            content_file_ids.append(content_file.id)
+            if content_file.published:
+                upsert_content_file.delay(content_file.id)
+    if content_file_ids:
+        generate_embeddings.delay(content_file_ids, CONTENT_FILE_TYPE, overwrite=True)
+
+
+@app.task(
+    autoretry_for=(RetryError,),
+    retry_backoff=True,
+    rate_limit=settings.CELERY_SEARCH_RATE_LIMIT,
+)
+def cleanup_deleted_content_files():
+    """
+    Physically delete ContentFile records that have been soft-deleted
+    (published=False) for longer than settings.CONTENT_FILE_RETENTION_DAYS.
+
+    Scoped to ETL sources whose contentfiles are managed by the soft-delete
+    flow (RESOURCE_FILE_ETL_SOURCES) so that contentfiles owned by other
+    sources are not affected.
+    """
+    from learning_resources_search.tasks import wrap_retry_exception
+
+    try:
+        with wrap_retry_exception(*CLEANUP_RETRY_EXCEPTIONS):
+            cutoff = now_in_utc() - datetime_module.timedelta(
+                days=settings.CONTENT_FILE_RETENTION_DAYS
+            )
+            chunk_size = settings.CONTENT_FILE_CLEANUP_CHUNK_SIZE
+            content_file_label = ContentFile._meta.label  # noqa: SLF001
+            total_deleted = 0
+            found_candidates = False
+            last_id = 0
+            while True:
+                chunk = list(
+                    ContentFile.objects.filter(
+                        published=False,
+                        updated_on__lt=cutoff,
+                        run__learning_resource__etl_source__in=RESOURCE_FILE_ETL_SOURCES,
+                        id__gt=last_id,
+                    )
+                    .order_by("id")
+                    .values_list("id", flat=True)[:chunk_size]
+                )
+
+                if not chunk:
+                    if not found_candidates:
+                        log.info(
+                            "cleanup_deleted_content_files: "
+                            "no eligible content files found"
+                        )
+                    return total_deleted
+
+                found_candidates = True
+                last_id = chunk[-1]
+                _, per_model = ContentFile.objects.filter(
+                    id__in=chunk,
+                    published=False,
+                    updated_on__lt=cutoff,
+                    run__learning_resource__etl_source__in=RESOURCE_FILE_ETL_SOURCES,
+                ).delete()
+                total_deleted += per_model.get(content_file_label, 0)
+    except (RetryError, Ignore):
+        raise
+    except:  # noqa: E722
+        error = "cleanup_deleted_content_files threw an error"
+        log.exception(error)
+        return error
+
+
+@app.task(acks_late=True, reject_on_worker_lost=True)
+def sync_website_content_learning_resource(content_id: int) -> None:
+    """
+    Mirror a published article into a LearningResource.
+
+    Articles only: news has the news feed instead. Re-checked here rather than
+    trusting the caller, so a direct call -- a backfill, say -- cannot mirror
+    something the plugin would have skipped.
+
+    Args:
+        content_id (int): id of the content item that was published or updated
+    """
+    from website_content.constants import WebsiteContentType
+    from website_content.models import WebsiteContent
+
+    content = WebsiteContent.objects.filter(id=content_id).first()
+    if (
+        content is None
+        # Unpublished or deleted between the hook firing and this running.
+        or not content.is_published
+        or content.content_type != WebsiteContentType.article.name
+    ):
+        log.info("Skipping learning resource sync for website content %s", content_id)
+        return
+    sync_website_content_to_learning_resource(content)
+
+    # The check above is a read, and the row can change under it: unpublishing
+    # runs in the request, so it can land between that read and this write and
+    # then have nothing queued behind it to notice -- leaving a published,
+    # indexed resource for content that is no longer public. Whoever writes
+    # last reconciles, so re-read the row and undo if it has moved on.
+    if not WebsiteContent.objects.filter(id=content_id, is_published=True).exists():
+        log.info(
+            "WebsiteContent %s was unpublished while syncing, undoing the sync",
+            content_id,
+        )
+        try:
+            unpublish_website_content_learning_resource(content_id)
+        except Exception:
+            # Any failure, not just a database one: the undo runs the search
+            # and vector hooks inline, which fail in other ways -- a broker
+            # that cannot be reached escapes `try_with_retry_as_task`, whose
+            # own fallback is an unguarded `.delay()`.
+            #
+            # This task does not retry, so raising would leave the resource
+            # unpublished in the database and still in the index with nothing
+            # behind it. Hand the undo to the task that does retry; its own
+            # republish guard makes a late run safe.
+            log.exception(
+                "Undoing the sync failed for content %s, queueing the removal",
+                content_id,
+            )
+            try:
+                unpublish_website_content_learning_resource_task.delay(content_id)
+            except Exception:
+                # Queueing needs the broker, which is exactly what may have
+                # sent us here. Nothing further to try: the row is already
+                # unpublished and the indexes are left to the next reindex.
+                log.exception("Could not queue the removal for content %s", content_id)
+
+
+@app.task(
+    acks_late=True,
+    reject_on_worker_lost=True,
+    # Retried, unlike the sync side: this task is where the inline removal
+    # hands off when it fails, and the callers that do so describe it as the
+    # one carrying the retries. Without a policy a transient database or
+    # search error failed it once and left the resource indexed.
+    autoretry_for=(Exception,),
+    retry_kwargs={"max_retries": 3, "countdown": 5},
+)
+def unpublish_website_content_learning_resource_task(content_id: int) -> None:
+    """
+    Take an unpublished WebsiteContent item's LearningResource out of search.
+
+    Takes an id rather than the instance because the content may since have
+    been deleted -- the resource still has to come out of the index.
+
+    Args:
+        content_id (int): id of the content item that was unpublished
+    """
+    from website_content.models import WebsiteContent
+
+    # Queued work can run late. If the item was republished in the meantime, a
+    # stale removal would unpublish the resource the republish just restored,
+    # so bail out -- the mirror of the sync task only acting on a published
+    # row. `objects` hides soft-deleted rows, so a row that is gone or
+    # soft-deleted still falls through and gets cleaned up.
+    if WebsiteContent.objects.filter(id=content_id, is_published=True).exists():
+        log.info(
+            "WebsiteContent %s is published again, skipping learning resource removal",
+            content_id,
+        )
+        return
+
+    unpublish_website_content_learning_resource(content_id)
+
+
+def credential_metadata_resources(resource_type: str, *, overwrite: bool = False):
+    """
+    Resources of one type the credential metadata sweep should generate for.
+
+    Args:
+        resource_type (str): the LearningResourceType to select
+        overwrite (bool): include resources that already have metadata
+
+    Returns:
+        QuerySet: the matching resources, empty when no configuration is
+            active for this type
+    """
+    active_fields = active_credential_metadata_fields(resource_type)
+    if not active_fields:
+        log.warning(
+            "No active %s CredentialMetadataConfiguration; nothing to generate",
+            resource_type,
+        )
+        return LearningResource.objects.none()
+
+    resources = LearningResource.objects.filter(
+        Q(published=True) | Q(test_mode=True)
+    ).filter(
+        resource_type=resource_type,
+        etl_source=ETLSource.mitxonline.name,
+        platform=PlatformType.mitxonline.name,
+    )
+    if not overwrite:
+        resources = resources.filter(
+            incomplete_credential_metadata_query(active_fields)
+        )
+    return resources
+
+
+def credential_metadata_resource_ids(
+    *, overwrite: bool = False, resource_types: list[str] | None = None
+):
+    """
+    Return the ids of the resources the sweep should generate for, newest first.
+
+    Args:
+        overwrite (bool): include resources that already have metadata
+        resource_types (list of str): the types to select, defaulting to
+            every type in CREDENTIAL_METADATA_RESOURCE_TYPES. Narrowing lets
+            one type be swept without the other -- a first program run, say,
+            without paying to recheck the whole course catalogue.
+
+    Returns:
+        list of int: the matching resource ids across the selected types,
+            newest first. A list rather than a QuerySet: the types are
+            selected by separate queries, and ids are all the caller needs.
+    """
+    ids = [
+        resource_id
+        for resource_type in (resource_types or CREDENTIAL_METADATA_RESOURCE_TYPES)
+        for resource_id in credential_metadata_resources(
+            resource_type, overwrite=overwrite
+        ).values_list("id", flat=True)
+    ]
+    # Sorted across the types rather than per query, so the newest resources
+    # are generated for first whichever type they are.
+    return sorted(ids, reverse=True)
+
+
+@app.task(acks_late=True, reject_on_worker_lost=True)
+def generate_credential_metadata_for_resource(
+    resource_id: int, *, overwrite: bool = False
+) -> bool:
+    """
+    Generate and store credential metadata for one resource.
+
+    Only the fields the resource is actually missing are generated, unless
+    `overwrite` asks for the row to be regenerated whole.
+
+    Args:
+        resource_id (int): the resource to generate for
+        overwrite (bool): regenerate even if the resource already has
+            complete metadata
+
+    Returns:
+        bool: whether anything was stored
+    """
+
+    from learning_resources.credentials import generate_and_save_credential_metadata
+
+    # The type decides both which queryset re-checks eligibility and which
+    # prompts generation uses, and the task is handed an id, so read it back
+    # before anything else.
+    resource_type = (
+        LearningResource.objects.filter(id=resource_id)
+        .values_list("resource_type", flat=True)
+        .first()
+    )
+    resource = (
+        credential_metadata_resources(resource_type, overwrite=overwrite)
+        .filter(id=resource_id)
+        .first()
+        if resource_type in CREDENTIAL_METADATA_RESOURCE_TYPES
+        else None
+    )
+    if not resource:
+        log.info(
+            "Skipping credential metadata for resource %s:"
+            " it no longer needs generating",
+            resource_id,
+        )
+        return False
+
+    fields = (
+        None
+        if overwrite
+        else missing_credential_metadata_fields(
+            resource, active_credential_metadata_fields(resource.resource_type)
+        )
+    )
+    metadata = run_on_worker_loop(
+        generate_and_save_credential_metadata(resource, fields=fields)
+    )
+    if metadata.errors:
+        log.warning(
+            "Credential metadata for %s is missing %s",
+            resource.readable_id,
+            ", ".join(sorted(metadata.errors)),
+        )
+    return bool(metadata.fields)
+
+
+@app.task
+def generate_all_credential_metadata(
+    *, overwrite=False, resource_types: list[str] | None = None
+) -> int:
+    """
+    Queue credential metadata generation for MITx Online resources.
+
+    Covers every type in CREDENTIAL_METADATA_RESOURCE_TYPES -- courses and
+    programs today. One task per resource whatever its type: the leaf reads
+    the type back off the resource and generates from that type's own
+    prompts, so nothing here has to fan out per type.
+
+    Args:
+        overwrite (bool): regenerate resources that already have metadata
+        resource_types (list of str): the types to sweep, defaulting to all
+            of them
+
+    Returns:
+        int: how many resources were queued. Zero is the normal case for the
+            daily non-overwriting sweep once the catalogue has been filled.
+    """
+    generation_tasks = [
+        generate_credential_metadata_for_resource.si(resource_id, overwrite=overwrite)
+        for resource_id in credential_metadata_resource_ids(
+            overwrite=overwrite, resource_types=resource_types
+        )
+    ]
+    if not generation_tasks:
+        log.info("No resources need credential metadata generation")
+        return 0
+    celery.group(generation_tasks).apply_async()
+    log.info(
+        "Queued credential metadata generation for %d resource(s)",
+        len(generation_tasks),
+    )
+    return len(generation_tasks)
+
+
+# Names the SyncYouTubeTask run whose playlist loads are current. Kept where
+# the warehouse watermarks are, so it outlives a cache flush.
+YOUTUBE_SYNC_GENERATION_KEY = "warehouse_etl:youtube_sync_generation"
+
+
+@app.task(acks_late=True, reject_on_worker_lost=True)
+def load_warehouse_youtube_playlist(channel_id, playlist_data, generation):
+    """
+    Load a single youtube playlist and its videos, as read from the warehouse
+
+    Args:
+        channel_id (str): youtube's id for the playlist's channel
+        playlist_data (dict): the playlist as load_playlist takes it
+        generation (str): the generation of the SyncYouTubeTask run that
+            queued this
+    """
+    with writing_as(Pipeline.WAREHOUSE):
+        # ownership can change between the sync that queued this and now
+        if not warehouse_media.may_write_youtube():
+            return
+        # A later sync may have unpublished this playlist, and loading it from
+        # the earlier read would publish it again. That sync queued every
+        # playlist it kept, so nothing is lost by dropping this one.
+        if caches[WAREHOUSE_STATE_CACHE].get(YOUTUBE_SYNC_GENERATION_KEY) != generation:
+            log.warning(
+                "Skipping youtube playlist %s: queued by a superseded sync",
+                playlist_data["playlist_id"],
+            )
+            return
+        video_channel = VideoChannel.objects.filter(channel_id=channel_id).first()
+        if video_channel is None:
+            log.error("No VideoChannel for channel_id=%s", channel_id)
+            return
+        loaders.load_playlist(video_channel, playlist_data)
+
+
+class SyncYouTubeTask(BaseWarehouseETLTask):
+    """
+    Warehouse-pull sync of the youtube channels, playlists and videos, replacing
+    get_youtube_data once ETLSourceOwnership names the warehouse for
+    youtube video_playlist and video.
+
+    Like get_youtube_data, it fans out into one task per playlist, so a culled
+    worker costs one playlist and not the run. A shadow run queues nothing and
+    writes nothing: it hands the playlists to shadow.observe_youtube.
+
+    Always a full sync, whatever ``since`` is: a playlist is loaded together
+    with all of its videos, and the views carry no per-playlist change time.
+
+    A run that would unpublish more than warehouse_guards.MAX_UNPUBLISH_SHARE of
+    the published playlists or videos fails before writing. Queue it with
+    ``allow_mass_unpublish=True`` when the removal is real.
+    """
+
+    name = "learning_resources.tasks.SyncYouTubeTask"
+    table_name = "integrations__learn__youtube_playlists"
+    writes = (ETLSource.youtube.name, warehouse_media.YOUTUBE_TYPES)
+
+    def fetch_and_upsert(
+        self,
+        conn,
+        *,
+        since=None,  # noqa: ARG002
+        allow_mass_unpublish: bool = False,
+    ) -> int:
+        """Read the four youtube views and queue a load of each playlist."""
+        channels, playlists, playlist_videos, videos = (
+            list(iter_rows(conn, self.qualified_name(table)))
+            for table in (
+                "integrations__learn__youtube_channels",
+                self.table_name,
+                "integrations__learn__youtube_playlist_videos",
+                "integrations__learn__youtube_videos",
+            )
+        )
+        playlists_by_channel = warehouse_media.prepare_youtube_sync(
+            channels,
+            playlists,
+            playlist_videos,
+            videos,
+            allow_mass_unpublish=allow_mass_unpublish,
+        )
+        if playlists_by_channel is None:
+            return 0
+        if is_shadow_run():
+            # the channel sync and the playlist tasks write, so a shadow
+            # compares what they would load instead
+            to_load = warehouse_media.playlists_to_load(channels, playlists_by_channel)
+            shadow.observe_youtube(to_load)
+            return len(to_load)
+        # Set once the checks have passed, so a refused run leaves an earlier
+        # run's queued loads current, and before this run unpublishes
+        # anything, so those loads cannot republish what this one removes.
+        generation = uuid.uuid4().hex
+        caches[WAREHOUSE_STATE_CACHE].set(
+            YOUTUBE_SYNC_GENERATION_KEY, generation, timeout=None
+        )
+        to_load = warehouse_media.sync_youtube_channels(channels, playlists_by_channel)
+        log.info("Queueing %d youtube playlists from the warehouse", len(to_load))
+        for channel_id, playlist_data in to_load:
+            load_warehouse_youtube_playlist.delay(channel_id, playlist_data, generation)
+        return len(to_load)
+
+
+SyncYouTubeTask = app.register_task(SyncYouTubeTask())
+
+
+class SyncPodcastsTask(BaseWarehouseETLTask):
+    """
+    Warehouse-pull sync of the podcasts and their episodes, replacing
+    get_podcast_data once ETLSourceOwnership names the warehouse for podcast
+    podcast and podcast_episode.
+
+    Always a full sync, whatever ``since`` is: load_podcasts unpublishes the
+    episodes a podcast no longer lists, so it needs all of them.
+
+    A run that would unpublish more than warehouse_guards.MAX_UNPUBLISH_SHARE of
+    the published podcasts or episodes fails before writing. Queue it with
+    ``allow_mass_unpublish=True`` when the removal is real.
+    """
+
+    name = "learning_resources.tasks.SyncPodcastsTask"
+    table_name = "integrations__learn__podcasts"
+    writes = (ETLSource.podcast.name, warehouse_media.PODCAST_TYPES)
+
+    def fetch_and_upsert(
+        self,
+        conn,
+        *,
+        since=None,  # noqa: ARG002
+        allow_mass_unpublish: bool = False,
+    ) -> int:
+        """Read the two podcast views and load them."""
+        return warehouse_media.sync_podcasts(
+            list(iter_rows(conn, self.view_name)),
+            list(
+                iter_rows(
+                    conn, self.qualified_name("integrations__learn__podcast_episodes")
+                )
+            ),
+            allow_mass_unpublish=allow_mass_unpublish,
+        )
+
+
+SyncPodcastsTask = app.register_task(SyncPodcastsTask())
+
+
+class SyncXproCoursesTask(BaseWarehouseETLTask):
+    """
+    Warehouse-pull sync of the xPRO courses and their runs, replacing
+    get_xpro_data's course half once ETLSourceOwnership names the warehouse for
+    xpro course.
+
+    Always a full sync, whatever ``since`` is: a course is loaded with all of
+    its runs, and the runs view lists only the runs that are open now.
+
+    A run that would unpublish more than warehouse_guards.MAX_UNPUBLISH_SHARE of
+    the published courses fails before writing. Queue it with
+    ``allow_mass_unpublish=True`` when the removal is real.
+    """
+
+    name = "learning_resources.tasks.SyncXproCoursesTask"
+    table_name = "integrations__learn__xpro_courses"
+    writes = (ETLSource.xpro.name, [LearningResourceType.course.name])
+
+    def fetch_and_upsert(
+        self,
+        conn,
+        *,
+        since=None,  # noqa: ARG002
+        allow_mass_unpublish: bool = False,
+    ) -> int:
+        """Read the xPRO course and run views and load them."""
+        return warehouse_xpro.sync_courses(
+            list(iter_rows(conn, self.view_name)),
+            list(
+                iter_rows(conn, self.qualified_name("integrations__learn__xpro_runs"))
+            ),
+            allow_mass_unpublish=allow_mass_unpublish,
+        )
+
+
+SyncXproCoursesTask = app.register_task(SyncXproCoursesTask())
+
+
+class SyncXproProgramsTask(BaseWarehouseETLTask):
+    """
+    Warehouse-pull sync of the xPRO programs, replacing get_xpro_data's program
+    half once ETLSourceOwnership names the warehouse for xpro program.
+
+    A program's courses are looked up among the xPRO courses MIT Learn has,
+    not loaded, so run SyncXproCoursesTask first. Always a full sync, whatever
+    ``since`` is.
+
+    A run that would unpublish more than warehouse_guards.MAX_UNPUBLISH_SHARE of
+    the published programs fails before writing. Queue it with
+    ``allow_mass_unpublish=True`` when the removal is real.
+    """
+
+    name = "learning_resources.tasks.SyncXproProgramsTask"
+    table_name = "integrations__learn__xpro_programs"
+    writes = (ETLSource.xpro.name, [LearningResourceType.program.name])
+
+    def fetch_and_upsert(
+        self,
+        conn,
+        *,
+        since=None,  # noqa: ARG002
+        allow_mass_unpublish: bool = False,
+    ) -> int:
+        """Read the xPRO program view and load the programs."""
+        return warehouse_xpro.sync_programs(
+            list(iter_rows(conn, self.view_name)),
+            allow_mass_unpublish=allow_mass_unpublish,
+        )
+
+
+SyncXproProgramsTask = app.register_task(SyncXproProgramsTask())
+
+
+class SyncMITxOnlineCoursesTask(BaseWarehouseETLTask):
+    """
+    Warehouse-pull sync of the MITx Online courses and their runs, replacing
+    get_mitxonline_data's course half once ETLSourceOwnership names the
+    warehouse for mitxonline course.
+
+    Always a full sync, whatever ``since`` is: a course is loaded with all of
+    its runs, and a run's published state and prices depend on when the view
+    was built.
+
+    A run that would unpublish more than warehouse_guards.MAX_UNPUBLISH_SHARE of
+    the published courses fails before writing. Queue it with
+    ``allow_mass_unpublish=True`` when the removal is real.
+    """
+
+    name = "learning_resources.tasks.SyncMITxOnlineCoursesTask"
+    table_name = "integrations__learn__mitxonline_courses"
+    writes = (ETLSource.mitxonline.name, [LearningResourceType.course.name])
+
+    def fetch_and_upsert(
+        self,
+        conn,
+        *,
+        since=None,  # noqa: ARG002
+        allow_mass_unpublish: bool = False,
+    ) -> int:
+        """Read the MITx Online course and run views and load them."""
+        return warehouse_mitxonline.sync_courses(
+            list(iter_rows(conn, self.view_name)),
+            list(
+                iter_rows(
+                    conn, self.qualified_name("integrations__learn__mitxonline_runs")
+                )
+            ),
+            allow_mass_unpublish=allow_mass_unpublish,
+        )
+
+
+SyncMITxOnlineCoursesTask = app.register_task(SyncMITxOnlineCoursesTask())
+
+
+class SyncMITxOnlineProgramsTask(BaseWarehouseETLTask):
+    """
+    Warehouse-pull sync of the MITx Online programs, replacing
+    get_mitxonline_data's program half once ETLSourceOwnership names the
+    warehouse for mitxonline program.
+
+    A program's courses are looked up among the MITx Online courses MIT Learn
+    has, not loaded, so run SyncMITxOnlineCoursesTask first. Always a full
+    sync, whatever ``since`` is.
+
+    A run that would unpublish more than warehouse_guards.MAX_UNPUBLISH_SHARE of
+    the published programs fails before writing. Queue it with
+    ``allow_mass_unpublish=True`` when the removal is real.
+    """
+
+    name = "learning_resources.tasks.SyncMITxOnlineProgramsTask"
+    table_name = "integrations__learn__mitxonline_programs"
+    writes = (ETLSource.mitxonline.name, [LearningResourceType.program.name])
+
+    def fetch_and_upsert(
+        self,
+        conn,
+        *,
+        since=None,  # noqa: ARG002
+        allow_mass_unpublish: bool = False,
+    ) -> int:
+        """Read the MITx Online program views and load the programs."""
+        return warehouse_mitxonline.sync_programs(
+            *(
+                list(iter_rows(conn, self.qualified_name(table)))
+                for table in (
+                    self.table_name,
+                    "integrations__learn__mitxonline_program_children",
+                    "integrations__learn__mitxonline_courses",
+                )
+            ),
+            allow_mass_unpublish=allow_mass_unpublish,
+        )
+
+
+SyncMITxOnlineProgramsTask = app.register_task(SyncMITxOnlineProgramsTask())
+
+
+class SyncOCWCoursesTask(BaseWarehouseETLTask):
+    """
+    Warehouse-pull sync of the OCW courses and their runs, replacing
+    get_ocw_data and the ocw-studio webhook's course loads once
+    ETLSourceOwnership names the warehouse for ocw course.
+
+    It loads no content files. ocw_courses_etl loads a course's content files
+    with the course, and stops for both once the warehouse owns ocw course.
+
+    Always reads the whole view, whatever ``since`` is: only a full set prunes,
+    and the view is a few thousand rows. A course whose row hashes as it did at
+    its last load is skipped (warehouse_ocw.sync_courses). A course that fails
+    to load is skipped too, and the run raises after loading the rest.
+
+    A run that would unpublish more than warehouse_guards.MAX_UNPUBLISH_SHARE of
+    the published courses fails before writing. Queue it with
+    ``allow_mass_unpublish=True`` when the removal is real.
+    """
+
+    name = "learning_resources.tasks.SyncOCWCoursesTask"
+    table_name = "integrations__learn__ocw_courses"
+    writes = (ETLSource.ocw.name, [LearningResourceType.course.name])
+
+    def fetch_and_upsert(
+        self,
+        conn,
+        *,
+        since=None,  # noqa: ARG002
+        allow_mass_unpublish: bool = False,
+    ) -> int:
+        """Read the OCW course view and load the courses."""
+        return warehouse_ocw.sync_courses(
+            list(iter_rows(conn, self.view_name)),
+            allow_mass_unpublish=allow_mass_unpublish,
+        )
+
+
+SyncOCWCoursesTask = app.register_task(SyncOCWCoursesTask())
+
+
+@app.task(acks_late=True, reject_on_worker_lost=True)
+def unpublish_mit_edx_resources():
+    """Unpublish every mit_edx resource. The rows stay, so it is safe to rerun."""
+    mit_edx = ETLSource.mit_edx.name
+    resources = LearningResource.objects.filter(etl_source=mit_edx)
+    resources.update(published=False, test_mode=False)
+    for resource in resources:
+        resource_unpublished_actions(resource)
+
+    # item_count only counts published children, so reindex the lists that
+    # held one
+    parents = (
+        LearningResource.objects.filter(
+            published=True, children__child__etl_source=mit_edx
+        )
+        .exclude(etl_source=mit_edx)
+        .distinct()
+    )
+    for parent in parents:
+        resource_upserted_actions(parent, percolate=False, generate_embeddings=True)
+
+    clear_views_cache()

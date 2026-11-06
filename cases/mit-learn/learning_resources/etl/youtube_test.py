@@ -1,0 +1,604 @@
+"""Tests for Video ETL functions"""
+
+# pylint: disable=redefined-outer-name
+import json
+from collections import defaultdict
+from datetime import UTC, datetime
+from glob import glob
+from os.path import basename
+from unittest.mock import Mock
+
+import pytest
+from googleapiclient.errors import HttpError
+from youtube_transcript_api import NoTranscriptFound
+from youtube_transcript_api._transcripts import FetchedTranscriptSnippet
+
+from learning_resources.constants import (
+    Availability,
+    LearningResourceType,
+    OfferedBy,
+    PlatformType,
+)
+from learning_resources.etl import youtube
+from learning_resources.etl.constants import ETLSource
+from learning_resources.etl.exceptions import ExtractException
+from learning_resources.etl.youtube import clean_youtube_description
+from learning_resources.factories import VideoFactory
+from main.utils import clean_data
+
+
+@pytest.fixture
+def youtube_api_responses():
+    """Load the api responses"""
+    mock_responses = defaultdict(list)
+
+    # these need to be sorted() so that *.N.json files get appended in the proper order
+    for pathname in sorted(glob("test_json/youtube/*.json")):  # noqa: PTH207
+        mod_name, func_name, _, _ = basename(pathname).split(".")  # noqa: PTH119
+
+        with open(pathname) as f:  # noqa: PTH123
+            mock_responses[(mod_name, func_name)].append(json.load(f))
+
+    for (mod_name, func_name), side_effects in mock_responses.items():  # noqa: B007
+        if func_name == "list_next":
+            # list_next() operations return None when there's no additional pages to fetch
+            side_effects.append(None)
+
+    return mock_responses
+
+
+@pytest.fixture(autouse=True)
+def video_settings(settings):
+    """Mock for django settings"""
+    settings.YOUTUBE_DEVELOPER_KEY = "key"
+    settings.YOUTUBE_CONFIG_URL = "http://test.mit.edu/test.yaml"
+    return settings
+
+
+@pytest.fixture(autouse=True)
+def mock_youtube_client(mocker, youtube_api_responses):
+    """Mocks out the youtube client with static json data"""  # noqa: D401
+    # each side effect should default to an empty list
+    config = defaultdict(list)
+    # build up a config based on filenames of the loaded responses, as an example
+    # the original filename "videos.list.0.json" will create this key:
+    config.update(
+        {
+            f"{'.return_value.'.join(key)}.return_value.execute.side_effect": value
+            for key, value in youtube_api_responses.items()
+        }
+    )
+    # append None to each of the list_next funcs so pagination terminates
+    for mod in ["channels", "playlistItems", "playlists", "video"]:
+        config[f"{mod}.return_value.list_next.return_value.execute.side_effect"].append(
+            None
+        )
+
+    mock_client = mocker.patch("learning_resources.etl.youtube.get_youtube_client")
+    mock_client.return_value.configure_mock(**config)
+    return mock_client
+
+
+def mock_channel(
+    offered_by,
+    channel_id,
+    playlist_id,
+):
+    """Mock video channel github file"""
+
+    return f"""
+- channel_id: {channel_id}
+  offered_by: {offered_by}
+  playlists:
+    - id: {playlist_id}"""
+
+
+def mock_channel_with_wildcard(channel_id, ignore_playlist_id):
+    """Mock video channel configuration with wildcard"""
+
+    return f"""
+- channel_id: {channel_id}
+  offered_by: csail
+  playlists:
+    - id: all
+    - id: {ignore_playlist_id}
+      ignore: true
+"""
+
+
+def mock_channel_file(content):
+    """Mock video channel github file"""
+
+    return f"---{content}"
+
+
+@pytest.fixture
+def mocked_github_channel_response(mocker):
+    """Mock response from github api requst to open-video-data"""
+
+    mock_file = mock_channel_file(
+        "".join(
+            [
+                mock_channel(
+                    OfferedBy.mitx.name,
+                    "UCTBMWu8yshnAmpzR3MoJFtw",
+                    "PL221E2BBF13BECF6C",
+                ),
+                mock_channel(
+                    OfferedBy.ocw.name,
+                    "UCEBb1b_L6zDS3xTUrIALZOw",
+                    "PLTz-v-F773kXwTSKsX_E9t8ZnP_3LYaGy",
+                ),
+                mock_channel_with_wildcard(
+                    "UCBpxspUNl1Th33XbugiHJzw", "PLcwbNON2hqP5TFbkw0igt6Wz79WTaeFGi"
+                ),
+            ]
+        )
+    )
+    mock_requests = mocker.patch("learning_resources.etl.youtube.requests")
+    mock_requests.get.return_value.content = mock_file
+
+
+@pytest.fixture
+def extracted_and_transformed_values(youtube_api_responses):
+    # pylint: disable=too-many-locals
+    """Mock data for the API responses and how they are transformed"""
+    channels_list = youtube_api_responses[("channels", "list")]
+    playlists_list = youtube_api_responses[("playlists", "list")]
+
+    playlist_items_list = youtube_api_responses[("playlistItems", "list")]
+    playlist_items_list_next = youtube_api_responses[("playlistItems", "list_next")]
+    videos_list = youtube_api_responses[("videos", "list")]
+
+    ocw_items = playlist_items_list[0]["items"] + playlist_items_list_next[0]["items"]
+    ocw_items_order = [item["contentDetails"]["videoId"] for item in ocw_items]
+
+    mitx_items = playlist_items_list[1]["items"]
+    mitx_items_order = [item["contentDetails"]["videoId"] for item in mitx_items]
+
+    csail_items = playlist_items_list[2]["items"]
+    csail_items_order = [item["contentDetails"]["videoId"] for item in csail_items]
+
+    # sort the videos by the order they appeared in playlistItems responses
+    ocw_videos = sorted(
+        videos_list[0]["items"] + videos_list[1]["items"],
+        key=lambda item: ocw_items_order.index(item["id"]),
+    )
+    mitx_videos = sorted(
+        videos_list[2]["items"], key=lambda item: mitx_items_order.index(item["id"])
+    )
+
+    csail_videos = sorted(
+        videos_list[3]["items"], key=lambda item: csail_items_order.index(item["id"])
+    )
+
+    extracted = [
+        (
+            OfferedBy.ocw.name,
+            channels_list[0]["items"][0],
+            [(playlists_list[0]["items"][0], ocw_videos, True)],
+        ),
+        (
+            OfferedBy.mitx.name,
+            channels_list[0]["items"][1],
+            [(playlists_list[1]["items"][0], mitx_videos, True)],
+        ),
+        (
+            "csail",
+            channels_list[0]["items"][2],
+            [
+                (playlists_list[2]["items"][1], csail_videos, True),
+            ],
+        ),
+    ]
+
+    transformed = [
+        {
+            "channel_id": channel["id"],
+            "title": channel["snippet"]["title"],
+            "published": True,
+            "playlists": [
+                {
+                    "playlist_id": playlist["id"],
+                    "title": playlist["snippet"]["title"],
+                    "platform": PlatformType.youtube.name,
+                    "etl_source": ETLSource.youtube.name,
+                    "image": {
+                        "url": playlist["snippet"]["thumbnails"]["high"]["url"],
+                        "alt": playlist["snippet"]["title"],
+                    },
+                    "offered_by": {"code": offered_by}
+                    if offered_by != "csail"
+                    else None,
+                    "availability": Availability.anytime.name,
+                    "published": True,
+                    "url": f"https://www.youtube.com/playlist?list={playlist['id']}",
+                    "videos": [
+                        {
+                            "readable_id": video["id"],
+                            "resource_type": LearningResourceType.video.name,
+                            "platform": PlatformType.youtube.name,
+                            "etl_source": ETLSource.youtube.name,
+                            "description": clean_youtube_description(
+                                clean_data(video["snippet"]["description"])
+                            ),
+                            "image": {
+                                "url": video["snippet"]["thumbnails"]["high"]["url"],
+                            },
+                            "last_modified": video["snippet"]["publishedAt"],
+                            "published": True,
+                            "url": f"https://www.youtube.com/watch?v={video['id']}",
+                            "offered_by": {"code": offered_by}
+                            if offered_by != "csail"
+                            else None,
+                            "title": video["snippet"]["localized"]["title"],
+                            "availability": Availability.anytime.name,
+                            "video": {
+                                "duration": video["contentDetails"]["duration"],
+                            },
+                            "youtube_id": video["id"],
+                        }
+                        for video in videos
+                    ],
+                    "create_videos": create_videos,
+                }
+                for playlist, videos, create_videos in playlists
+            ],
+        }
+        for offered_by, channel, playlists in extracted
+    ]
+
+    return extracted, transformed
+
+
+def test_get_captions_for_video(mocker):
+    """Test fetching caption data for a video when non auto-generated english caption is available"""
+    caption_text = "English: Not Auto-generated"
+    mock_captions_api = mocker.patch(
+        "learning_resources.etl.youtube.YouTubeTranscriptApi"
+    ).return_value.list
+    mock_captions_api.return_value.find_manually_created_transcript.return_value = Mock(
+        fetch=Mock(
+            return_value=[
+                FetchedTranscriptSnippet(text=caption_text, start=0, duration=1)
+            ]
+        )
+    )
+
+    video = Mock()
+    assert youtube.get_captions_for_video(video) == caption_text
+
+
+def test_get_captions_for_video_autogenerated_only(mocker):
+    """Test fetching caption data for a video when only auto-generated english caption is available"""
+    auto_text = "English: Auto-generated"
+    mock_captions_api = mocker.patch(
+        "learning_resources.etl.youtube.YouTubeTranscriptApi"
+    ).return_value.list
+    mock_captions_api.return_value.find_manually_created_transcript.return_value = None
+    mock_captions_api.return_value.find_generated_transcript.return_value = Mock(
+        fetch=Mock(
+            return_value=[FetchedTranscriptSnippet(text=auto_text, start=0, duration=1)]
+        )
+    )
+
+    video = Mock()
+    captions = youtube.get_captions_for_video(video)
+    assert captions == auto_text
+
+
+def test_get_captions_for_video_no_english_caption(mocker):
+    """Test fetching caption data for a video with no english caption available"""
+    mock_captions_api = mocker.patch(
+        "learning_resources.etl.youtube.YouTubeTranscriptApi"
+    ).return_value.list
+    mock_captions_api.return_value.find_manually_created_transcript.return_value = None
+    mock_captions_api.return_value.find_generated_transcript.return_value = None
+
+    video = Mock()
+    assert youtube.get_captions_for_video(video) is None
+
+
+def test_get_captions_for_video_no_captions(mocker):
+    """Test fetching caption data for a video with no captions available"""
+    mock_captions_api = mocker.patch(
+        "learning_resources.etl.youtube.YouTubeTranscriptApi"
+    ).return_value.list
+    mock_captions_api.side_effect = NoTranscriptFound("abc", "en", {})
+
+    video = Mock()
+    assert youtube.get_captions_for_video(video) is None
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("error", "raised_exception", "message"),
+    [
+        (StopIteration, None, None),
+        (HttpError, ExtractException, "Error fetching video_ids="),
+    ],
+)
+def test_extract_videos_errors(error, raised_exception, message):
+    """Test that extract_videos handles errors as expected"""
+    client = Mock(videos=Mock(side_effect=error(Mock(), b"")))
+    if raised_exception:
+        with pytest.raises(raised_exception) as err:
+            list(youtube.extract_videos(client, []))
+        assert message in str(err)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("error", "raised_exception", "message"),
+    [
+        (StopIteration, None, None),
+        (HttpError, ExtractException, "Error fetching playlist items: playlist_id="),
+    ],
+)
+def test_extract_playlist_items_errors(error, raised_exception, message):
+    """Test that extract_playlist_items handles errors as expected"""
+    client = Mock(playlistItems=Mock(side_effect=error(Mock(), b"")))
+    if raised_exception:
+        with pytest.raises(raised_exception) as err:
+            list(youtube.extract_playlist_items(client, "playlist_id"))
+        assert message in str(err)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("error", "raised_exception", "message"),
+    [
+        (StopIteration, None, None),
+        (
+            HttpError,
+            ExtractException,
+            "Error fetching channel playlists: playlist_ids=",
+        ),
+    ],
+)
+def test_extract_playlists_errors(
+    mock_youtube_client, error, raised_exception, message
+):
+    """Test that _extract_playlists handles errors as expected"""
+    request = Mock(execute=Mock(side_effect=error(Mock(), b"")))
+    if raised_exception:
+        with pytest.raises(raised_exception) as err:
+            list(
+                youtube._extract_playlists(  # noqa: SLF001
+                    mock_youtube_client, request, {}, create_videos_channel_setting=True
+                )
+            )
+        assert message in str(err)
+
+
+@pytest.mark.parametrize(
+    ("channel_create_videos", "playlist_create_videos", "expected"),
+    [
+        (True, None, True),
+        (False, None, False),
+        (True, False, False),
+        (False, True, True),
+    ],
+)
+def test_extract_playlists_create_videos(
+    mock_youtube_client,
+    channel_create_videos,
+    playlist_create_videos,
+    expected,
+):
+    """Test that create_videos is resolved from playlist config or channel setting"""
+    playlist_id = "PL_test_123"
+    playlist_data = {"id": playlist_id, "snippet": {"title": "Test"}}
+    request = Mock(execute=Mock(return_value={"items": [playlist_data]}))
+    mock_youtube_client.return_value.playlists.return_value.list_next.return_value = (
+        None
+    )
+
+    playlist_config = {"id": playlist_id}
+    if playlist_create_videos is not None:
+        playlist_config["create_videos"] = playlist_create_videos
+
+    results = list(
+        youtube._extract_playlists(  # noqa: SLF001
+            mock_youtube_client.return_value,
+            request,
+            {playlist_id: playlist_config},
+            create_videos_channel_setting=channel_create_videos,
+        )
+    )
+    assert len(results) == 1
+    _, create_videos = results[0]
+    assert create_videos is expected
+
+
+@pytest.mark.parametrize("items", [[{"id": "channel_id", "snippet": {}}], []])
+def test_extract_channel(items):
+    """extract_channel should return the single channel youtube has, if any"""
+    client = Mock()
+    client.channels.return_value.list.return_value.execute.return_value = {
+        "items": items
+    }
+    assert youtube.extract_channel(client, "channel_id") == (
+        items[0] if items else None
+    )
+
+
+def test_extract_channel_error():
+    """extract_channel should wrap youtube api errors"""
+    client = Mock(channels=Mock(side_effect=HttpError(Mock(), b"")))
+    with pytest.raises(ExtractException) as err:
+        youtube.extract_channel(client, "channel_id")
+    assert "Error fetching channel: channel_id=channel_id" in str(err)
+
+
+def test_transform_channel(extracted_and_transformed_values):
+    """transform_channel should normalize a channel without its playlists"""
+    extracted, transformed = extracted_and_transformed_values
+    result = youtube.transform_channel(extracted[0][1])
+    assert result == {
+        key: value for key, value in transformed[0].items() if key != "playlists"
+    }
+
+
+def test_transform_video(extracted_and_transformed_values):
+    """Test youtube transform for a video"""
+    extracted, transformed = extracted_and_transformed_values
+    result = youtube.transform_video(extracted[0][2][0][1][0], OfferedBy.ocw.name)
+    assert result == transformed[0]["playlists"][0]["videos"][0]
+
+
+@pytest.mark.parametrize("has_user_list", [True, False])
+@pytest.mark.parametrize("user_list_title", ["Title", None])
+def test_transform_playlist(
+    extracted_and_transformed_values, has_user_list, user_list_title
+):
+    """Test youtube transform for a playlist"""
+    extracted, transformed = extracted_and_transformed_values
+    result = youtube.transform_playlist(
+        extracted[0][2][0][0],
+        extracted[0][2][0][1],
+        OfferedBy.ocw.name,
+        create_videos=True,
+    )
+    assert {**result, "videos": list(result["videos"])} == {
+        **transformed[0]["playlists"][0],
+    }
+    assert (
+        result["url"]
+        == f"https://www.youtube.com/playlist?list={extracted[0][2][0][0]['id']}"
+    )
+    assert result["image"] == {
+        "url": extracted[0][2][0][0]["snippet"]["thumbnails"]["high"]["url"],
+        "alt": extracted[0][2][0][0]["snippet"]["title"],
+    }
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (None, ["Channel configs data is empty"]),
+        ([], ["Channel configs data is empty"]),
+        ([10], ["Channel data should be a dict"]),
+        ("a string", ["Channels data should be a list of dicts"]),
+        (
+            [{"channel_id": "abc", "offered_by": "org", "playlists": [{"id": "def"}]}],
+            [],
+        ),
+        ([{"channel_id": "abc", "playlists": [{"id": "def"}]}], []),
+        (
+            [{"offered_by": "org"}],
+            [
+                "Required key 'channel_id' is not present in channel dict",
+                "Required key 'playlists' is not present in channel dict",
+            ],
+        ),
+        (
+            [{"channel_id": "abc", "playlists": [{}]}],
+            ["Required key 'id' not present in playlists[0]"],
+        ),
+    ],
+)
+def test_validate_channel_config(config, expected):
+    """Test that validate_channel_configs returns expected errors"""
+    assert youtube.validate_channel_configs(config) == expected
+
+
+@pytest.mark.django_db
+@pytest.mark.usefixtures("video_settings")
+def test_get_youtube_transcripts(mocker):
+    """Verify that get_youtube_transcript downloads, saves and upserts video data"""
+    mock_caption_parsed = "parsed"
+    mock_resource = VideoFactory.create().learning_resource
+    mock_update_index_call = mocker.patch("learning_resources.etl.youtube.update_index")
+
+    mock_caption_call = mocker.patch(
+        "learning_resources.etl.youtube.get_captions_for_video"
+    )
+    mock_caption_call.return_value = mock_caption_parsed
+
+    youtube.get_youtube_transcripts([mock_resource])
+
+    mock_caption_call.assert_called_once_with(mock_resource)
+    mock_update_index_call.assert_called_once_with(mock_resource, newly_created=False)
+    mock_resource.refresh_from_db()
+    assert mock_resource.video.transcript == mock_caption_parsed
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("overwrite", [True, False])
+@pytest.mark.parametrize("created_after", [datetime(2019, 10, 4, tzinfo=UTC), None])
+@pytest.mark.parametrize("created_minutes", [2000, None])
+def test_get_youtube_videos_for_transcripts_job(
+    overwrite, created_after, created_minutes
+):
+    """Verify that get_youtube_videos_for_transcripts_job applies filters correctly"""
+
+    video1 = VideoFactory.create(transcript="saved already").learning_resource
+    video2 = VideoFactory.create(transcript="").learning_resource
+    video3 = VideoFactory.create(transcript="saved already").learning_resource
+    video3.created_on = datetime(2019, 10, 1, tzinfo=UTC)
+    video3.save()
+    video4 = VideoFactory.create(transcript="").learning_resource
+    video4.created_on = datetime(2019, 10, 1, tzinfo=UTC)
+    video4.save()
+    video5 = VideoFactory.create(transcript="saved already").learning_resource
+    video5.created_on = datetime(2019, 10, 5, tzinfo=UTC)
+    video5.save()
+    video6 = VideoFactory.create(transcript="").learning_resource
+    video6.created_on = datetime(2019, 10, 5, tzinfo=UTC)
+    video6.save()
+
+    result = youtube.get_youtube_videos_for_transcripts_job(
+        created_after=created_after,
+        created_minutes=created_minutes,
+        overwrite=overwrite,
+    )
+
+    if overwrite:
+        if created_after:
+            assert list(result.order_by("video__id")) == [
+                video1,
+                video2,
+                video5,
+                video6,
+            ]
+        elif created_minutes:
+            assert list(result.order_by("video__id")) == [video1, video2]
+        else:
+            assert list(result.order_by("video__id")) == [
+                video1,
+                video2,
+                video3,
+                video4,
+                video5,
+                video6,
+            ]
+    else:  # noqa: PLR5501
+        if created_after:
+            assert list(result.order_by("video__id")) == [video2, video6]
+        elif created_minutes:
+            assert list(result.order_by("video__id")) == [video2]
+        else:
+            assert list(result.order_by("video__id")) == [video2, video4, video6]
+
+
+def test_clean_youtube_description():
+    """Test that clean_youtube_description removes boilerplate and unwanted lines"""
+
+    original_description1 = "Nancy L. Rose and Janis Melvold share how two different approaches—Plickers and workshops—engage students in conversation and challenge them to deepen their knowledge. \n\nNancy L. Rose is Charles P. Kindleberger Professor of Applied Economics and MacVicar Faculty Fellow at MIT, and a Visiting Scholar at Harvard Kennedy School.\n\nJanis Melvold is a linguist and Lecturer II in Comparative Media Studies/Writing at MIT. \n\nChapters:\n0:00 INTRODUCTION\n\n1:29 NANCY L. ROSE &amp; USE OF PLICKERS\n2:02 Deciding to use Plickers\n2:36 About 14.20/14.200 Industrial Organization\n3:52 Plickers for participation and in-class feedback\n4:11 What is a Plicker?\n6:27 Generating discussion\n8:19 Lowering the barrier to participation\n9:40 Assessing translational skills\n12:00 Real-time feedback on lectures\n13:47 Checking student understanding of lecture\n15:43 Illustrating progress in learning\n\n17:48 JANIS MELVOLD &amp; WRITING WORKSHOPS\n18:17 About writing workshops\n18:37 MIT's communication requirement\n20:29 Intended outcomes of CI-H subjects\n21:12 Toolkit for embedded writing instruction\n23:04 About 24.900 Intro to Linguistics\n26:08 Overview of 24.900 writing workshops\n26:54 Instruction &amp; active engagement\n27:35 Leveraging sample writing from past students\n28:24 Example of workshop exercise: Critical summary\n30:41 Example of workshop exercise: Research findings\n34:32 Advantages &amp; limitations of writing workshops\n36:37 Considerations for the future\n\n38:32 DISCUSSION &amp; Q/A\n39:39 Student feedback\n43:12 Course iteration\n47:40 Plickers &amp; student explanations\n49:10 Optional attendance: Writing workshops\n\nMIT Open Learning:\nhttps://openlearning.mit.edu/residential-education\nhttps://openlearning.mit.edu/events/uncovering-student-perspectives-course-concepts-tips-economist-and-linguist"
+    clean_description1 = "Nancy L. Rose and Janis Melvold share how two different approaches—Plickers and workshops—engage students in conversation and challenge them to deepen their knowledge. \n\nNancy L. Rose is Charles P. Kindleberger Professor of Applied Economics and MacVicar Faculty Fellow at MIT, and a Visiting Scholar at Harvard Kennedy School.\n\nJanis Melvold is a linguist and Lecturer II in Comparative Media Studies/Writing at MIT."
+
+    original_description2 = "MIT 9.35, Spring 2024\nInstructor: Josh McDermott\nView the complete course: https://ocw.mit.edu/courses/9-35-perception-spring-2024\nYouTube Playlist: https://www.youtube.com/playlist?list=PLUl4u3cNGP62-9RweyYBIpkqfo5dfcuS8\n\nThis lecture discusses the senses of smell and taste, with emphasis on the working of the sense receptors in the nose and tongue.\n\nLicense: Creative Commons BY-NC-SA\nMore information at https://ocw.mit.edu/terms\nMore courses at https://ocw.mit.edu\nSupport OCW at http://ow.ly/a1If50zVRl\n\nWe encourage constructive comments and discussion on OCW's YouTube and other social media channels. Personal attacks, hate speech, trolling, and inappropriate comments are not allowed and may be removed. More details at https://ocw.mit.edu/comments."
+    clean_description2 = "This lecture discusses the senses of smell and taste, with emphasis on the working of the sense receptors in the nose and tongue."
+
+    original_description3 = "MIT 21H.151 Dynastic China, Fall 2024 \nInstructor: Tristan G. Brown \nView the complete course: https://ocw.mit.edu/courses/21h-151-dynastic-china-fall-2024\nYouTube Playlist: https://www.youtube.com/playlist?list=PLUl4u3cNGP60g8vnEsLGuA4Kt-d5vNqy9\n\nProf. Brown discusses the emergence of Taiwan during the Qing Dynasty.\n\nLicense: Creative Commons BY-NC-SA\nMore information at https://ocw.mit.edu/terms\nMore courses at https://ocw.mit.edu\nSupport OCW at http://ow.ly/a1If50zVRlQ\n\nWe encourage constructive comments and discussion on OCW's YouTube and other social media channels. Personal attacks, hate speech, trolling, and inappropriate comments are not allowed and may be removed. More details at https://ocw.mit.edu/comments."
+    clean_description3 = (
+        "Prof. Brown discusses the emergence of Taiwan during the Qing Dynasty."
+    )
+
+    original_description4 = "What can we do at MIT to prepare our students to solve the challenges of their time? Every learner at MIT can impact the future of humankind and the planet—calling on us to embrace new approaches to an MIT education. In this video, panelists share their perspectives on deeply engaging students and the future of teaching and learning at MIT. \n\nSpeakers:\nOpening Remarks by Daniel E. Hastings, Interim Vice Chancellor, and the Cecil and Ida Green Education Professor of Aeronautics and Astronautics\nChris Capozzola, Elting E. Morison Professor of History &amp; Senior Associate Dean for Open Learning\nAdam Martin, Professor of Biology &amp; Co-Chair of the Task Force on the Undergraduate Academic Program\nAmitava 'Babi' Mitra, Founding Executive Director, New Engineering Education Transformation (NEET), School of Engineering\nSusan Silbey, Leon and Anne Goldberg Professor of Humanities, Sociology and Anthropology; &amp; Professor of Behavioral and Policy Sciences at Sloan School of Management\nModerator: Janet Rankin, Director of MIT Teaching + Learning Lab\n\nChapters:\n0:00 Opening remarks\n6:11 Panelist introductions\n8:35 Mens et manus (mind and hand): Strengths &amp; challenges\n16:25 Important changes or improvements to MIT education\n26:06 Examples of deeply engaging students\n39:45 Transforming mens et manus for the future\n47:53 Technology, society, and culture\n48:23 Helping students grasp the purpose and relevance of courses\n53:00 Expanding the idea of campus\n56:10 Supporting students with different goals\n1:00:57 Scaling the MIT experience for the world\n1:04:09 Envisioning a campus that values communities\n\nFestival: https://openlearning.mit.edu/mit-faculty/festival-learning \nMIT Residential Education: https://openlearning.mit.edu/residential-education"
+    clean_description4 = "What can we do at MIT to prepare our students to solve the challenges of their time? Every learner at MIT can impact the future of humankind and the planet—calling on us to embrace new approaches to an MIT education. In this video, panelists share their perspectives on deeply engaging students and the future of teaching and learning at MIT. \n\nOpening Remarks by Daniel E. Hastings, Interim Vice Chancellor, and the Cecil and Ida Green Education Professor of Aeronautics and Astronautics\nChris Capozzola, Elting E. Morison Professor of History &amp; Senior Associate Dean for Open Learning\nAdam Martin, Professor of Biology &amp; Co-Chair of the Task Force on the Undergraduate Academic Program\nAmitava 'Babi' Mitra, Founding Executive Director, New Engineering Education Transformation (NEET), School of Engineering\nSusan Silbey, Leon and Anne Goldberg Professor of Humanities, Sociology and Anthropology; &amp; Professor of Behavioral and Policy Sciences at Sloan School of Management\nModerator: Janet Rankin, Director of MIT Teaching + Learning Lab"
+    assert clean_youtube_description(original_description1) == clean_description1
+    assert clean_youtube_description(original_description2) == clean_description2
+    assert clean_youtube_description(original_description3) == clean_description3
+    assert clean_youtube_description(original_description4) == clean_description4

@@ -1,0 +1,118 @@
+[build-system]
+requires = ["setuptools>=77.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fugal-subnet"
+version = "0.2.0"
+description = "Bittensor subnet for continuous LLM router optimization"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11,<3.13"
+keywords = ["bittensor", "decentralized-ai", "llm-routing", "pytorch"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "bittensor==10.5.0",
+    "pydantic==2.14.2",
+    "torch==2.14.0",
+    "transformers==5.17.0",
+    "numpy==2.2.6",
+    "httpx==0.28.1",
+    "click==8.5.0",
+    "datasets==5.0.1",
+    "cmaes==0.13.1",
+    "math-verify==0.9.0",
+]
+
+[project.urls]
+Repository = "https://github.com/fugal-ai/fugal-subnet"
+Documentation = "https://github.com/fugal-ai/fugal-subnet/tree/main/docs"
+Issues = "https://github.com/fugal-ai/fugal-subnet/issues"
+Changelog = "https://github.com/fugal-ai/fugal-subnet/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.11.0",
+    "pip-audit>=2.7.0",
+    "hypothesis>=6.100.0",
+    # tests/test_tpm.py verifies real Google AK certificates, so the TPM
+    # verifier's dependency has to be present wherever tests run.
+    #
+    # Deliberately NOT written as `fugal-subnet[tee]`: that would also pull in
+    # dcap-qvl, and the `test` and `tee-verifier` CI jobs would become the same
+    # environment. They differ on purpose — `verify_dcap` takes a different path
+    # when the library is absent, and two tests once passed in CI only because
+    # it was missing. The duplicated version is held in step by
+    # check_safety_invariants.check_tpm_dependency_pin.
+    "cryptography==50.0.1",
+]
+# Required for --live validation: DCAP quote verification against Intel
+# collateral. A validator running --live without this cannot verify any
+# attestation, so it is a declared dependency rather than a manual install
+# mentioned only in the guide.
+tee = [
+    # Pinned exactly, like the runtime deps: DCAP verification is a consensus
+    # rule for --live validators, so a behaviour change in it is a consensus
+    # change and should arrive through a deliberate bump.
+    "dcap-qvl==0.6.3",
+    # Verifying dstack's GCP attestation means checking a TPM quote as well as
+    # the TDX one: an ECDSA P-256 signature over TPMS_ATTEST, and the
+    # attestation key certificate chained to Google's CA. Both are consensus
+    # rules for a --live validator on GCP, so the library is pinned exactly for
+    # the same reason dcap-qvl is — a behaviour change in it is a consensus
+    # change and should arrive deliberately.
+    #
+    # Hand-rolling ECDSA and X.509 to avoid a dependency would be strictly worse
+    # than depending on the library every other Python project depends on.
+    "cryptography==50.0.1",
+]
+
+[project.scripts]
+fugal-validator = "neurons.validator:main"
+fugal-miner = "neurons.miner:main"
+
+[tool.setuptools.packages.find]
+include = ["fugal_subnet*", "neurons*"]
+
+# The vendored Google EK/AK CA certificates are not Python, but a TPM quote
+# cannot be verified without them, so they have to be in the wheel. An install
+# that silently omits them fails only at the moment a real proof arrives.
+[tool.setuptools.package-data]
+"fugal_subnet" = ["routing_data/*.json", "vendor/SOURCE.json", "vendor/conformance.json", "vendor/LICENSE", "vendor/NOTICE"]
+"fugal_subnet.tee" = ["roots/*.der"]
+# The pinned pool manifest is read by load_all() at startup. Left out of
+# the wheel it does not fail — it goes quiet, and the validator loads an
+# unverified pool while logging nothing.
+"fugal_subnet.benchmarks" = ["pool_manifest.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+# Immutable test-only core projection, checked against Git objects in CI.
+extend-exclude = ["tests/core_snapshot"]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = [
+    "E501",   # line-too-long (existing code)
+    "E701",   # multiple-statements-on-one-line
+    "E702",   # multiple-statements-on-one-line-semicolon
+    "E741",   # ambiguous-variable-name (W, b, etc. are standard ML names)
+    "E731",   # do-not-assign-lambda-expression (existing docker code)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"fugal_subnet/graders.py" = ["ALL"]  # immutable hash-pinned file

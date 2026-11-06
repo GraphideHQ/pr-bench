@@ -1,0 +1,285 @@
+{
+  "count": 3,
+  "next": null,
+  "previous": null,
+  "results": [
+    {
+      "id": 62,
+      "ingest_content_files_for_ai": false,
+      "title": "Introduction to Differential Equations",
+      "readable_id": "course-v1:MITxT+18.03.1x",
+      "next_run_id": 256,
+      "departments": [
+        {
+          "name": "Mathematics"
+        }
+      ],
+      "page": {
+        "feature_image_src": "/media/original_images/18031_about_image_MITxO.png?v=41481accea58165c33bab53898e5eccf6f96bc39",
+        "page_url": "/courses/course-v1:MITxT+18.03.1x/",
+        "description": "Scientists and engineers understand the world through differential equations. You can too.",
+        "live": true,
+        "length": "14 weeks",
+        "effort": "7 hrs/wk",
+        "financial_assistance_form_url": "",
+        "current_price": 100,
+        "instructors": [
+          {
+            "name": "David Jerison",
+            "description": ""
+          },
+          {
+            "name": "Gigliola Staffilani",
+            "description": ""
+          },
+          {
+            "name": "Jennifer French",
+            "description": ""
+          }
+        ]
+      },
+      "include_in_learn_catalog": true,
+      "programs": null,
+      "topics": [
+        {
+          "name": "Mathematics"
+        }
+      ],
+      "min_price": 123,
+      "max_price": 456,
+      "certificate_type": "Certificate of Completion",
+      "required_prerequisites": true,
+      "duration": "14 weeks",
+      "time_commitment": "7 hrs/wk",
+      "availability": "dated",
+      "courseruns": [
+        {
+          "title": "Introduction to Differential Equations",
+          "start_date": "2024-09-04T15:00:00Z",
+          "end_date": "2024-12-18T16:00:00Z",
+          "enrollment_start": "2024-08-15T00:00:00Z",
+          "enrollment_end": "2024-12-14T00:00:00Z",
+          "expiration_date": null,
+          "courseware_url": "https://courses.mitxonline.mit.edu/courses/course-v1:MITxT+18.03.1x+2T2024/course",
+          "courseware_id": "course-v1:MITxT+18.03.1x+2T2024",
+          "certificate_available_date": "2024-12-18T16:00:00Z",
+          "upgrade_deadline": "2024-12-03T23:59:00Z",
+          "is_upgradable": true,
+          "is_enrollable": true,
+          "is_archived": false,
+          "is_self_paced": false,
+          "run_tag": "2T2024",
+          "id": 256,
+          "live": true,
+          "course_number": "18.03.1x",
+          "products": [
+            {
+              "id": 227,
+              "price": "100.00",
+              "description": "course-v1:MITxT+18.03.1x+2T2024",
+              "is_active": true,
+              "product_flexible_price": null
+            }
+          ],
+          "approved_flexible_price_exists": false,
+          "enrollment_modes": [
+            { "mode_slug": "verified" },
+            { "mode_slug": "audit" }
+          ]
+        },
+        {
+          "title": "Introduction to Differential Equations",
+          "start_date": "2023-05-31T15:00:00Z",
+          "end_date": "2023-09-06T16:00:00Z",
+          "enrollment_start": null,
+          "enrollment_end": null,
+          "expiration_date": null,
+          "courseware_url": "https://courses.mitxonline.mit.edu/courses/course-v1:MITxT+18.03.1x+2T2023/course",
+          "courseware_id": "course-v1:MITxT+18.03.1x+2T2023",
+          "certificate_available_date": "2023-09-06T16:00:00Z",
+          "upgrade_deadline": "2024-05-08T14:00:00Z",
+          "is_upgradable": false,
+          "is_enrollable": false,
+          "is_archived": false,
+          "is_self_paced": false,
+          "run_tag": "2T2023",
+          "id": 174,
+          "ingest_content_files_for_ai": false,
+          "live": true,
+          "course_number": "18.03.1x",
+          "products": [
+            {
+              "id": 153,
+              "price": "100.00",
+              "description": "course-v1:MITxT+18.03.1x+2T2023",
+              "is_active": true,
+              "product_flexible_price": null
+            }
+          ],
+          "approved_flexible_price_exists": false,
+          "enrollment_modes": [
+            { "mode_slug": "verified" },
+            { "mode_slug": "audit" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 74,
+      "title": "Differential Equations: 2x2 Systems",
+      "readable_id": "course-v1:MITxT+18.03.2x",
+      "next_run_id": null,
+      "departments": [
+        {
+          "name": "Mathematics"
+        }
+      ],
+      "page": {
+        "feature_image_src": "/media/original_images/18.032x_courseimage_MITxO.png?v=bb0e1eaeb2bc4ff5f079d479ece6954bd8f22ca6",
+        "page_url": "/courses/course-v1:MITxT+18.03.2x/",
+        "description": "In order to understand most phenomena in the world, we need to understand not just single equations, but systems of differential equations. In this course, we start with 2x2 systems.",
+        "live": true,
+        "length": "9 weeks",
+        "effort": "5-8 hrs/wk",
+        "financial_assistance_form_url": "",
+        "current_price": null,
+        "instructors": [
+          {
+            "name": "David Jerison",
+            "description": ""
+          },
+          {
+            "name": "Gigliola Staffilani",
+            "description": ""
+          },
+          {
+            "name": "Jennifer French",
+            "description": ""
+          }
+        ]
+      },
+      "include_in_learn_catalog": true,
+      "min_price": null,
+      "max_price": 456,
+      "programs": null,
+      "topics": [
+        {
+          "name": "Mathematics"
+        }
+      ],
+      "certificate_type": "Certificate of Completion",
+      "required_prerequisites": true,
+      "duration": "9 weeks",
+      "time_commitment": "5-8 hrs/wk",
+      "availability": "anytime",
+      "courseruns": [
+        {
+          "title": "Differential Equations: 2x2 Systems",
+          "start_date": "2023-09-13T15:00:00Z",
+          "end_date": "2023-11-22T16:00:00Z",
+          "enrollment_start": "2023-06-07T00:00:00Z",
+          "enrollment_end": "2023-11-15T00:00:00Z",
+          "expiration_date": null,
+          "courseware_url": "https://courses.mitxonline.mit.edu/courses/course-v1:MITxT+18.03.2x+3T2023/course",
+          "courseware_id": "course-v1:MITxT+18.03.2x+3T2023",
+          "certificate_available_date": "2023-11-22T16:00:00Z",
+          "upgrade_deadline": "2023-10-31T23:59:00Z",
+          "is_upgradable": false,
+          "is_enrollable": true,
+          "is_archived": false,
+          "is_self_paced": false,
+          "run_tag": "3T2023",
+          "id": 195,
+          "live": true,
+          "course_number": "18.03.2x",
+          "products": [
+            {
+              "id": 174,
+              "price": "75.00",
+              "description": "course-v1:MITxT+18.03.2x+3T2023",
+              "is_active": true,
+              "product_flexible_price": null
+            }
+          ],
+          "approved_flexible_price_exists": false,
+          "enrollment_modes": [{ "mode_slug": "audit" }]
+        }
+      ]
+    },
+    {
+      "id": 79,
+      "ingest_content_files_for_ai": true,
+      "title": "Linear Algebra and NxN Systems",
+      "readable_id": "course-v1:MITxT+18.03.3x",
+      "next_run_id": null,
+      "departments": [
+        {
+          "name": "Mathematics"
+        }
+      ],
+      "page": {
+        "feature_image_src": "/media/original_images/18.033x_CourseImage_MITxO.jpg?v=2cec25b47f7adc2971b9287e723445b02093523a",
+        "page_url": "/courses/course-v1:MITxT+18.03.3x/",
+        "description": "Learn how to use algebra and MATLAB to solve large systems of differential equations.",
+        "live": true,
+        "length": "11 weeks",
+        "effort": "5-8 hours per week",
+        "financial_assistance_form_url": "",
+        "current_price": null,
+        "instructors": [
+          {
+            "name": "David Jerison",
+            "description": ""
+          }
+        ]
+      },
+      "include_in_learn_catalog": true,
+      "min_price": 123,
+      "max_price": null,
+      "programs": null,
+      "topics": [
+        {
+          "name": "Mathematics"
+        }
+      ],
+      "certificate_type": "Certificate of Completion",
+      "required_prerequisites": true,
+      "duration": "11 weeks",
+      "time_commitment": "5-8 hours per week",
+      "availability": "anytime",
+      "courseruns": [
+        {
+          "title": "Linear Algebra and NxN Systems",
+          "start_date": "2024-01-10T17:00:00Z",
+          "end_date": "2024-03-14T17:00:00Z",
+          "enrollment_start": "2023-08-09T17:00:00Z",
+          "enrollment_end": "2024-02-14T17:00:00Z",
+          "expiration_date": null,
+          "courseware_url": "https://courses.mitxonline.mit.edu/courses/course-v1:MITxT+18.03.3x+1T2024/course",
+          "courseware_id": "course-v1:MITxT+18.03.3x+1T2024",
+          "certificate_available_date": "2024-03-14T17:00:00Z",
+          "upgrade_deadline": "2024-02-14T23:59:00Z",
+          "is_upgradable": false,
+          "is_enrollable": true,
+          "is_archived": false,
+          "is_self_paced": false,
+          "run_tag": "1T2024",
+          "id": 200,
+          "live": true,
+          "course_number": "18.03.3x",
+          "products": [
+            {
+              "id": 179,
+              "price": "75.00",
+              "description": "course-v1:MITxT+18.03.3x+1T2024",
+              "is_active": true,
+              "product_flexible_price": null
+            }
+          ],
+          "approved_flexible_price_exists": false,
+          "enrollment_modes": [{ "mode_slug": "verified" }]
+        }
+      ]
+    }
+  ]
+}

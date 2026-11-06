@@ -1,0 +1,67 @@
+import numpy as np
+import pytest
+from qdrant_client.http.models.models import CountResult
+
+from vector_search.encoders.base import BaseEncoder
+
+
+class DummyEmbedEncoder(BaseEncoder):
+    """
+    A dummy encoder that returns random vectors
+    """
+
+    def __init__(self, model_name="dummy-embedding"):
+        self.model_name = model_name
+
+    def embed(self, text: str) -> list:  # noqa: ARG002
+        return np.random.random((10, 1))
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [self.embed(text) for text in texts]
+
+
+@pytest.fixture(autouse=True)
+def _use_dummy_encoder(settings):
+    settings.QDRANT_ENCODER = "vector_search.conftest.DummyEmbedEncoder"
+    settings.QDRANT_DENSE_MODEL = None
+
+
+@pytest.fixture(autouse=True)
+def _use_test_qdrant_settings(settings, mocker):
+    settings.QDRANT_HOST = "https://test"
+    settings.QDRANT_BASE_COLLECTION_NAME = "test"
+    settings.LITELLM_API_BASE = "https://test/api/"
+    settings.LITELLM_TOKEN_ENCODING_NAME = None
+    settings.CONTENT_FILE_EMBEDDING_CHUNK_OVERLAP = 0
+    settings.QDRANT_SPARSE_MODEL = "sklearn/hashing_vectorizer_sparse_model"
+    settings.QDRANT_SPARSE_ENCODER = (
+        "vector_search.encoders.sparse_hash.SparseHashEncoder"
+    )
+    mock_qdrant = mocker.patch("qdrant_client.QdrantClient")
+    mocker.patch(
+        "vector_search.utils.compute_optimizer_settings",
+        return_value={
+            "indexing_threshold": 10,
+            "flush_interval_sec": 5,
+        },
+    )
+
+    mock_qdrant.scroll.return_value = [
+        [],
+        None,
+    ]
+    mock_qdrant.count.return_value = CountResult(count=10)
+    mocker.patch(
+        "vector_search.utils.qdrant_client",
+        return_value=mock_qdrant,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _reset_qdrant_collections_guard():
+    """Per-process embed guard must not leak across tests."""
+    from vector_search.utils import ensure_qdrant_collections
+
+    ensure_qdrant_collections.cache_clear()
+    yield
+    ensure_qdrant_collections.cache_clear()

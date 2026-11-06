@@ -1,0 +1,193 @@
+[
+  {
+    "id": 18,
+    "title": "Discovering and Implementing Your Leadership Strengths",
+    "description": "<p>A three-week online course for technical professionals</p>",
+    "url": "https://xpro.mit.edu/courses/course-v1:xPRO+LASERx4/",
+    "external_marketing_url": null,
+    "marketing_hubspot_form_id": "",
+    "thumbnail_url": "https://ol-xpro-app-production.s3.amazonaws.com/original_images/NEW-LP-Course-4_New.jpg",
+    "readable_id": "course-v1:xPRO+LASERx4",
+    "courseruns": [
+      {
+        "title": "Discovering and Implementing Your Leadership Strengths",
+        "start_date": "2025-02-10T05:00:00Z",
+        "end_date": "2025-03-03T23:59:00Z",
+        "enrollment_start": "2024-03-06T00:00:00Z",
+        "enrollment_end": "2025-02-17T23:59:00Z",
+        "expiration_date": null,
+        "courseware_url": null,
+        "courseware_id": "course-v1:xPRO+LASERx4+R16",
+        "run_tag": "R16",
+        "id": 687,
+        "product_id": 641,
+        "instructors": [
+          {
+            "name": "David Niño"
+          }
+        ],
+        "current_price": 999.0
+      },
+      {
+        "title": "Discovering and Implementing Your Leadership Strengths",
+        "start_date": "2025-05-05T05:00:00Z",
+        "end_date": "2025-05-26T23:59:00Z",
+        "enrollment_start": "2024-03-06T00:00:00Z",
+        "enrollment_end": "2025-05-12T23:59:00Z",
+        "expiration_date": null,
+        "courseware_url": "https://courses.xpro.mit.edu/courses/course-v1:xPRO+LASERx4+R17/course/",
+        "courseware_id": "course-v1:xPRO+LASERx4+R17",
+        "run_tag": "R17",
+        "id": 691,
+        "product_id": 645,
+        "instructors": [
+          {
+            "name": "David Niño"
+          }
+        ],
+        "current_price": 999.0
+      },
+      {
+        "title": "Discovering and Implementing Your Leadership Strengths",
+        "start_date": "2025-07-14T05:00:00Z",
+        "end_date": "2025-08-04T23:59:00Z",
+        "enrollment_start": "2024-03-06T00:00:00Z",
+        "enrollment_end": "2025-07-21T23:59:00Z",
+        "expiration_date": null,
+        "courseware_url": null,
+        "courseware_id": "course-v1:xPRO+LASERx4+R18",
+        "run_tag": "R18",
+        "id": 695,
+        "product_id": 649,
+        "instructors": [
+          {
+            "name": "David Niño"
+          }
+        ],
+        "current_price": 999.0
+      }
+    ],
+    "next_run_id": 687,
+    "topics": [
+      {
+        "name": "Business:Leadership & Organizations"
+      },
+      {
+        "name": "Organization & Leadership"
+      }
+    ],
+    "time_commitment": "5 Hours per Week",
+    "duration": "3 Weeks",
+    "video_url": null,
+    "format": "Online",
+    "credits": "1.25",
+    "is_external": false,
+    "platform": "xPRO",
+    "availability": "dated"
+  },
+  {
+    "id": 17,
+    "title": "Navigating and Leveraging Culture and Networks",
+    "description": "<p>A three-week online course for technical professionals.</p>",
+    "url": "https://xpro.mit.edu/courses/course-v1:xPRO+LASERx3/",
+    "external_marketing_url": null,
+    "marketing_hubspot_form_id": "",
+    "thumbnail_url": "https://ol-xpro-app-production.s3.amazonaws.com/original_images/NEW-LP-Course-3_New.jpg",
+    "readable_id": "course-v1:xPRO+LASERx3",
+    "courseruns": [
+      {
+        "title": "Navigating and Leveraging Culture and Networks",
+        "start_date": "2025-01-13T05:00:00Z",
+        "end_date": "2025-02-03T23:59:00Z",
+        "enrollment_start": "2024-03-06T00:00:00Z",
+        "enrollment_end": "2025-01-20T23:59:00Z",
+        "expiration_date": null,
+        "courseware_url": "https://courses.xpro.mit.edu/courses/course-v1:xPRO+LASERx3+R16/course/",
+        "courseware_id": "course-v1:xPRO+LASERx3+R16",
+        "run_tag": "R16",
+        "id": 686,
+        "product_id": 640,
+        "instructors": [
+          {
+            "name": "John Van Maanen"
+          },
+          {
+            "name": "David Niño"
+          },
+          {
+            "name": "Ray Reagans"
+          }
+        ],
+        "current_price": 999.0
+      },
+      {
+        "title": "Navigating and Leveraging Culture and Networks",
+        "start_date": "2025-04-07T05:00:00Z",
+        "end_date": "2025-04-28T23:59:00Z",
+        "enrollment_start": "2024-03-06T00:00:00Z",
+        "enrollment_end": "2025-04-14T23:59:00Z",
+        "expiration_date": null,
+        "courseware_url": "https://courses.xpro.mit.edu/courses/course-v1:xPRO+LASERx3+R17/course/",
+        "courseware_id": "course-v1:xPRO+LASERx3+R17",
+        "run_tag": "R17",
+        "id": 690,
+        "product_id": 644,
+        "instructors": [
+          {
+            "name": "John Van Maanen"
+          },
+          {
+            "name": "David Niño"
+          },
+          {
+            "name": "Ray Reagans"
+          }
+        ],
+        "current_price": 999.0
+      },
+      {
+        "title": "Navigating and Leveraging Culture and Networks",
+        "start_date": "2025-06-16T05:00:00Z",
+        "end_date": "2025-07-07T23:59:00Z",
+        "enrollment_start": "2024-03-06T00:00:00Z",
+        "enrollment_end": "2025-06-23T23:59:00Z",
+        "expiration_date": null,
+        "courseware_url": "https://courses.xpro.mit.edu/courses/course-v1:xPRO+LASERx3+R18course/",
+        "courseware_id": "course-v1:xPRO+LASERx3+R18",
+        "run_tag": "R18",
+        "id": 694,
+        "product_id": 648,
+        "instructors": [
+          {
+            "name": "John Van Maanen"
+          },
+          {
+            "name": "David Niño"
+          },
+          {
+            "name": "Ray Reagans"
+          }
+        ],
+        "current_price": 999.0
+      }
+    ],
+    "next_run_id": 686,
+    "topics": [
+      {
+        "name": "Business:Leadership & Organizations"
+      }
+    ],
+    "time_commitment": "5-7 Hours per Week",
+    "min_weekly_hours": 5,
+    "max_weekly_hours": 7,
+    "duration": "3-4 Weeks",
+    "min_weeks": 3,
+    "max_weeks": 4,
+    "video_url": null,
+    "format": "Online",
+    "credits": "1.25",
+    "is_external": false,
+    "platform": "xPRO",
+    "availability": "dated"
+  }
+]

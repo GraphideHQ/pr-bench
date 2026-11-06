@@ -1,0 +1,1141 @@
+"use client"
+
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import styled from "@emotion/styled"
+import { EditorContext, JSONContent, useEditor } from "@tiptap/react"
+import type { Extension, Node, Mark } from "@tiptap/core"
+import { getSchema } from "@tiptap/core"
+import { WebsiteContentContentTypeEnum, type WebsiteContent } from "api/v1"
+import {
+  LoadingSpinner,
+  Typography,
+  HEADER_HEIGHT,
+  HEADER_HEIGHT_MD,
+} from "ol-components"
+import { ActionButton, Alert, Button, ButtonLink } from "@mitodl/smoot-design"
+import { useUserHasPermission, Permission } from "api/hooks/user"
+import { useQueryClient, type QueryClient } from "@tanstack/react-query"
+import dynamic from "next/dynamic"
+import {
+  RiCheckLine,
+  RiEditLine,
+  RiEqualizerLine,
+  RiSave3Line,
+} from "@remixicon/react"
+import { showPublishWebsiteContentDialog } from "@/page-components/WebsiteContentDialogs/PublishWebsiteContentDialog"
+import {
+  ArticleSettingsDrawer,
+  type ArticleSettingsValues,
+} from "@/page-components/ArticleSettings/ArticleSettingsDrawer"
+
+import { Toolbar } from "../vendor/components/tiptap-ui-primitive/toolbar"
+import { TiptapEditor, MainToolbarContent, TipTapViewer } from "../TiptapEditor"
+import { BannerViewer } from "../extensions/node/Banner/BannerNode"
+import { Spacer } from "../vendor/components/tiptap-ui-primitive/spacer"
+import { handleImageUpload } from "../vendor/lib/tiptap-utils"
+import { useSchema } from "../useSchema"
+import { WebsiteContentProvider } from "../WebsiteContentContext"
+import { extractLearningResourceIds } from "../extensions/utils"
+import { LearningResourceProvider } from "../extensions/node/LearningResource/LearningResourceDataProvider"
+import { websiteContentDraftsView, websiteContentEditView } from "@/common/urls"
+import {
+  CONTENT_TYPE_LABELS,
+  extractWebsiteContentDescription,
+} from "@/common/website_content"
+
+const LearningResourceDrawer = dynamic(
+  () =>
+    import("@/page-components/LearningResourceDrawer/LearningResourceDrawer"),
+  { ssr: false },
+)
+
+const TOOLBAR_HEIGHT = 43
+
+/**
+ * How long typing has to stop before a draft saves itself.
+ *
+ * Long enough that ordinary typing does not queue a request per pause, short
+ * enough that little is at risk if the tab goes away.
+ */
+const AUTOSAVE_DELAY_MS = 2000
+
+/** Matches the banner's and the body's column, which the action row follows. */
+const CONTENT_COLUMN_WIDTH = 890
+
+/* The pieces the stacked edit-mode bar is built from, per the design. */
+const TOOLBAR_PADDING_Y = 12
+const TOOLBAR_ROW_GAP = 24
+const ACTION_ROW_HEIGHT = 40 /* buttonSize="medium" */
+const FORMATTING_ROW_HEIGHT = 32 /* .tiptap-button is 2rem */
+
+/**
+ * The bar is fixed, so the content below has to be offset by its height.
+ * Derived from the values above rather than measured, which is safe because
+ * neither row wraps -- the toolbar scrolls horizontally instead.
+ */
+const STACKED_TOOLBAR_HEIGHT =
+  TOOLBAR_PADDING_Y * 2 +
+  ACTION_ROW_HEIGHT +
+  TOOLBAR_ROW_GAP +
+  FORMATTING_ROW_HEIGHT
+
+const ViewContainer = styled.div<{
+  toolbarHeight: number
+}>(({ toolbarHeight, theme }) => ({
+  width: "100vw",
+  marginTop: toolbarHeight,
+  backgroundColor: theme.custom.colors.white,
+}))
+
+const StyledToolbar = styled(Toolbar)(({ theme }) => ({
+  "&&": {
+    position: "fixed",
+    top: HEADER_HEIGHT,
+    [theme.breakpoints.down("md")]: {
+      top: HEADER_HEIGHT_MD,
+    },
+  },
+}))
+
+/**
+ * Edit mode stacks the actions above the formatting controls as a centred
+ * column, per the design.
+ */
+const StackedToolbar = styled(StyledToolbar)({
+  "&&": {
+    flexDirection: "column",
+    alignItems: "center",
+    gap: `${TOOLBAR_ROW_GAP}px`,
+    padding: `${TOOLBAR_PADDING_Y}px 40px`,
+  },
+})
+
+/* Nowrap so the bar keeps its derived height; it scrolls instead. */
+const ActionRow = styled.div(({ theme }) => ({
+  display: "flex",
+  alignItems: "center",
+  gap: "16px",
+  flexWrap: "nowrap",
+  /**
+   * The article's own column, not the bar's full width: the status then lines
+   * up with the breadcrumb and title, and the actions with the far edge of the
+   * text. Both the banner (`InnerContainer`) and the body (`TiptapEditor`'s
+   * `Container`) are this same 890px centred column, padded by 24px, so these
+   * numbers follow them and have to keep following them.
+   */
+  width: "100%",
+  maxWidth: `${CONTENT_COLUMN_WIDTH}px`,
+  margin: "0 auto",
+  padding: "0 24px",
+  [theme.breakpoints.down("sm")]: {
+    padding: "0 16px",
+  },
+}))
+
+/**
+ * A real box for the formatting controls. `MainToolbarContent` wraps them in a
+ * `display: contents` div, so without this they would become flex items of the
+ * column above and stack one group per row. It also restores the 0.25rem gap
+ * they used to get from the bar's own flex layout, and the leading/trailing
+ * Spacers inside then centre them.
+ */
+const FormattingRow = styled.div({
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  gap: "0.25rem",
+  width: "100%",
+})
+
+const StyledAlert = styled(Alert)(({ theme }) => ({
+  margin: "20px auto",
+  maxWidth: "1000px",
+  position: "fixed",
+  top: "108px",
+  left: "50%",
+  width: "690px",
+  transform: "translateX(-50%)",
+  /**
+   * Above the modal layer: a save can fail from the publish/unpublish
+   * confirmation, which stays open so the user can retry, and at a lower
+   * z-index this alert rendered behind it — the failure was invisible. The
+   * settings drawer (1200) would hide it too. `snackbar` is the layer for a
+   * notification that has to be legible over those.
+   */
+  zIndex: theme.zIndex.snackbar,
+  "p:not(:first-child)": {
+    margin: "10px 0",
+  },
+}))
+
+/**
+ * Publish is green rather than the primary red: red is reserved for the
+ * destructive Unpublish action in the same bar. Keeps primary's white label
+ * and Shadow/04dp.
+ */
+const PublishButton = styled(Button)(({ theme }) => ({
+  backgroundColor: theme.custom.colors.darkGreen,
+  ":hover:not(:disabled)": {
+    backgroundColor: theme.custom.colors.green,
+  },
+}))
+
+const StatusText = styled(Typography)(({ theme }) => ({
+  paddingLeft: "4px",
+  color: theme.custom.colors.silverGrayDark,
+  whiteSpace: "nowrap",
+}))
+
+const StyledStatusContainer = styled.div({
+  display: "flex",
+  alignItems: "center",
+  gap: "16px",
+  marginRight: "16px",
+})
+
+/* The value is darker than its label, but not bolder. */
+const StatusValue = styled.span(({ theme }) => ({
+  color: theme.custom.colors.darkGray2,
+}))
+
+/* Sits beside the status, as the design's "Saving..." does beside the title. */
+/**
+ * A span, not a `Typography`: it holds a spinner while saving, which renders a
+ * div -- and a `<p>`, Typography's default, may not contain one. Wrapping
+ * `Typography` cannot fix that, since `styled()` drops its polymorphic
+ * `component` prop, so the typography comes from the theme instead.
+ */
+const AutosaveText = styled.span(({ theme }) => ({
+  display: "inline-flex",
+  alignItems: "center",
+  gap: "4px",
+  ...theme.typography.body3,
+  color: theme.custom.colors.silverGrayDark,
+  whiteSpace: "nowrap",
+  svg: {
+    width: "16px",
+    height: "16px",
+  },
+}))
+
+/**
+ * The settings drawer's values, as a save takes them.
+ *
+ * Passed explicitly when a held-back publish resumes, because React state set
+ * in the same handler has not landed by the time the save reads it.
+ */
+type SettingsOverrides = {
+  topics?: number[]
+  seoTitle?: string
+  seoDescription?: string
+}
+
+export type UploadHandler = (
+  file: File,
+  onProgress?: (e: { progress: number }) => void,
+  abortSignal?: AbortSignal,
+) => Promise<string>
+
+/**
+ * The minimal interface expected from a media upload mutation.
+ * Matches the shape returned by `useMediaUpload` from `api/hooks/website_content`,
+ * but callers may supply any compatible implementation.
+ */
+export interface MediaUpload {
+  mutateAsync: (data: { file: File }) => Promise<{ url?: string }>
+  setNextProgressCallback: (
+    callback: ((percent: number) => void) | undefined,
+  ) => void
+}
+
+/**
+ * The data shape sent to the create/update API.
+ * `[key: string]: unknown` allows per-type extra fields (e.g. author_name).
+ */
+export interface SavePayload {
+  title: string
+  content: JSONContent
+  is_published: boolean
+  [key: string]: unknown
+}
+
+/**
+ * Per-type save mutations. Each content type owns its own API hooks and passes
+ * the resulting mutation objects here, so WebsiteContentEditor never imports a
+ * specific API hook directly.
+ *
+ * Example — news type uses websiteContent API:
+ *   const create = useWebsiteContentCreate()
+ *   const update = useWebsiteContentPartialUpdate()
+ *   <WebsiteContentEditor saveMutations={{ create, update }} ... />
+ *
+ * A future content type could use a different API hook:
+ *   const create = useSpecializedContentCreate()    // future hook
+ *   const update = useSpecializedContentPartialUpdate()
+ *   <WebsiteContentEditor saveMutations={{ create, update }} ... />
+ *
+ * `mutateAsync` rather than the callback form of `mutate`: callers need a
+ * promise that settles with the request, so a confirmation dialog can stay
+ * open until the save actually succeeds, and stay open if it fails.
+ */
+export interface SaveMutations {
+  create: {
+    mutateAsync: (data: SavePayload) => Promise<WebsiteContent>
+    isPending: boolean
+    error: Error | null | unknown
+  }
+  update: {
+    /**
+     * Partial because the endpoint is a PATCH and the settings drawer saves
+     * `topics` on its own. Naming only what changed matters there: writing the
+     * editor's current content as a side effect of saving settings would push
+     * unsaved edits to an already-published page.
+     */
+    mutateAsync: (
+      data: Partial<SavePayload> & { id: number },
+    ) => Promise<WebsiteContent>
+    isPending: boolean
+    error: Error | null | unknown
+  }
+}
+
+/**
+ * A factory function that builds the Tiptap extensions for a given content type.
+ * Receives upload utilities so extensions that handle image upload can be configured.
+ */
+export type CreateExtensionsFn = (
+  uploadHandler: UploadHandler,
+  setUploadError: (error: string | null) => void,
+  queryClient?: QueryClient | null,
+) => (Extension | Node | Mark)[]
+
+export interface WebsiteContentEditorProps {
+  /**
+   * Factory that builds the full extensions list for this content type.
+   * Must be a stable reference (module-level function or useCallback).
+   */
+  createExtensions: CreateExtensionsFn
+  /** Initial document structure when no content item is provided. */
+  initialDoc: JSONContent
+  /** Content type for route generation (Drafts/Edit links in read-only toolbar). */
+  contentType: WebsiteContentContentTypeEnum
+  /**
+   * Optional CSS class applied to the editor root container (covers both edit
+   * and read-only). Used by content-type wrappers via `styled(WebsiteContentEditor)`
+   * to theme nodes through their hook classes.
+   */
+  className?: string
+  /**
+   * Extract additional fields to include in the save payload.
+   * E.g., for news: `(content) => ({ author_name: extractAuthorName(content) })`
+   */
+  extractExtraFields?: (content: JSONContent) => Record<string, unknown>
+  /**
+   * Mutations for create and update. Provided by the content-type wrapper so
+   * WebsiteContentEditor stays decoupled from any specific API endpoint.
+   */
+  saveMutations: SaveMutations
+  /**
+   * Upload mutation provided by the content-type wrapper.
+   * Pass the return value of `useMediaUpload()` (or a compatible implementation)
+   * so WebsiteContentEditor stays decoupled from any specific upload endpoint.
+   */
+  uploadImage: MediaUpload
+  onSave?: (contentItem: WebsiteContent) => void
+  /**
+   * How long typing has to stop before a draft saves itself.
+   *
+   * Only tests pass it. They set it far enough out that no save fires while
+   * they work -- a background write landing mid-interaction re-renders the
+   * toolbar and warns about updates outside `act`, which made every typing
+   * test in these suites intermittently fail -- and the ones that are about
+   * autosave set it back to something they can wait for.
+   */
+  autosaveDelayMs?: number
+  readOnly?: boolean
+  contentItem?: WebsiteContent
+  bannerViewer?: typeof BannerViewer
+}
+
+const WebsiteContentEditor = ({
+  createExtensions,
+  contentType,
+  initialDoc,
+  className,
+  extractExtraFields,
+  saveMutations,
+  uploadImage,
+  onSave,
+  autosaveDelayMs = AUTOSAVE_DELAY_MS,
+  readOnly,
+  contentItem,
+  bannerViewer,
+}: WebsiteContentEditorProps) => {
+  const [isPublishing, setIsPublishing] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  /**
+   * Whether a publish is waiting on the settings drawer -- for topics, for the
+   * SEO fields, or for both. `handleSettingsSave` resumes it once everything
+   * publishing needs is there. Only a publish is ever held back: a draft saves
+   * itself, and autosave cannot stop to ask.
+   */
+  const [awaitingSettingsForPublish, setAwaitingSettingsForPublish] =
+    useState(false)
+  const [uploadError, setUploadError] = useState<string | null>(null)
+  const [resetAttempted, setResetAttempted] = useState(false)
+  const [content, setContent] = useState<JSONContent>(
+    contentItem?.content || initialDoc,
+  )
+  const [title, setTitle] = useState(contentItem?.title)
+  const [topics, setTopics] = useState<number[]>(contentItem?.topics ?? [])
+  /**
+   * The editor's SEO *overrides*, not the values that will be used. Blank is
+   * the ordinary state: the title then follows the content's own title and the
+   * description the banner's subheading, and both keep following them. Storing
+   * what was inferred would freeze it at today's wording.
+   */
+  const [seo, setSeo] = useState({
+    title: contentItem?.seo_title_override ?? "",
+    description: contentItem?.seo_description_override ?? "",
+  })
+  const [touched, setTouched] = useState(false)
+  /**
+   * The title and content as last written to the server, so autosave can tell
+   * an unsaved change from a re-render. Seeded with what was loaded: opening a
+   * draft and closing it must not write anything.
+   */
+  /**
+   * The row this editor has created, when it started without one.
+   *
+   * Autosave repeats, and the caller moves the editor to the new item's URL
+   * only once that has happened -- so a second write before the route changes
+   * would create a second item. This is what makes it an update instead.
+   */
+  const createdIdRef = useRef<number | null>(null)
+  /**
+   * Every write goes through here, so two can never be in flight at once.
+   *
+   * A publish confirmed while a debounced draft save is still running would
+   * otherwise race it, and whichever landed last would decide whether the
+   * item ended up public -- however the dialog reported it.
+   */
+  const saveChainRef = useRef<Promise<unknown>>(Promise.resolve())
+  /**
+   * Set once a publish from this editor has succeeded. A draft write queued
+   * behind it would send `is_published: false` and take the item straight back
+   * down, since `contentItem` still says draft until the caller reloads.
+   */
+  const publishedHereRef = useRef(false)
+  /**
+   * A created item waiting to be handed to the caller, which navigates to its
+   * URL and so unmounts this editor. Held until nothing is unsaved, or
+   * anything typed while the create was in flight would go with it.
+   *
+   * A publish clears it: the response held here says `is_published: false`,
+   * so handing it over afterwards would send the editor to the draft page for
+   * an item that is now public. That was reachable -- a publish confirmed
+   * while the create was still in flight leaves this waiting on `isPending`,
+   * and it fired once the publish settled.
+   *
+   * Neither the holding nor that ordering is covered by a test. Both windows
+   * only exist while a create is in flight, and in happy-dom the editor's
+   * state updates and the mutation's pending flag do not interleave the way
+   * they do in a browser: the edit typed during a create has not reached
+   * state by the time the response lands, and forcing the other order needs a
+   * wait long enough that the suite trips over its own teardown.
+   */
+  const handoffRef = useRef<WebsiteContent | null>(null)
+  const savedRef = useRef({
+    title: contentItem?.title,
+    content: contentItem?.content ?? initialDoc,
+  })
+  const [autosaveState, setAutosaveState] = useState<
+    "idle" | "saving" | "saved"
+  >("idle")
+
+  const { create: createMutation, update: updateMutation } = saveMutations
+  const isPending = createMutation.isPending || updateMutation.isPending
+  const saveError = createMutation.error || updateMutation.error
+
+  // Keep a ref so the stable uploadHandler callback always calls the latest mutation.
+  const uploadImageRef = useRef(uploadImage)
+  uploadImageRef.current = uploadImage
+
+  const queryClient = useQueryClient()
+  const isArticleEditor = useUserHasPermission(Permission.ArticleEditor)
+
+  const uploadHandler = useCallback<UploadHandler>(
+    async (file, onProgress, abortSignal) => {
+      setUploadError(null)
+      return handleImageUpload(
+        file,
+        async (f, progressCb) => {
+          try {
+            uploadImageRef.current.setNextProgressCallback(progressCb)
+            const response = await uploadImageRef.current.mutateAsync({
+              file: f,
+            })
+            if (!response?.url) throw new Error("Upload failed")
+            return response.url
+          } catch (error) {
+            const msg =
+              error instanceof Error
+                ? error.message
+                : String(error) || "Upload failed"
+            setUploadError(msg)
+            throw error
+          }
+        },
+        onProgress,
+        abortSignal,
+      )
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  )
+
+  const extensions = useMemo(
+    () => createExtensions(uploadHandler, setUploadError, queryClient),
+    [createExtensions, uploadHandler, queryClient],
+  )
+
+  const schema = useMemo(() => getSchema(extensions), [extensions])
+
+  const schemaError = useSchema({
+    schema,
+    content,
+    enabled: isArticleEditor,
+  })
+
+  /**
+   * Returns a promise that settles with the save, so a confirmation dialog can
+   * await it: it must not close until the request has actually succeeded, and
+   * must stay open if it fails. Rejects on failure, so every caller that is
+   * not a dialog has to handle the rejection itself.
+   */
+  /** Runs `write` after whatever is already queued, in order. */
+  const queueSave = <T,>(write: () => Promise<T>): Promise<T> => {
+    const next = saveChainRef.current.catch(() => undefined).then(write)
+    saveChainRef.current = next
+    return next
+  }
+
+  const handleSave = async (
+    publish: boolean,
+    overrides?: SettingsOverrides,
+  ) => {
+    if (!title) return
+    const extraFields = extractExtraFields?.(content) ?? {}
+    // The drawer's own values are passed in when a held-back publish resumes:
+    // `setTopics` and `setSeo` have not landed at that point, and this carries
+    // them itself rather than leaving the drawer to PATCH them separately.
+    const settings = {
+      topics: overrides?.topics ?? topics,
+      seo_title_override: overrides?.seoTitle ?? seo.title,
+      seo_description_override: overrides?.seoDescription ?? seo.description,
+    }
+    const existingId = contentItem?.id ?? createdIdRef.current
+    const saved = existingId
+      ? await updateMutation.mutateAsync({
+          id: existingId,
+          title: title.trim(),
+          content,
+          is_published: publish,
+          ...settings,
+          ...extraFields,
+        })
+      : await createMutation.mutateAsync({
+          title: title.trim(),
+          content,
+          is_published: publish,
+          ...settings,
+          ...extraFields,
+        })
+    savedRef.current = { title, content }
+    createdIdRef.current = saved.id
+    /**
+     * `onSave` exists to move the editor to where the saved item now lives,
+     * and that is somewhere new on exactly two transitions: the save that
+     * created the item, and the one that published it.
+     *
+     * An autosave of a draft that already exists is already there, so calling
+     * it would ask the caller to navigate to the route it is on -- every
+     * couple of seconds, for as long as someone keeps typing.
+     */
+    if (publish) {
+      // Supersedes a handoff still waiting to be made. The create response it
+      // holds says `is_published: false`, so a caller acting on it afterwards
+      // would send the editor to the draft page for an item now public.
+      handoffRef.current = null
+      onSave?.(saved)
+    } else if (!existingId) {
+      // Deferred to the effect below: handing over navigates, and anything
+      // typed while the create was in flight is not saved yet.
+      handoffRef.current = saved
+    }
+  }
+
+  /**
+   * The drawer's settings are persisted as soon as it saves them, so they
+   * survive without a further save of the content -- but only once the content
+   * exists. Before the first save there is nothing to PATCH, so they are held
+   * in state and ride along with the create.
+   *
+   * Only the settings go in the patch. Sending the editor's current content or
+   * published state here would push unsaved edits live.
+   *
+   * The failure is surfaced by the `saveError` alert below, so the rejection is
+   * swallowed rather than left unhandled.
+   */
+  const handleSettingsSave = ({
+    topics: nextTopics,
+    seoTitle,
+    seoDescription,
+  }: ArticleSettingsValues) => {
+    setSeo({ title: seoTitle, description: seoDescription })
+    const overrides: SettingsOverrides = { seoTitle, seoDescription }
+    // `topics` is absent for a type whose drawer has no topics section. Left
+    // out of the patch rather than sent as `[]`, which would empty a selection
+    // the editor was never shown.
+    if (nextTopics !== undefined) {
+      setTopics(nextTopics)
+      overrides.topics = nextTopics
+    }
+
+    /**
+     * A publish that was held back resumes here, carrying the drawer's values,
+     * so the content write persists them and nothing is PATCHed twice.
+     *
+     * Judged on what the drawer just handed over rather than on state, which
+     * has not landed yet. `!topicsRequired` matters for news: its drawer sends
+     * no `topics` at all, so a length test alone would strand a publish that
+     * was only ever waiting on the SEO fields.
+     */
+    const topicsSupplied = !topicsRequired || (nextTopics?.length ?? 0) > 0
+    /**
+     * Resolved, not the overrides the drawer just handed over. Blank overrides
+     * are the common case -- the content's own title and subheading are then
+     * what a search result shows -- so testing the overrides alone would
+     * strand a publish that was only ever waiting on topics.
+     */
+    const seoSupplied =
+      !!(seoTitle.trim() || inferredSeoTitle) &&
+      !!(seoDescription.trim() || inferredSeoDescription)
+    if (awaitingSettingsForPublish && topicsSupplied && seoSupplied) {
+      setAwaitingSettingsForPublish(false)
+      startPublish(overrides)
+      return
+    }
+
+    // `createdIdRef` as well as `contentItem`: autosave may have created the
+    // row already, without the caller having navigated here yet.
+    const existingId = contentItem?.id ?? createdIdRef.current
+    if (!existingId) return
+    // Queued like the others. A content write already in flight carries the
+    // settings as they were when it started, so sent alongside it this could
+    // be the older values that the server stores last -- taking what the
+    // editor just entered back out, with nothing on screen to say so.
+    queueSave(() =>
+      updateMutation.mutateAsync({
+        id: existingId,
+        seo_title_override: seoTitle,
+        seo_description_override: seoDescription,
+        ...(nextTopics === undefined ? {} : { topics: nextTopics }),
+      }),
+    ).catch(() => undefined)
+  }
+
+  /**
+   * A draft writes itself; published content does not.
+   *
+   * Once something is public every save pushes edits live, so it stays an
+   * explicit act -- the author presses Publish. A draft has no such audience,
+   * and losing unsaved work to a closed tab is the worse risk, so it is
+   * written for them. This covers content that has never been saved too:
+   * that is how it comes into existence now that there is no draft button.
+   */
+  const autosaves = !contentItem?.is_published
+  const hasUnsavedChanges =
+    title !== savedRef.current.title || content !== savedRef.current.content
+
+  useEffect(() => {
+    // `isPending` in the deps is what re-arms this after an in-flight save:
+    // edits made while one was running are picked up when it settles.
+    // `touched` as well as the comparison: a new item's content starts out
+    // differing from the empty saved state, and opening the editor on it must
+    // not write anything until somebody types.
+    if (!autosaves || !touched || !hasUnsavedChanges || !title || isPending) {
+      return
+    }
+    // A publish from this editor supersedes draft writes: `contentItem` still
+    // says draft, so this would otherwise take down what was just published.
+    if (publishedHereRef.current) return
+    const timer = setTimeout(() => {
+      setAutosaveState("saving")
+      queueSave(() => handleSave(false))
+        .then(() => setAutosaveState("saved"))
+        // The alert below reports the failure; the indicator drops back to
+        // saying nothing rather than claiming a save that did not happen.
+        .catch(() => setAutosaveState("idle"))
+    }, autosaveDelayMs)
+    return () => clearTimeout(timer)
+    // `handleSave` closes over the state it sends and is remade every render;
+    // the timer is rearmed on every edit regardless, which is the debounce.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    autosaves,
+    touched,
+    hasUnsavedChanges,
+    title,
+    content,
+    isPending,
+    autosaveDelayMs,
+  ])
+
+  useEffect(() => {
+    const created = handoffRef.current
+    if (!created || isPending || hasUnsavedChanges) return
+    // Nor after a publish from here, whatever set the handoff.
+    if (publishedHereRef.current) return
+    handoffRef.current = null
+    onSave?.(created)
+    // `onSave` is the caller's and stable in practice; re-running on a new
+    // identity would hand the same item over twice.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPending, hasUnsavedChanges])
+
+  /**
+   * An article's topics are what put it on a topic page, so it is not
+   * published without them: the press opens the settings drawer instead and is
+   * resumed once a topic is picked. Drafts are exempt -- autosave cannot stop
+   * to ask -- and news has no topics section at all.
+   */
+  const topicsRequired = contentType === WebsiteContentContentTypeEnum.Article
+  const topicsMissing = topicsRequired && topics.length === 0
+
+  /**
+   * What publishing needs: an SEO title and description that resolve -- an
+   * override, or the content's own title and banner subheading -- since they
+   * are what a search result and a link preview show. Required on news as
+   * well as articles -- both are pages someone finds through search.
+   */
+  const seoRequired = true
+  /**
+   * Inferred from the document in hand rather than from `contentItem`: the
+   * author may have retitled the banner seconds ago, and the placeholder and
+   * the publish gate both have to reflect what would be saved now.
+   */
+  const inferredSeoTitle = (title ?? "").trim()
+  const inferredSeoDescription = extractWebsiteContentDescription({
+    content,
+  }).trim()
+  /**
+   * Missing means the *resolved* value is empty -- no override and nothing to
+   * infer from. A blank override is the common case and perfectly publishable:
+   * gating on the override itself would hold back every publish that simply
+   * let the content speak for itself.
+   */
+  const seoMissing =
+    !(seo.title.trim() || inferredSeoTitle) ||
+    !(seo.description.trim() || inferredSeoDescription)
+
+  /** Hold the publish back and ask for whatever publishing still needs. */
+  const askForSettings = () => {
+    setAwaitingSettingsForPublish(true)
+    setSettingsOpen(true)
+  }
+
+  /**
+   * The publish press itself. Confirms the transition to public, but not every
+   * save: on an item that is already published this button pushes edits live,
+   * where "will make it publicly available" would be both wrong and a prompt
+   * on every save.
+   */
+  const startPublish = (overrides?: SettingsOverrides) => {
+    const publish = () => {
+      setIsPublishing(true)
+      // Queued, so a draft save already running settles first and this lands
+      // last -- what the dialog reports and what is stored then agree.
+      return queueSave(() => handleSave(true, overrides))
+        .then((result) => {
+          publishedHereRef.current = true
+          return result
+        })
+        .finally(() => setIsPublishing(false))
+    }
+    if (contentItem?.is_published) {
+      // Nothing awaits this path, so do not leave the rejection unhandled;
+      // the alert below shows it.
+      publish().catch(() => undefined)
+    } else {
+      showPublishWebsiteContentDialog(contentLabel, publish)
+    }
+  }
+
+  const editor = useEditor({
+    immediatelyRender: false,
+    shouldRerenderOnTransaction: false,
+    content,
+    editable: !readOnly,
+
+    onUpdate: ({ editor }) => {
+      const json = editor.getJSON()
+      setContent(json)
+      setTouched(true)
+    },
+
+    onCreate: ({ editor }) => {
+      setTimeout(() => {
+        editor.commands.setTextSelection(1)
+        editor.commands.focus()
+      }, 0)
+
+      editor.commands.updateAttributes("mediaEmbed", { editable: !readOnly })
+      editor.commands.updateAttributes("byline", { editable: readOnly })
+    },
+
+    editorProps: {
+      attributes: {
+        autocomplete: "off",
+        autocorrect: "off",
+        autocapitalize: "off",
+        "aria-label": "Main content area, start typing to enter text.",
+        class: "simple-editor",
+      },
+    },
+    extensions,
+  })
+
+  // NOTE: the editor deliberately does *not* write `contentItem` back over its
+  // own state when the prop changes. Once the author has typed, the prop is
+  // only the last version the server knows, so syncing it in would discard
+  // their unsaved work -- a mutation elsewhere on the page (saving the settings
+  // drawer, say) invalidates the detail query, and the refetch would land on
+  // top of a half-written document.
+  //
+  // Resetting for a genuinely different item is the caller's job, done
+  // declaratively with a `key` on the editor keyed by content id. That also
+  // re-seeds state this never touched, such as `topics`.
+
+  // Keep title in sync with the h1 heading inside the editor
+  useEffect(() => {
+    if (!editor) return
+    const headingTitle =
+      editor.$node("heading", { level: 1 })?.textContent || ""
+    setTitle(headingTitle)
+  }, [editor, content])
+
+  // Propagate readOnly changes to interactive node attrs
+  useEffect(() => {
+    if (!editor) return
+    editor
+      .chain()
+      .command(({ tr, state }) => {
+        state.doc.descendants((node, pos) => {
+          if (
+            node.type.name === "mediaEmbed" ||
+            node.type.name === "imageWithCaption" ||
+            node.type.name === "byline" ||
+            node.type.name === "learningResource"
+          ) {
+            tr.setNodeMarkup(pos, undefined, {
+              ...node.attrs,
+              editable: !readOnly,
+            })
+          }
+        })
+        return true
+      })
+      .run()
+  }, [editor, readOnly])
+
+  if (!editor) return null
+
+  const error = saveError || uploadError || schemaError
+  const errorMessage =
+    error instanceof Error ? error.message : (error as string | null)
+  const resourceIds = extractLearningResourceIds(content)
+  const editIdOrSlug = contentItem?.is_published
+    ? (contentItem?.slug ?? contentItem.id)
+    : contentItem?.id
+  /**
+   * The designs are drawn for /articles, but this chrome is shared by every
+   * content type this editor serves. The type's display label is substituted
+   * into the copy so news reads "News status:" rather than "Article status:".
+   */
+  const contentLabel = CONTENT_TYPE_LABELS[contentType]
+
+  const statusSlot = (
+    <StatusText variant="body2">
+      Status:{" "}
+      <StatusValue>
+        {contentItem?.is_published ? "Published" : "Draft"}
+      </StatusValue>
+    </StatusText>
+  )
+
+  /**
+   * What autosave is doing, in the manner of the design: "Saving..." while a
+   * write is in flight, then "Saved" until the next edit. It says nothing
+   * until the first save, so a draft opened and left alone claims nothing.
+   *
+   * `role="status"` announces that without stealing focus -- but only if the
+   * region was already in the page when the text appeared. A live region
+   * mounted in the same paint as its first message is routinely dropped by
+   * screen readers, and that first message is the one that matters, so the
+   * region is mounted empty for the whole session and only its text changes.
+   */
+  const autosaveMessages: Record<typeof autosaveState, React.ReactNode> = {
+    idle: null,
+    saving: (
+      <>
+        {/* Decorative: the text beside it says the same thing, and the
+            spinner's own "Loading" label would be read out as well. */}
+        <span aria-hidden>
+          <LoadingSpinner size={14} color="inherit" loading />
+        </span>
+        Saving...
+      </>
+    ),
+    saved: (
+      <>
+        <RiCheckLine aria-hidden />
+        Saved
+      </>
+    ),
+  }
+
+  /**
+   * "Saved" is only true until the next keystroke. The state itself cannot say
+   * that -- it is set once, when a write returns -- so it is read together
+   * with whether anything has changed since, rather than claiming a save that
+   * no longer covers what is on screen.
+   */
+  const autosaveShown =
+    autosaveState === "saved" && hasUnsavedChanges ? "idle" : autosaveState
+
+  const autosaveSlot = autosaves ? (
+    <AutosaveText role="status">{autosaveMessages[autosaveShown]}</AutosaveText>
+  ) : null
+
+  /**
+   * "medium" reproduces the design's button box exactly: 40px tall, 14px medium
+   * label, 20px icon, 8px gap, and 12px/16px horizontal padding (smoot-design
+   * pulls the icon side in by 4px).
+   */
+  const buttonSize = "medium"
+
+  /**
+   * The icon alone in a button box, as the design has it -- `bordered` to
+   * match the other buttons in the bar, `ActionButton` because it carries no
+   * label. Named for assistive technology and for the pointer, since nothing
+   * on screen says what it opens.
+   *
+   * Shared with the published view's bar, so the control looks the same
+   * wherever it appears.
+   */
+  const settingsButton = (
+    <ActionButton
+      variant="bordered"
+      size={buttonSize}
+      aria-label="Settings"
+      title="Settings"
+      onClick={() => setSettingsOpen(true)}
+    >
+      <RiEqualizerLine />
+    </ActionButton>
+  )
+
+  /**
+   * Published view: the same row as edit mode -- status at the left end,
+   * actions at the right, the Spacer between them, all within the article's
+   * own column. Laid out here rather than differently because it is the same
+   * bar in the same place, and the two looked unrelated: this one ran the
+   * full width of the window, with its buttons against the left edge and the
+   * status against the right, while edit mode lines both up with the
+   * breadcrumb and the text.
+   *
+   * Unpublishing is not offered here -- it lives on the listing card's menu,
+   * next to the item it acts on.
+   */
+  const readOnlyToolbarSlot = (
+    <ActionRow>
+      {statusSlot}
+      <Spacer />
+      <StyledStatusContainer>
+        <ButtonLink
+          variant="bordered"
+          href={websiteContentDraftsView(contentType)}
+          size={buttonSize}
+          startIcon={<RiSave3Line />}
+        >
+          Draft
+        </ButtonLink>
+        {editIdOrSlug !== undefined ? (
+          <ButtonLink
+            variant="bordered"
+            href={websiteContentEditView(contentType, editIdOrSlug)}
+            size={buttonSize}
+            startIcon={<RiEditLine />}
+          >
+            Edit
+          </ButtonLink>
+        ) : null}
+        {settingsButton}
+      </StyledStatusContainer>
+    </ActionRow>
+  )
+
+  return (
+    <ViewContainer
+      toolbarHeight={
+        isArticleEditor
+          ? readOnly
+            ? TOOLBAR_HEIGHT
+            : STACKED_TOOLBAR_HEIGHT
+          : 0
+      }
+      className={className}
+    >
+      <WebsiteContentProvider value={{ contentItem }}>
+        <LearningResourceProvider resourceIds={resourceIds}>
+          <EditorContext.Provider value={{ editor }}>
+            {isArticleEditor ? (
+              readOnly ? (
+                /* No wrapper: `StyledToolbar` is fixed, so the flex box that
+                   used to be here could not lay it out either way. */
+                <StyledToolbar>{readOnlyToolbarSlot}</StyledToolbar>
+              ) : (
+                <StackedToolbar>
+                  {/* The design puts the actions above the formatting
+                      controls, both rows centred. */}
+                  <ActionRow>
+                    {/* The design puts the status at the left end and the
+                      actions at the right, the Spacer between them. */}
+                    {statusSlot}
+                    {autosaveSlot}
+                    <Spacer />
+                    <StyledStatusContainer>
+                      <PublishButton
+                        variant="primary"
+                        disabled={
+                          isPending ||
+                          !title ||
+                          (!touched && contentItem?.is_published)
+                        }
+                        onClick={() => {
+                          if (topicsMissing || seoMissing) {
+                            askForSettings()
+                            return
+                          }
+                          startPublish()
+                        }}
+                        size={buttonSize}
+                        endIcon={
+                          isPending && isPublishing ? (
+                            <LoadingSpinner size={14} color="inherit" loading />
+                          ) : null
+                        }
+                      >
+                        Publish
+                      </PublishButton>
+                      {settingsButton}
+                    </StyledStatusContainer>
+                  </ActionRow>
+                  <FormattingRow>
+                    <MainToolbarContent editor={editor} />
+                  </FormattingRow>
+                </StackedToolbar>
+              )
+            ) : null}
+
+            {isArticleEditor ? (
+              <ArticleSettingsDrawer
+                open={settingsOpen}
+                onClose={() => {
+                  setSettingsOpen(false)
+                  // Dropped rather than kept: a press the editor walked away
+                  // from must not fire the next time topics happen to be saved.
+                  setAwaitingSettingsForPublish(false)
+                }}
+                contentLabel={contentLabel}
+                /* Only an article becomes a LearningResource, so only there do
+                   topics put the content on a topic page. */
+                showTopics={
+                  contentType === WebsiteContentContentTypeEnum.Article
+                }
+                topicsRequired={topicsRequired}
+                seoRequired={seoRequired}
+                inferredSeoTitle={inferredSeoTitle}
+                inferredSeoDescription={inferredSeoDescription}
+                /* Wording only -- which sentence a section shows when
+                   something it needs is missing. */
+                contentIsPublished={!!contentItem?.is_published}
+                /**
+                 * A draft's settings save in whatever state they are in, so
+                 * they can be filled in a piece at a time. What publishing
+                 * needs is insisted on at the publish -- which is also what
+                 * keeps a held-back press from being saved away.
+                 */
+                mustResolve={
+                  !!contentItem?.is_published || awaitingSettingsForPublish
+                }
+                initialValues={{
+                  topics,
+                  seoTitle: seo.title,
+                  seoDescription: seo.description,
+                }}
+                onSave={handleSettingsSave}
+              />
+            ) : null}
+
+            {error ? (
+              <StyledAlert severity="error" closable>
+                <Typography variant="body2" color="textPrimary">
+                  {errorMessage}
+                </Typography>
+                {schemaError && !readOnly ? (
+                  <>
+                    <Typography variant="body2">
+                      Reset to attempt to align the content to the template.
+                    </Typography>
+                    {resetAttempted ? (
+                      <Typography variant="body2">
+                        Reset attempt failed.
+                      </Typography>
+                    ) : null}
+                    <Button
+                      variant="secondary"
+                      size="small"
+                      onClick={() => {
+                        editor.commands.setContent(contentItem?.content)
+                        setResetAttempted(true)
+                      }}
+                    >
+                      Reset
+                    </Button>
+                  </>
+                ) : null}
+              </StyledAlert>
+            ) : null}
+
+            {readOnly ? (
+              <>
+                <LearningResourceDrawer />
+                <TipTapViewer
+                  content={content}
+                  extensions={extensions}
+                  bannerViewer={bannerViewer}
+                />
+              </>
+            ) : (
+              <TiptapEditor editor={editor} />
+            )}
+          </EditorContext.Provider>
+        </LearningResourceProvider>
+      </WebsiteContentProvider>
+    </ViewContainer>
+  )
+}
+
+export { WebsiteContentEditor }

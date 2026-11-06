@@ -1,0 +1,238 @@
+import React from "react"
+import { fireEvent } from "@testing-library/react"
+import { setMockResponse, urls, factories } from "api/test-utils"
+import { renderWithProviders, screen, user } from "@/test-utils"
+import ProductPageTemplate from "./ProductPageTemplate"
+import { StayUpdatedModal } from "./StayUpdatedModal"
+import { useHubspotFormDetail } from "api/hooks/hubspot"
+import NiceModal from "@ebay/nice-modal-react"
+import { STAY_UPDATED_FORM_ID } from "./test-utils/stayUpdated"
+import { capturePostHog } from "@/common/analytics/posthog"
+import { PostHogEvents } from "@/common/constants"
+import type { ResourceInfo } from "./ProductPageTemplate"
+import { PlatformEnum } from "api"
+import { DEFAULT_RESOURCE_IMG } from "ol-utilities"
+import { getAllByImageSrc, queryAllByImageSrc } from "ol-test-utilities"
+
+jest.mock("@/common/analytics/posthog", () => ({
+  capturePostHog: jest.fn(),
+  initPostHog: jest.fn(),
+}))
+const mockCapturePostHog = jest.mocked(capturePostHog)
+
+jest.mock("api/hooks/hubspot", () => ({
+  ...jest.requireActual("api/hooks/hubspot"),
+  useHubspotFormDetail: jest.fn(),
+}))
+
+jest.mock("@ebay/nice-modal-react", () => {
+  const actual = jest.requireActual("@ebay/nice-modal-react")
+  return {
+    ...actual,
+    __esModule: true,
+    default: {
+      ...actual.default,
+      show: jest.fn(),
+    },
+  }
+})
+
+const mockedUseHubspotFormDetail = jest.mocked(useHubspotFormDetail)
+const mockedNiceModalShow = jest.mocked(NiceModal.show)
+
+const DEFAULT_RESOURCE: ResourceInfo = {
+  readable_id: "program-v1:default+test",
+  resource_type: "program",
+}
+
+const renderProductPageTemplate = (
+  args: {
+    resource?: ResourceInfo
+    hubspotFormId?: string
+  } = {},
+) => {
+  const { resource = DEFAULT_RESOURCE, hubspotFormId } = args
+  setMockResponse.get(urls.userMe.get(), { is_authenticated: false })
+  renderWithProviders(
+    <ProductPageTemplate
+      currentBreadcrumbLabel="Programs"
+      title="Sample Program"
+      shortDescription={"Program description"}
+      imageSrc="/test-image.jpg"
+      infoBox={<div>Info box</div>}
+      enrollmentAction={<button type="button">Enroll</button>}
+      resource={resource}
+      hubspotFormId={hubspotFormId}
+    >
+      <div>Page content</div>
+    </ProductPageTemplate>,
+  )
+}
+
+describe("ProductPageTemplate image error fallback", () => {
+  it("falls back to the original image, then DEFAULT_RESOURCE_IMG, when imageSrc fails", () => {
+    setMockResponse.get(urls.userMe.get(), { is_authenticated: false })
+    const { view } = renderWithProviders(
+      <ProductPageTemplate
+        currentBreadcrumbLabel="Programs"
+        title="Sample Program"
+        shortDescription="Program description"
+        imageSrc="https://example.com/image.jpg"
+        infoBox={<div>Info box</div>}
+        enrollmentAction={<button type="button">Enroll</button>}
+        resource={DEFAULT_RESOURCE}
+      >
+        <div>Page content</div>
+      </ProductPageTemplate>,
+    )
+
+    const src = "https://example.com/image.jpg"
+    const raw = { nextJsOriginalSrc: false }
+    expect(queryAllByImageSrc(view.container, src, raw)).toHaveLength(0)
+    // Optimized image fails: retry the original, loaded directly
+    getAllByImageSrc(view.container, src).forEach((img) => fireEvent.error(img))
+    const originals = getAllByImageSrc(view.container, src, raw)
+    // Original fails too: use the default
+    originals.forEach((img) => fireEvent.error(img))
+    expect(
+      getAllByImageSrc(view.container, DEFAULT_RESOURCE_IMG).length,
+    ).toBeGreaterThan(0)
+  })
+})
+
+describe("ProductPageTemplate stay-updated trigger", () => {
+  beforeEach(() => {
+    mockedUseHubspotFormDetail.mockReset()
+  })
+
+  it("hides the trigger button when no hubspot form id is set", () => {
+    mockedUseHubspotFormDetail.mockReturnValue({
+      data: undefined,
+      isError: false,
+    } as ReturnType<typeof useHubspotFormDetail>)
+
+    renderProductPageTemplate()
+
+    expect(
+      screen.queryByRole("button", { name: "Stay Updated" }),
+    ).not.toBeInTheDocument()
+    expect(mockedUseHubspotFormDetail).toHaveBeenCalledWith(undefined, {
+      enabled: false,
+    })
+  })
+
+  it("hides the trigger button while the form detail is still loading", () => {
+    // Avoids a flash of the button on pages with a bad/misconfigured form id:
+    // the button must not appear until the form is confirmed to exist.
+    mockedUseHubspotFormDetail.mockReturnValue({
+      data: undefined,
+      isError: false,
+      isSuccess: false,
+    } as ReturnType<typeof useHubspotFormDetail>)
+
+    renderProductPageTemplate({ hubspotFormId: STAY_UPDATED_FORM_ID })
+
+    expect(
+      screen.queryByRole("button", { name: "Stay Updated" }),
+    ).not.toBeInTheDocument()
+  })
+
+  it("hides the trigger button when form fetch errors", () => {
+    mockedUseHubspotFormDetail.mockReturnValue({
+      data: undefined,
+      isError: true,
+    } as ReturnType<typeof useHubspotFormDetail>)
+
+    renderProductPageTemplate({ hubspotFormId: STAY_UPDATED_FORM_ID })
+
+    expect(
+      screen.queryByRole("button", { name: "Stay Updated" }),
+    ).not.toBeInTheDocument()
+  })
+
+  it("attaches click handler when form id is set and form data exists", async () => {
+    mockedUseHubspotFormDetail.mockReturnValue({
+      data: factories.hubspot.form({
+        id: STAY_UPDATED_FORM_ID,
+        name: "Stay Updated",
+      }),
+      isError: false,
+      isSuccess: true,
+    } as unknown as ReturnType<typeof useHubspotFormDetail>)
+
+    renderProductPageTemplate({ hubspotFormId: STAY_UPDATED_FORM_ID })
+
+    const button = screen.getByRole("button", { name: "Stay Updated" })
+    expect(button).toBeInTheDocument()
+    expect(button).toBeEnabled()
+
+    await user.click(button)
+    expect(mockedNiceModalShow).toHaveBeenCalledWith(StayUpdatedModal, {
+      productReadableId: DEFAULT_RESOURCE.readable_id,
+      hubspotFormId: STAY_UPDATED_FORM_ID,
+    })
+  })
+
+  it("threads the per-product hubspotFormId to the form lookup and the modal", async () => {
+    const PRODUCT_FORM_ID = "product-specific-form"
+    mockedUseHubspotFormDetail.mockReturnValue({
+      data: factories.hubspot.form({ id: PRODUCT_FORM_ID }),
+      isError: false,
+      isSuccess: true,
+    } as unknown as ReturnType<typeof useHubspotFormDetail>)
+
+    renderProductPageTemplate({ hubspotFormId: PRODUCT_FORM_ID })
+
+    expect(mockedUseHubspotFormDetail).toHaveBeenCalledWith(
+      { form_id: PRODUCT_FORM_ID },
+      { enabled: true },
+    )
+
+    const button = screen.getByRole("button", { name: "Stay Updated" })
+    await user.click(button)
+    expect(mockedNiceModalShow).toHaveBeenCalledWith(StayUpdatedModal, {
+      productReadableId: DEFAULT_RESOURCE.readable_id,
+      hubspotFormId: PRODUCT_FORM_ID,
+    })
+  })
+
+  describe("PostHog tracking", () => {
+    beforeEach(() => {
+      process.env.NEXT_PUBLIC_POSTHOG_API_KEY = "test-key"
+      mockedUseHubspotFormDetail.mockReturnValue({
+        data: factories.hubspot.form({ id: STAY_UPDATED_FORM_ID }),
+        isError: false,
+        isSuccess: true,
+      } as unknown as ReturnType<typeof useHubspotFormDetail>)
+    })
+
+    afterEach(() => {
+      delete process.env.NEXT_PUBLIC_POSTHOG_API_KEY
+      mockCapturePostHog.mockReset()
+    })
+
+    it("fires cta_clicked with resource properties when Stay Updated is clicked", async () => {
+      const resource = {
+        id: 42,
+        readable_id: "program-v1:test+101",
+        resource_type: "program" as const,
+      }
+      renderProductPageTemplate({
+        hubspotFormId: STAY_UPDATED_FORM_ID,
+        resource,
+      })
+
+      await user.click(screen.getByRole("button", { name: "Stay Updated" }))
+
+      expect(mockCapturePostHog).toHaveBeenCalledWith(
+        PostHogEvents.CallToActionClicked,
+        {
+          label: "Stay Updated",
+          readableId: resource.readable_id,
+          resourceType: resource.resource_type,
+          platform: PlatformEnum.Mitxonline,
+        },
+      )
+    })
+  })
+})

@@ -1,0 +1,822 @@
+"""Env-overridable constants for the Fugal subnet."""
+
+import logging
+import os
+
+_log = logging.getLogger(__name__)
+
+# Network and netuid are CLI concerns: neurons/validator.py and neurons/miner.py
+# read FUGAL_NETWORK and FUGAL_NETUID as click defaults. Nothing in the package
+# needs them, so they are not constants here.
+
+# --- Epoch ---
+EPOCH_INTERVAL = int(os.getenv("FUGAL_EPOCH_INTERVAL", "3600"))
+SLICE_SIZE = int(os.getenv("FUGAL_SLICE_SIZE", "300"))
+# A benchmark's share of the slice may not exceed this factor times its share
+# of the pool. Equal per-benchmark quotas gave AIME, GSM8K and IFEval -- 2,511
+# questions, about what a linear head can memorise outright (measured,
+# docs/HEAD_EFFICACY.md) -- 180 of 300 slots, so 60% of every score was a
+# lookup table away (diligence 2026-10, finding 6). Pure proportional draw
+# (factor 1) hands MMLU 65% of the slice and lets it dominate the routing
+# signal, which is what stratification existed to prevent. At 1.5 the three
+# small benchmarks hold 17% of the slice, MMLU 48%, and a 2,500-question
+# memoriser captures about 21% of a score instead of 64%; the table for other
+# factors is in docs/HEAD_EFFICACY.md, experiment 4. Consensus-critical (two
+# neurons with different values select different questions), so it is in the
+# fingerprint's epoch block.
+SLICE_SHARE_FACTOR = float(os.getenv("FUGAL_SLICE_SHARE_FACTOR", "1.5"))
+# How far into the epoch validators collect proofs, as a fraction of it.
+#
+# A miner cannot begin benchmarking until the boundary block exists — the block
+# hash is what seeds the question slice, and hiding the slice until that moment
+# is the whole anti-overfitting design. So there is an unavoidable gap between
+# an epoch starting and any proof existing for it, and a validator that queries
+# at the boundary asks before anyone can possibly answer.
+#
+# Retrying until something appears would fix the symptom and break I1: how long
+# a validator happened to wait would decide which miners it scored, so two
+# honest validators would grade different fields and publish different weights.
+# The collection point is therefore derived from the block number, identically
+# for everyone, and lives in the consensus digest — a validator collecting at a
+# different offset diverges visibly instead of silently.
+#
+# Half the epoch splits it evenly: miners get half to benchmark, validators get
+# half to verify, score, set weights and publish the reveal. At the default
+# 3600s epoch that is 150 blocks (~30 min) for a 300-question slice — 6s per
+# question, ample for serial API calls.
+EPOCH_COLLECT_FRACTION = float(os.getenv("FUGAL_COLLECT_FRACTION", "0.5"))
+
+# --- Grading policy ---
+# Whether the benchmark harness may EXECUTE model-produced code to grade it.
+#
+# Off, deliberately. graders.py's sandbox is process-level — rlimits, kill-tree,
+# DEVNULL, a size cap — with no filesystem or namespace isolation. Under --live
+# the miner controls where the metering proxy points, so it controls what
+# "model output" the harness receives; executing that inside the TD that
+# produces the attested proof would let a miner run chosen code in its own
+# enclave and walk away with a genuine Intel signature over forged results.
+# That is a total break of I8, not a contained risk.
+#
+# The cost of having it off was invisible and large. exec_io and exec_unittest
+# both return 0 unless permitted, and they are the checkers for humaneval and
+# livecode — so those questions could never score above zero, while miners paid
+# real API money attempting them. Because the slicer equalises benchmarks, that
+# was not humaneval's 0.8% share of the pool but a FULL SIXTH of every graded
+# slice, and routing those questions to a capable model was punished on thrift
+# with no possible quality gain. The scoring was teaching heads to route code to
+# the cheapest model available.
+#
+# So the pool now excludes what the harness cannot score (see loader.load_all),
+# derived from this flag rather than hardcoded: turning execution on re-includes
+# the benchmarks in one place. Doing that safely is docs/CODE_BENCHMARK_PLAN.md.
+HARNESS_ALLOW_EXEC = os.getenv("FUGAL_HARNESS_ALLOW_EXEC", "0") not in ("0", "", "false", "False")
+
+# How many model calls the miner's benchmark runs at once. Miner-side only:
+# nothing in consensus depends on how fast a miner answers, only on whether
+# its proof exists at the collection block.
+#
+# Measured 2026-09-07 on the first live epoch on real TDX: 315 serial calls to
+# the three cheapest models with 2048-token completions ran past 49 minutes —
+# the collection point is 36 minutes after the boundary. The config note above
+# assumed "6 s per question, ample for serial API calls"; real completions on
+# math prompts run ~10 s, and one 180 s timeout eats 5% of the window on its
+# own. Eight in flight brings a 315-question slice to a few minutes and makes
+# a stalled call cost one worker rather than the epoch.
+#
+# Raised to 24 for protocol v2 (2026-11-05). The 16,384-token answer budget
+# lets reasoning models run long: in the v2 token run, glm-5.3 and mimo-v2.6-pro
+# had p90 completions at the cap, and several other cheap reasoners at 11k-15k.
+# A latency model calibrated on that run (757 calls, wall time reproduced)
+# puts the p95 epoch of a router leaning on cheap reasoners at 33 min with 8 in
+# flight (44 min if providers are 30% slower), a missed proof every epoch; with
+# 24 it is 14 min (18 min). The floor is one call at PROXY_CALL_DEADLINE_S.
+# More in flight also holds more of an OpenRouter in-flight budget; see
+# runtime.OPENROUTER_402_TRANSIENT and docs/MINER_GUIDE.md.
+HARNESS_CONCURRENCY = max(1, int(os.getenv("FUGAL_HARNESS_CONCURRENCY", "24")))
+
+# --- Protocol v2 benchmark pool (approved scope, 2026-11-04) ---
+# Consensus constants from V2_ACTIVATION_BLOCK, written into the v2 pool
+# manifest and checked against it (scripts/check_safety_invariants.py).
+# Targets apply to the scored slice and to exploration alike
+# (slicer.select_slice_v2 / select_explore_set_v2).
+# Decided 2026-11-04: instruction is 5% in v2.0 (only 259 IFEval items are checkable
+# by the pinned constraint kinds; at 15 a slice they repeat every ~17 epochs).
+# The generated instruction set that lets it grow again is v2.1.
+CATEGORY_TARGETS_V2 = {"knowledge": 0.40, "math": 0.25, "hard": 0.30, "instruction": 0.05}
+BENCHMARK_CATEGORY_V2 = {
+    "mmlupro": "knowledge", "mmlu": "knowledge",
+    "math_l35": "math", "omnimath_mid": "math",
+    "supergpqa_hard": "hard", "aime": "hard", "aime25": "hard", "beyondaime": "hard", "omnimath_hard": "hard",
+    "ifeval": "instruction",
+}
+# Within-category weights; only the hard category is weighted: 50% the open
+# multiple-choice set, 50% integer olympiad math split by pool size
+# (aime 933, aime25 30, beyondaime 100, omnimath_hard 846 of 1,909). Every
+# other category splits by pool share.
+BENCHMARK_WEIGHT_V2 = {
+    "supergpqa_hard": 0.5,
+    "aime": 0.244369, "aime25": 0.007858, "beyondaime": 0.026192, "omnimath_hard": 0.221582,
+}
+
+# Miner-side only (never a score): an epoch is not started with fewer than this
+# many blocks left before its collection block (~12 min at 12 s/block).
+LATE_START_MARGIN_BLOCKS = 60
+# Miner-side only: the v2 image commits its head this many blocks after the last
+# v1 boundary, clear of the boundary block where validators read commitments.
+COMMIT_AFTER_BOUNDARY_BLOCKS = 10
+# The pre-flip commit is retried every COMMIT_RETRY_BLOCKS until this many blocks
+# before the activation block. A single failed transaction would otherwise leave
+# the commit to the post-flip fallback, and validators reading commitments at the
+# flip boundary would reject this miner's first v2 epoch as committed late.
+COMMIT_DEADLINE_BEFORE_FLIP_BLOCKS = 20
+COMMIT_RETRY_BLOCKS = 2
+
+# --- Harness answer budget and call deadlines (image constants, protocol v2) ---
+# Part of the measured image, not env-overridable: exploration (the reference
+# frame's source) runs on the same harness, so a miner and the frame ask for the
+# same answer.
+#
+# HARNESS_MAX_TOKENS bounds the whole completion, reasoning included (reasoning
+# tokens count inside max_tokens on most providers). v1 asked for 2048, and
+# measured on the July matrix that cap was the reason most long reasoners were
+# graded wrong: 118 of one model's 145 wrong answers stopped at it. At 8192,
+# 4.1% of all answers still ended at the cap, nearly all wrong, mostly on
+# competition math. 16384 recovers most of those.
+HARNESS_MAX_TOKENS = 16384
+#
+# Deadlines nest, innermost first, so each layer reports before the next gives
+# up: one upstream attempt <= the proxy's per-call deadline < the harness's wait.
+# A 16k answer from a slow model (~50 tok/s) takes ~330 s.
+# PROXY_CALL_DEADLINE_S is wall-clock (runtime._post_with_deadline): a per-read
+# socket timeout is not a deadline, because OpenRouter keeps a non-streamed
+# request alive while the model reasons (one such call was measured at 917 s).
+PROXY_CALL_DEADLINE_S = 420.0      # total time the proxy spends on one call, retries included
+HARNESS_CALL_TIMEOUT_S = 450.0     # the harness's wait on the proxy; > PROXY_CALL_DEADLINE_S
+
+# Checkers that grade by running the candidate's code, and therefore return 0
+# unless HARNESS_ALLOW_EXEC. Named here rather than in graders.py, which is
+# hash-pinned and must stay byte-identical.
+EXECUTION_CHECKERS = frozenset({"exec_io", "exec_unittest"})
+
+# --- Proof bounds (I2) ---
+# The largest token count a proof result may carry, prompt or completion. Not
+# env-overridable: it decides which proofs verify. Honest calls are bounded by
+# the harness's answer budget and the pool's prompts, orders of magnitude
+# below this; the bound exists because a JSON integer is unbounded and every
+# value a validator computes with must be bounded first (I2).
+PROOF_MAX_TOKENS = 10_000_000
+
+# --- Head constraints ---
+HEAD_MAX_BYTES = int(os.getenv("FUGAL_HEAD_MAX_BYTES", str(1 * 1024 * 1024)))  # 1 MB
+# Decompressed cap: a valid head is ~130 KB even at 64 models; 8 MB blocks zip bombs.
+HEAD_MAX_DECOMPRESSED_BYTES = int(os.getenv("FUGAL_HEAD_MAX_DECOMPRESSED", str(8 * 1024 * 1024)))
+HEAD_HIDDEN_DIM = int(os.getenv("FUGAL_HEAD_HIDDEN_DIM", "1024"))  # Qwen3-0.6B
+HEAD_MAX_MODELS = int(os.getenv("FUGAL_HEAD_MAX_MODELS", "64"))
+# Real OpenRouter IDs are well under 100 chars and save_head writes U100.
+# Without a cap a miner can pad IDs to megabytes: the array still fits the
+# decompressed budget, and the strings land verbatim in the published
+# reveal artifact. Amplification, not RCE, but free to close.
+HEAD_MAX_MODEL_ID_LEN = int(os.getenv("FUGAL_HEAD_MAX_MODEL_ID_LEN", "256"))
+
+# --- Scoring ---
+WILSON_CONFIDENCE = float(os.getenv("FUGAL_WILSON_CONFIDENCE", "0.95"))
+
+# score = headroom above the constant-policy frontier, ramped in over burn-in.
+#
+# A router is paid for the value of reading the question. Anything a policy can
+# do WITHOUT reading it — always call model k, or flip a coin between two — is
+# free to build, so the subnet must not pay for it. The reference is therefore
+# the whole curve of what constant policies buy at each price (the upper convex
+# hull of the per-model (cost, accuracy) points from the reference frame, plus
+# the origin; see fugal_subnet/frontier.py), and the score is
+#
+#     headroom = wilson_lcb(miner accuracy) - frontier(miner cost per question)
+#
+# Every constant policy has zero headroom by construction. A router earns
+# exactly the accuracy it adds over the best non-routing alternative at its own
+# price. Cheap-and-smart routing is where the frontier is low and steep, so
+# that is where headroom is largest — which is the product.
+#
+# WHY THIS REPLACED quality^0.9 * thrift^0.1 AGAINST THE BEST SINGLE MODEL.
+# Measured (docs/HEAD_EFFICACY.md): a head with W=0 that always called one
+# mid-priced model scored 1.183 against the best trained router's 1.057. Any
+# quality-versus-cost tradeoff scored against ONE point of the frontier hands a
+# cheaper point a cost advantage for free; no exponent fixes that, because the
+# constant policy sits on the curve the exponent is trying to trade along. The
+# derivation of w=0.9 and the break-even analysis are kept in
+# docs/design-decisions.md as the record of why.
+#
+# THE QUALITY FLOOR. "Match frontier quality" is the product claim, so a router
+# that gives up too much of the best model's accuracy has not delivered it
+# however much headroom it shows at a low price. Below this fraction of the
+# frontier's maximum accuracy the score is zero. 0.8 is a product constant, not
+# a derived one, and is stated as such.
+SCORE_QUALITY_FLOOR = float(os.getenv("FUGAL_SCORE_QUALITY_FLOOR", "0.8"))
+
+# How many DISTINCT decayed exploration observations every model on the hull
+# needs before the frontier is trusted at face value. Scores scale with
+# least_trials/this until it is met. A trial is one (question, model) per
+# epoch however many miners answered it (reference_frame.aggregate_observations),
+# so this is a count of what has been measured and does not fill faster in a
+# bigger field. It was 50, and thirty miners' duplicate answers reached that in
+# a couple of epochs on two distinct questions per model, before the prior had
+# washed out (diligence 2026-10, finding 3). At fifteen exploration slots over
+# seventeen models a cold frame reaches 300 in roughly 340 epochs; the shipped
+# bootstrap frame (data/reference_frame.json) is what makes epoch 1 pay.
+FRONTIER_MIN_TRIALS = float(os.getenv("FUGAL_FRONTIER_MIN_TRIALS", "300"))
+
+# A fresh artifact's score ramps in over this many scored questions. This is
+# what makes evidence reset symmetric: resetting clears accumulated PENALTIES
+# as readily as accumulated credit, so without a ramp any miner could wash a
+# bad record by flipping one weight bit. With it, climbing back costs exactly
+# what earning the position cost in the first place.
+BURN_IN_QUESTIONS = int(os.getenv("FUGAL_BURN_IN_QUESTIONS", "3000"))
+# Protocol v2's burn-in (the E'' counter, evidence.burn_in_complete): scored
+# questions in an unbroken run before a head can TAKE a seat, first or by
+# challenge. 1,500 = five epochs of a 300-question slice. Every head is new at
+# the flip, so the seat stays empty and the miner share burns for this long
+# after it: about six hours, chosen 2026-11-04 over v1's 3,000 (~12 h). v2-only: v1
+# epochs keep BURN_IN_QUESTIONS. Holding or resuming a seat needs no burn-in;
+# a challenger also needs CHAMPION_MIN_PAIRED_QUESTIONS from its unbroken run.
+V2_BURN_IN_QUESTIONS = int(os.getenv("FUGAL_V2_BURN_IN_QUESTIONS", "1500"))
+
+# --- Soft targets ---
+SOFT_TARGET_TAU = float(os.getenv("FUGAL_TAU", "1.0"))
+
+# --- Exploration integrity ---
+# A proof whose exploration calls fail more often than its scored calls, by
+# more than this margin, is rejected. Failed calls are excluded from the
+# reference frame (they measure the network, not the model), so without this a
+# miner could skip exploration -- 5% of its inference bill -- by blocking its
+# own network during that phase and pay nothing for it. 0.34 is six of the
+# fifteen default exploration slots; an honest per-call failure rate of a few
+# percent reaches it with probability well under one in a million. Diligence
+# 2026-10, finding 2.
+EXPLORE_FAIL_MARGIN = float(os.getenv("FUGAL_EXPLORE_FAIL_MARGIN", "0.34"))
+# Cross-miner agreement. Every miner answers the same exploration question on
+# the same nonce-chosen model, so honest answers mostly agree; a miner that
+# disagrees with the majority of coldkeys on more than this share of its
+# answers (over at least EXPLORE_DISAGREE_MIN_SAMPLES of them, on questions
+# with at least EXPLORE_DISAGREE_MIN_VOTERS coldkeys) is flagged and its
+# samples are left out of the reference frame for the epoch. Loose on purpose:
+# OpenRouter routes one model id to several providers, so temperature 0 is
+# not identical output and some honest disagreement is normal. Diligence
+# 2026-10, finding 4.
+EXPLORE_DISAGREE_MAX = float(os.getenv("FUGAL_EXPLORE_DISAGREE_MAX", "0.4"))
+EXPLORE_DISAGREE_MIN_SAMPLES = int(os.getenv("FUGAL_EXPLORE_DISAGREE_MIN_SAMPLES", "8"))
+EXPLORE_DISAGREE_MIN_VOTERS = int(os.getenv("FUGAL_EXPLORE_DISAGREE_MIN_VOTERS", "3"))
+
+# --- Dedup ---
+# Behavioural clause: two heads whose routing decisions agree on this share of
+# the slice are one head. A copier can pass it by nudging a bias term until a
+# handful of decisions change (diligence 2026-10, finding 5), which is why the
+# two clauses below exist alongside it.
+DEDUP_SIMILARITY_THRESHOLD = float(os.getenv("FUGAL_DEDUP_THRESHOLD", "0.99"))
+# Parameter clause: two heads whose weights sit closer than this relative
+# Frobenius distance (fugal_subnet/head_distance.py) are one head whatever
+# their decisions say. Measured 2026-10-14 by
+# scripts/experiment_head_similarity.py on the cached SPROUT data: eight heads
+# each trained on its own 60% of the questions sit 0.42-0.61 from each other
+# (and agree on only 85-92% of decisions); copies of one head with 10%
+# multiplicative weight noise sit at 0.10 and change 0-15 of 300 decisions,
+# which the behavioural clause alone misses. 0.2 is the geometric midpoint of
+# that gap (docs/HEAD_EFFICACY.md, "Experiment 3").
+DEDUP_PARAM_DISTANCE = float(os.getenv("FUGAL_DEDUP_PARAM_DISTANCE", "0.2"))
+# Epsilon clause (Subnet 9's rule): a head that agrees with a SENIOR head on
+# at least DEDUP_EPSILON_AGREEMENT of decisions must beat its composite score
+# by DEDUP_EPSILON (relative) or it is disqualified. Copy-and-tweak then has to
+# be copy-and-improve, which is the thing the subnet pays for anyway.
+DEDUP_EPSILON_AGREEMENT = float(os.getenv("FUGAL_DEDUP_EPSILON_AGREEMENT", "0.95"))
+DEDUP_EPSILON = float(os.getenv("FUGAL_DEDUP_EPSILON", "0.005"))
+
+# --- Evidence accumulation ---
+EVIDENCE_HALF_LIFE = int(os.getenv("FUGAL_EVIDENCE_HALF_LIFE", "200"))
+LIVENESS_MAX_MISSED_EVIDENCE = int(os.getenv("FUGAL_MAX_MISSED_EVIDENCE", "10"))
+
+# --- Exploration (recovers the counterfactual the TEE architecture removes) ---
+# Fraction of the scored slice size, answered with a nonce-chosen model the
+# miner does not pick. These answers are never scored against the miner; they
+# are the only unbiased samples of the model pool anyone has.
+EXPLORE_FRACTION = float(os.getenv("FUGAL_EXPLORE_FRACTION", "0.05"))
+
+# --- Reference frame ---
+# Per-model evidence decays on its own half-life. Longer than the per-miner
+# half-life on purpose: the frame describes the model pool, which changes far
+# more slowly than a miner's head does, and a steadier reference means scores
+# stay comparable across time.
+FRAME_HALF_LIFE = int(os.getenv("FUGAL_FRAME_HALF_LIFE", "500"))
+# Beta prior strength, in pseudo-observations. Makes the frame well-defined at
+# epoch 1 with zero samples, and washes out once real evidence exceeds it.
+#
+# Calibrated by measurement, not taste. The prior is deliberately neutral (0.5)
+# and therefore *wrong* for real models, so while it dominates it biases the
+# ceiling low — and it dominates for longer in a small field, which makes a
+# miner's score depend on how many other miners are online. Measured ceiling
+# spread between a 3-miner and a 50-miner field, 30-model pool:
+#
+#     epoch:        10      25      50     100     200     400
+#     K=200:     0.113   0.145   0.155   0.128   0.100   0.063
+#     K=50:      0.112   0.103   0.104   0.076   0.041   0.019
+#     K=20:      0.054   0.046   0.053   0.052   0.020   0.005
+#
+# All three converge to the same true value — field size changes how fast, not
+# where — but K=20 gets there soonest and is the least field-sensitive at every
+# horizon. Its cost is a noisier ceiling in the first few epochs, which weight
+# capping and the burn-in ramp already absorb.
+FRAME_PRIOR_STRENGTH = float(os.getenv("FUGAL_FRAME_PRIOR_STRENGTH", "20"))
+# Deliberately neutral: the subnet does not claim to know any model's accuracy
+# before measuring it. Under a flat prior every model ties, and best_model()
+# breaks the tie toward the cheapest — the coherent reference for quality per
+# dollar among equals. Recalibrate from testnet data, do not guess.
+FRAME_PRIOR_ACCURACY = float(os.getenv("FUGAL_FRAME_PRIOR_ACCURACY", "0.5"))
+# Fallback completion length for a model the frame has never observed.
+FRAME_DEFAULT_COMPLETION_TOKENS = float(
+    os.getenv("FUGAL_FRAME_DEFAULT_COMPLETION_TOKENS", "256")
+)
+
+# --- TEE (Trusted Execution Environment) ---
+TEE_APPROVED_MEASUREMENTS = [
+    m.strip() for m in os.getenv("FUGAL_TEE_MEASUREMENTS", "").split(",") if m.strip()
+]
+# No bundle store: proofs travel inline in the synapse response. See
+# fugal_subnet/protocol.py for why an external artifact store earned nothing
+# at this payload size.
+TEE_PROXY_PORT = int(os.getenv("FUGAL_TEE_PROXY_PORT", "8199"))
+TEE_MODEL_PRICES_PATH = os.getenv("FUGAL_MODEL_PRICES", "")
+
+# Where DCAP collateral is fetched from. Pinned HERE, deliberately, rather than
+# left to whatever `dcap-qvl` defaults to.
+#
+# `get_collateral_and_verify(quote)` with no url resolves to
+# `PHALA_PCCS_URL = "https://pccs.phala.network"` inside the library. That is
+# how every --live validator came to depend on Phala without anyone choosing
+# it, and how INVARIANTS came to claim the collateral came from Intel: the
+# dependency was invisible because nothing in this repo named it.
+#
+# The value below is the same endpoint, so behaviour is unchanged. What changes
+# is who decides: a `dcap-qvl` bump can no longer move every validator's
+# collateral source, because the url is now an argument this project supplies
+# rather than a default it inherits. `check_safety_invariants` enforces that
+# `verify_dcap` never calls the library without it.
+#
+# This is NOT a trust root. Collateral is TCB info, QE identity and CRLs, all
+# Intel-signed and checked against a root CA compiled into `dcap-qvl` — a
+# mirror can withhold or serve stale, never forge. So the endpoint is an
+# availability, privacy and latency choice, and the measured cost of that
+# choice is ~690 ms per proof from GCP us-central1 (docs/INVARIANTS.md).
+#
+# Operators wanting neither the third party nor the round trip should point
+# this at a local caching PCCS, which re-serves the same Intel-signed bytes.
+TEE_PCCS_URL = os.getenv("FUGAL_PCCS_URL", "https://pccs.phala.network").strip()
+
+# How long one collateral fetch may take before the validator gives up on it.
+#
+# This is a HANG GUARD, not a latency target. The measured round trip is 788 ms
+# cold and ~690 ms warm (GCP us-central1 -> Phala), so the default below is
+# roughly 12x the worst measured case. It exists for the failure that has no
+# natural bound: a PCCS that accepts the connection and then never answers.
+#
+# Without it a stalled upstream blocks the epoch outright -- no weights, and no
+# log line either, because the code that records the failure is downstream of
+# the block and never runs. Every validator hits it at the same moment, since
+# the collection point is a deterministic block.
+#
+# A timeout here raises CollateralUnavailable, NOT "invalid". That distinction
+# is the prerequisite for this timeout existing at all: before the unverifiable
+# path was built, a bare timeout converted a network outage into a false
+# accusation of forgery against every honest miner at once.
+#
+# RESIDUAL, stated because it is easy to assume otherwise: this bounds ONE
+# fetch, and the verify loop is serial over every UID. 256 stalled proofs still
+# cost 256 x this value, which overruns the 1800 s post-collection budget. The
+# per-proof bound stops the unbounded hang; it does not by itself satisfy I6 at
+# field scale. Bounding the aggregate is tracked in docs/OPEN_WORK.md.
+# --- Benchmark pool size is a SECURITY parameter ---
+#
+# Nothing about the number 21,717 says "security", which is exactly why this
+# constant exists. What stops a miner memorising the pool instead of learning
+# to route is that a linear head does not have the parameters to do it — and
+# that is a property of pool SIZE, not of the head.
+#
+# Measured, random-label fit on isotropic Gaussian embeddings (the most
+# favourable geometry, so an upper bound on any real pool):
+#
+#     2,000 questions -> 100%   memorisation is total, the subnet measures
+#                               nothing at all
+#     4,000           ->  79%
+#     8,000           ->  35%
+#    21,717           ->  16.9% the real pool today
+#
+# So the pool must not be allowed to shrink quietly. It already nearly did:
+# excluding one benchmark the way the code-benchmark work excluded others would
+# take it to ~7,675 and roughly double what a head can memorise, and no test
+# would have noticed — the load would succeed, the hash would change as
+# expected, and every downstream check would pass.
+#
+# Slicing and nonce-derived exploration do NOT defend this. They hide WHICH
+# questions are asked; they cannot hide the pool, because they draw from it.
+# Head capacity against pool size is the real defence -- and the slice SHAPE
+# decides how much of a score that capacity can buy: equal per-benchmark
+# quotas let 2,511 questions fill 60% of every slice (SLICE_SHARE_FACTOR).
+BENCHMARK_POOL_MIN_SIZE = int(os.getenv("FUGAL_POOL_MIN_SIZE", "12000"))
+
+TEE_COLLATERAL_TIMEOUT = float(os.getenv("FUGAL_COLLATERAL_TIMEOUT", "10"))
+
+# The aggregate ceiling: total seconds one epoch may spend fetching collateral,
+# across all proofs. This is the half that actually satisfies I6.
+#
+# The per-call bound above stops ONE fetch hanging. It does not stop the epoch
+# hanging, because the verify loop is serial over every UID -- 256 proofs at
+# 10 s each is 2560 s against an 1800 s post-collection window, so the epoch
+# returns having already missed the window it exists to hit.
+#
+# Sized from measurement, not taste. A healthy field costs 256 x ~690 ms
+# measured RTT = ~178 s, so the default leaves roughly 3.4x headroom over the
+# normal case while capping the pathological one at a third of the
+# post-collection budget -- leaving scoring, weight-setting and the reveal the
+# ~1200 s they share.
+#
+# Raising this does not buy more verified proofs when the upstream is healthy;
+# it only buys patience with an upstream that is not. Lowering it converts
+# proofs to `unverifiable` sooner, which is a real cost: those miners fall
+# through to apply_miss.
+TEE_COLLATERAL_EPOCH_BUDGET = float(
+    os.getenv("FUGAL_COLLATERAL_EPOCH_BUDGET", "600")
+)
+
+# How many fetches may be abandoned before this validator stops dialling the
+# PCCS for the rest of the epoch.
+#
+# A bounded fetch cannot be cancelled -- cancelling unwinds a Rust future
+# inside pyo3 and crashes the interpreter -- so it is ABANDONED instead, and an
+# abandoned fetch keeps its socket until the connection dies on its own.
+# Measured at 1.02 leaked file descriptors per abandoned fetch. A container
+# inheriting the common 1024 default would exhaust it in a few epochs against a
+# persistently stalled PCCS, and lose its axon and subtensor sockets with it --
+# an I6 failure arriving by a different road than the hang.
+#
+# So a run of consecutive timeouts is treated as evidence about the ENDPOINT
+# rather than about the proof. Consecutive, not cumulative: an upstream that
+# answers between failures — even with an error — is slow, not down, and the
+# counter resets.
+#
+# WHY 10 AND NOT 3, because 3 is the intuitive answer and it is wrong. A
+# breaker converts a graded failure into an all-or-nothing cliff, and where the
+# cliff sits decides how far two honest validators on the SAME PCCS diverge.
+# Simulated over 400 validator-epochs per cell at the real defaults (256
+# proofs, T=10, B=600, RTT 0.788 s), counting proofs verified, p10..p90 spread:
+#
+#     p(stall)   no breaker    K=3      K=10
+#     0.02            6          6        6
+#     0.05            9         10       11
+#     0.10           11        136       11
+#     0.20           58        184       58
+#
+# At K=3 and a 10% stall rate one validator trips at proof ~5 and verifies 100
+# while its neighbour never trips and verifies 236 — the breaker is free when
+# the endpoint is healthy and maximally divergent exactly when it is degraded,
+# which is the only case it exists for. K=10 is indistinguishable from having
+# no breaker at all on divergence, while still capping a genuinely dead PCCS at
+# 10 abandoned fetches and 100 s of the 600 s ceiling.
+#
+# The fd cost of the higher threshold is smaller than it first appeared:
+# abandoned descriptors ARE reclaimed once the connection dies, by peer close
+# or by Linux's own retransmit timeout (~15 min, well inside a 3600 s epoch).
+# The leak is transient rather than cumulative across epochs. Measured at
+# 1.02 fds per abandoned fetch at a short bound and 5.3 at a longer one, so
+# "10 fds" is really 10-53. Still small, and worth paying to stop the breaker
+# manufacturing a fork.
+TEE_COLLATERAL_MAX_TIMEOUTS = int(
+    os.getenv("FUGAL_COLLATERAL_MAX_TIMEOUTS", "10")
+)
+
+# --- Routing ---
+# New benchmark routing uses the shared success contract at lambda=1. The
+# constant below is retained ONLY for historical preference-head experiments;
+# no live success path reads it. See routing_protocol.BENCHMARK_LAMBDA.
+TRAINING_COST_LAMBDA = float(os.getenv("FUGAL_LAMBDA", "2.0"))
+
+# Routing utilities are quantized to this step before argmax picks a model.
+# Deliberately NOT env-overridable: it is consensus-critical, and two validators
+# using different quanta would disagree on every near-tie.
+#
+# Why it exists: the routing decision is argmax(sigmoid(W@h + b) - lam*costs),
+# a discontinuity with no tolerance. Any float difference between two validators
+# — a different BLAS kernel, CPU generation, or library build — flips the
+# decision whenever two models' utilities are close, and across 300 questions
+# and 30 models near-ties are possible. Quantizing reduces sensitivity to small
+# numerical differences; it does not guarantee agreement at every rounding
+# boundary. Conformance fixtures check selections explicitly. Exact ties retain
+# artifact row order.
+ROUTING_DECISION_QUANTUM = 1e-4
+
+# --- API ---
+API_TIMEOUT = int(os.getenv("FUGAL_API_TIMEOUT", "180"))
+API_MAX_RETRIES = int(os.getenv("FUGAL_API_RETRIES", "3"))
+API_RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504}
+
+# --- Backbone ---
+BACKBONE_MODEL = os.getenv("FUGAL_BACKBONE", "Qwen/Qwen3-0.6B")
+# Two questions bound memory for the 2048-token CPU profile. Mask-aware pooling
+# removes padding from the mean; numerical batch/single conformance is checked
+# separately. Larger batches require more memory and conformance verification.
+BACKBONE_BATCH_SIZE = int(os.getenv("FUGAL_BACKBONE_BATCH_SIZE", "2"))
+# torch intra-op threads for the backbone. Miner-side only: validators never
+# run the backbone, and embeddings shape only the miner's own routing choices,
+# so this is a throughput knob and not consensus state (see
+# fugal_subnet/determinism.py). Default 1 keeps every other tool's behaviour;
+# a TD miner sets 0 (all vCPUs) in its compose. Read by determinism.py before
+# torch imports, so it is documented here and consumed there.
+# FUGAL_BACKBONE_THREADS=1
+ROUTER_SYSTEM_PROMPT = (
+    "You are a routing model. Given a question, your hidden state will be used to "
+    "predict which language model can best answer it. Read the question carefully."
+)
+
+# --- Weight stability ---
+MAX_WEIGHT_DELTA = float(os.getenv("FUGAL_MAX_WEIGHT_DELTA", "0.3"))
+
+# --- Protocol v2: activation ---
+# The block at which every validator switches from the v1 rules to the v2
+# rules. It must be an epoch boundary (a multiple of blocks_per_epoch), and the
+# rules an epoch is scored under are decided by that epoch's BOUNDARY block
+# (slicer.protocol_version_for_boundary), never by the block a validator
+# happens to be at. So a retried epoch, or a validator that reaches an epoch
+# late, applies the same rules as every peer. Unset means v2 never activates
+# and the v1 rules apply for good. A consensus input, like the epoch length:
+# set once per deployment, identical on every neuron, and in the consensus
+# digest's epoch block, so a validator with a different or missing value
+# shows a different digest from the first epoch. The miner image reads the
+# same variable to hold its axon until the flip. docs/INVARIANTS.md, "I1 —
+# protocol v2 activates at one named boundary".
+_v2_activation = os.getenv("FUGAL_V2_ACTIVATION_BLOCK", "").strip()
+V2_ACTIVATION_BLOCK = int(_v2_activation) if _v2_activation else None
+
+# --- Protocol v2: champion scoring (paired net value) ---
+# From the activation block, a challenger is compared with the current
+# champion on the SAME questions, by net value per question:
+#
+#     NV_i = u_i * (g_challenger,i - g_champion,i) - (s_challenger,i - s_champion,i) / V
+#     V    = CHAMPION_ACCURACY_VALUE * the champion's own mean spend per
+#            question over the same paired questions
+#     u_i  = CHAMPION_HARD_WEIGHT on the hard-reasoning category, else 1
+#     NV   = 100 * mean_i NV_i                       (percentage points)
+#
+# The challenger takes the seat when the one-sided paired-bootstrap lower
+# bound of NV, at CHAMPION_CONFIDENCE over CHAMPION_BOOTSTRAP_RESAMPLES
+# resamples, exceeds CHAMPION_MARGIN points. The champion keeps the seat with
+# no margin, so two near-equal heads cannot trade it on noise. This margin
+# also replaces the earlier draft's absolute headroom margin (0.004) wherever
+# a head must beat a senior or the champion: there is one margin in v2, in NV
+# points.
+#
+# CHAMPION_ACCURACY_VALUE (m) prices one extra correct answer at m questions'
+# worth of the champion's own spend. At 30, accuracy dominates and cost
+# decides between heads of near-equal accuracy. It is a published policy
+# constant. With no champion there is no comparison: the most senior eligible
+# head takes the empty seat.
+CHAMPION_ACCURACY_VALUE = float(os.getenv("FUGAL_CHAMPION_ACCURACY_VALUE", "30"))
+CHAMPION_HARD_WEIGHT = float(os.getenv("FUGAL_CHAMPION_HARD_WEIGHT", "2"))
+# The anchor that prices one extra correct answer: V = CHAMPION_ACCURACY_VALUE
+# x this model's expected spend per question, from the reviewed v2 token
+# manifest (mean input and output tokens) at the pinned v2 prices
+# (v2_epoch.anchor_spend_per_question). Pinned, so the exchange rate between
+# accuracy and cost does not depend on who holds the seat: with the
+# champion's own spend as the anchor, a cheap champion made every pricier,
+# more accurate router pay for its spend at the cheap champion's rate.
+CHAMPION_ANCHOR_MODEL = os.getenv("FUGAL_CHAMPION_ANCHOR_MODEL", "anthropic/claude-fable-5.1")
+CHAMPION_MARGIN = float(os.getenv("FUGAL_CHAMPION_MARGIN", "0.2"))
+# 90% rather than a lower confidence because a slice is 300 questions an epoch.
+CHAMPION_CONFIDENCE = float(os.getenv("FUGAL_CHAMPION_CONFIDENCE", "0.90"))
+CHAMPION_BOOTSTRAP_RESAMPLES = int(os.getenv("FUGAL_CHAMPION_BOOTSTRAP_RESAMPLES", "2000"))
+# Quality gates on a challenger, besides the margin: accuracy at or above the
+# high-water mark (overall, and on the hard subset once the comparison holds
+# at least CHAMPION_HARD_GATE_MIN_QUESTIONS hard questions; the marks start at
+# the first champion's lower bound, never fall while a champion or its ghost
+# stands, and reset when the last ghost expires with the seat empty), and
+# per-call time within
+# CHAMPION_TIME_GATE_FACTOR of the champion's. Time is a gate only; it is not
+# priced into NV, and it is not applied until proofs carry a hash-bound
+# per-call latency.
+# An absolute accuracy floor on a head's window accuracy (shared grades, the
+# last CHAMPION_WINDOW_EPOCHS), applied to taking AND holding the seat. It
+# replaces v1's frame-based quality floor, because in v2 nothing that pays may
+# read the frame. Its job is narrow: a broken head (every call failing, say)
+# must not be seated first and collect the champion share until someone
+# beats it. 0.30 is far below any working router on any plausible v2 list,
+# but it is UNMEASURED on the v2 benchmarks and is to be revisited after the
+# first v2 week.
+CHAMPION_MIN_ACCURACY = float(os.getenv("FUGAL_CHAMPION_MIN_ACCURACY", "0.30"))
+# Insurance on the paired test: a take needs at least this many paired
+# questions against the bar, whatever the bootstrap says. Burn-in (3,000
+# questions in an unbroken run) normally guarantees it; this keeps a short
+# overlap with a ghost or a champion that only just appeared from deciding
+# the seat on a few hundred questions.
+CHAMPION_MIN_PAIRED_QUESTIONS = int(os.getenv("FUGAL_CHAMPION_MIN_PAIRED_QUESTIONS", "1500"))
+CHAMPION_HARD_GATE_MIN_QUESTIONS = int(os.getenv("FUGAL_CHAMPION_HARD_GATE_MIN_QUESTIONS", "100"))
+CHAMPION_TIME_GATE_FACTOR = float(os.getenv("FUGAL_CHAMPION_TIME_GATE_FACTOR", "2"))
+# A champion that stops being eligible leaves a ghost bar: for this many
+# epochs a head takes the seat only by beating the ghost by the margin, and
+# otherwise the miner share burns. GHOST_OFF when it simply missed proofs,
+# GHOST_RETIRE when its owner committed a different head. Kept as short as
+# the copy rule allows, because every ghost epoch with no qualifying head
+# burns.
+CHAMPION_GHOST_OFF = int(os.getenv("FUGAL_CHAMPION_GHOST_OFF", "3"))
+CHAMPION_GHOST_RETIRE = int(os.getenv("FUGAL_CHAMPION_GHOST_RETIRE", "24"))
+# The paired comparison reads the last CHAMPION_WINDOW_EPOCHS epochs by
+# calendar, counting only epochs in which both heads were scored and, for the
+# challenger, only from its first commit. Bounded so the per-question state
+# every validator holds (and rebuilds from reveals) is bounded: 48 epochs is
+# up to 14,400 paired questions, about two and a half days.
+CHAMPION_WINDOW_EPOCHS = int(os.getenv("FUGAL_CHAMPION_WINDOW_EPOCHS", "48"))
+
+# --- Protocol v2: payout ---
+# The miner share is split across the last three champions: current, previous,
+# the one before. A seat pays only while its head is live and passes the
+# gates; an empty seat's share goes to the current champion.
+PAYOUT_SEAT_SHARES = tuple(
+    float(x) for x in os.getenv("FUGAL_PAYOUT_SEAT_SHARES", "0.85,0.10,0.05").split(",")
+)
+
+# --- Validator budget ---
+# Deliberately absent. Under the TEE architecture the validator never calls a
+# model, so it has no API budget to cap and no shared model pool to bound.
+# Miners pay for their own inference inside the TEE, which is what resolved the
+# I5 cost-asymmetry problem — a $1 registration could previously waste $30+ of
+# validator inference per epoch. tests/test_paid_safety.py asserts the
+# validator has no epoch_budget parameter so this cannot creep back.
+
+# --- Head commitment (anti-copy / anti-overfit) ---
+# When enabled, a head is only scored if its SHA256 was committed on-chain
+# (pallet_commitments) at or before the epoch boundary block. This makes
+# head-copying and slice-overfitting detectable: any head changed after the
+# epoch nonce is knowable has a commitment block past the boundary.
+REQUIRE_COMMITMENT = os.getenv("FUGAL_REQUIRE_COMMITMENT", "1") not in ("0", "false", "False")
+
+# --- Miner axon access control ---
+# Minimum stake a querying hotkey needs in --live, permit or not. The unit is
+# the chain's `total_stake` for the UID as `metagraph.S` reports it: alpha on
+# this subnet plus root TAO at the chain's 0.18 root weight, after child/parent
+# key inheritance -- the same quantity subtensor uses for permits. A permit
+# alone does not admit: the chain grants one to any nonzero stake while fewer
+# than max_allowed_validators hotkeys are staked (review 2026-11-02). The axon
+# answers with the miner's FULL head, so an open axon is a free download of
+# the leader's router for anyone with a registration (diligence 2026-10,
+# finding 5); dedup, not this floor, is the defence, so the floor is set where
+# it never starves a real validator (50, decided 2026-11-03) rather than where
+# it would stop a determined copier. It ships inside the measured image, so a
+# change is an image rotation. Mock ignores it and admits any registered
+# hotkey, for local testnets and the dress rehearsal; a live miner refuses to
+# start with it at 0 (neurons/miner.py, caller_allowed).
+MIN_VALIDATOR_STAKE = float(os.getenv("FUGAL_MIN_VALIDATOR_STAKE", "50"))
+
+# Grader execution limits live in graders.py itself (EXEC_TIMEOUT_SECS and the
+# output cap): that file is hash-pinned consensus code and cannot read an
+# env-overridable value without making every validator's grades depend on its
+# environment.
+
+
+# --- Reveal publishing (operational; nothing here reads back into a score) ---
+# Public-read GCS bucket each epoch's reveal.json is uploaded to, delayed past
+# the weight commit-reveal window, with its sha256 committed on chain by the
+# validator hotkey (fugal_subnet/reveal_publisher.py). Unset: publishing is
+# skipped with one warning. Diligence 2026-10, finding A1.
+REVEAL_BUCKET = os.getenv("FUGAL_REVEAL_BUCKET", "").strip()
+# Override the hold (epochs) read from the chain's commit-reveal period. 0 =
+# read it from the chain.
+REVEAL_DELAY_EPOCHS = int(os.getenv("FUGAL_REVEAL_DELAY_EPOCHS", "0"))
+
+# --- Head archive (operational; nothing here reads back into a score) ---
+# Directory where the validator keeps every VERIFIED miner head, raw bytes
+# named by sha256, plus an index.jsonl (fugal_subnet/head_archive.py). Private:
+# created 0700, never uploaded. Unset (default): heads are discarded after
+# verification, as before.
+HEAD_ARCHIVE_DIR = os.getenv("FUGAL_HEAD_ARCHIVE_DIR", "").strip()
+
+# --- Chain endpoints (operational) ---
+# The validator pins three reads to old blocks every epoch (commitments and
+# the owner hotkey at the boundary block, the metagraph at the collection
+# block). A non-archive node serves roughly the last 300 blocks, so a validator
+# that starts late in an epoch, or retries one, can be refused those reads. Name
+# archive-capable endpoints here; the SDK uses them for historical queries and
+# the fallbacks for everything else when the primary drops.
+ARCHIVE_ENDPOINTS = [
+    e.strip() for e in os.getenv("FUGAL_ARCHIVE_ENDPOINTS", "").split(",") if e.strip()
+]
+FALLBACK_ENDPOINTS = [
+    e.strip() for e in os.getenv("FUGAL_FALLBACK_ENDPOINTS", "").split(",") if e.strip()
+]
+# How many times one epoch may re-submit set_weights after a failure, while
+# blocks remain before the next boundary and the chain's rate limit allows.
+# Each SDK call already retries up to five times internally; this bounds the
+# outer loop so a transient websocket drop costs seconds, not the epoch.
+WEIGHTS_SET_RETRIES = int(os.getenv("FUGAL_WEIGHTS_SET_RETRIES", "3"))
+
+# --- Chain identity ---
+# Genesis block hash of Bittensor mainnet (finney). Not configurable: it is the
+# one fact about the chain a --network URL cannot disguise, and it is what
+# both neurons compare against to refuse --mock on mainnet (diligence 2026-10,
+# finding A3). Verified 2026-10-29 at finney block ~9,391,998 on two independent
+# endpoints (lite.sub.latent.to, bittensor-finney.api.onfinality.io). Re-verify with
+# `subtensor.substrate.get_block_hash(0)` before launch; a wrong value here
+# makes the guard inert, never wrongly blocking.
+FINNEY_GENESIS_HASH = "0x2f0555cc76fc2840a25a6ea3b9637146806f1f44b090c175ffde2a7e5ab36c03"
+
+# --- Every FUGAL_ environment variable this module reads, classified ---
+#
+# Diligence 2026-10, additional finding A2: scoring constants could be changed
+# by environment variable and were not in the consensus digest, so a validator
+# with FUGAL_SCORE_QUALITY_FLOOR=0.5 exported scored the field differently
+# from every other validator and nothing recorded why. Three classes:
+#
+# CONSENSUS_ENV_VARS   decide a score or which proofs verify. Their VALUES are
+#                      in `fingerprint.consensus_digest`, and a live validator
+#                      refuses to start with any of them set in its
+#                      environment (`fingerprint.check_environment`). Mock
+#                      warns, so local testnets and the dress rehearsal can
+#                      shrink slices.
+# CONSENSUS_ENV_INPUTS must agree across neurons and are SUPPOSED to be set
+#                      per deployment (the epoch length is the chain's tempo;
+#                      the approved entries are the published list). In the
+#                      fingerprint so a divergence is attributable.
+# OPERATIONAL_ENV_VARS change timing, ports, paths or a miner's own costs,
+#                      never a validator's scores.
+#
+# scripts/check_safety_invariants.py fails if a FUGAL_ variable is read here
+# and listed in none of the three, so a new constant cannot be added
+# unclassified.
+CONSENSUS_ENV_VARS = (
+    "FUGAL_SLICE_SIZE",
+    "FUGAL_SLICE_SHARE_FACTOR",
+    "FUGAL_COLLECT_FRACTION",
+    "FUGAL_EXPLORE_FRACTION",
+    "FUGAL_HARNESS_ALLOW_EXEC",
+    "FUGAL_WILSON_CONFIDENCE",
+    "FUGAL_SCORE_QUALITY_FLOOR",
+    "FUGAL_FRONTIER_MIN_TRIALS",
+    "FUGAL_BURN_IN_QUESTIONS",
+    "FUGAL_V2_BURN_IN_QUESTIONS",
+    "FUGAL_EXPLORE_FAIL_MARGIN",
+    "FUGAL_EXPLORE_DISAGREE_MAX",
+    "FUGAL_EXPLORE_DISAGREE_MIN_SAMPLES",
+    "FUGAL_EXPLORE_DISAGREE_MIN_VOTERS",
+    "FUGAL_DEDUP_THRESHOLD",
+    "FUGAL_DEDUP_PARAM_DISTANCE",
+    "FUGAL_DEDUP_EPSILON_AGREEMENT",
+    "FUGAL_DEDUP_EPSILON",
+    "FUGAL_EVIDENCE_HALF_LIFE",
+    "FUGAL_MAX_MISSED_EVIDENCE",
+    "FUGAL_FRAME_HALF_LIFE",
+    "FUGAL_FRAME_PRIOR_STRENGTH",
+    "FUGAL_FRAME_PRIOR_ACCURACY",
+    "FUGAL_FRAME_DEFAULT_COMPLETION_TOKENS",
+    "FUGAL_POOL_MIN_SIZE",
+    "FUGAL_MAX_WEIGHT_DELTA",
+    "FUGAL_REQUIRE_COMMITMENT",
+    "FUGAL_HEAD_HIDDEN_DIM",
+    "FUGAL_HEAD_MAX_MODELS",
+    "FUGAL_HEAD_MAX_BYTES",
+    "FUGAL_HEAD_MAX_DECOMPRESSED",
+    "FUGAL_HEAD_MAX_MODEL_ID_LEN",
+    "FUGAL_MODEL_PRICES",
+    "FUGAL_CHAMPION_ACCURACY_VALUE",
+    "FUGAL_CHAMPION_HARD_WEIGHT",
+    "FUGAL_CHAMPION_ANCHOR_MODEL",
+    "FUGAL_CHAMPION_MARGIN",
+    "FUGAL_CHAMPION_CONFIDENCE",
+    "FUGAL_CHAMPION_BOOTSTRAP_RESAMPLES",
+    "FUGAL_CHAMPION_HARD_GATE_MIN_QUESTIONS",
+    "FUGAL_CHAMPION_TIME_GATE_FACTOR",
+    "FUGAL_CHAMPION_GHOST_OFF",
+    "FUGAL_CHAMPION_GHOST_RETIRE",
+    "FUGAL_CHAMPION_WINDOW_EPOCHS",
+    "FUGAL_CHAMPION_MIN_ACCURACY",
+    "FUGAL_CHAMPION_MIN_PAIRED_QUESTIONS",
+    "FUGAL_PAYOUT_SEAT_SHARES",
+)
+CONSENSUS_ENV_INPUTS = (
+    "FUGAL_EPOCH_INTERVAL",
+    "FUGAL_TEE_MEASUREMENTS",
+    "FUGAL_V2_ACTIVATION_BLOCK",
+)
+OPERATIONAL_ENV_VARS = (
+    "FUGAL_HARNESS_CONCURRENCY",
+    "FUGAL_TAU",
+    "FUGAL_LAMBDA",
+    "FUGAL_TEE_PROXY_PORT",
+    "FUGAL_PCCS_URL",
+    "FUGAL_COLLATERAL_TIMEOUT",
+    "FUGAL_COLLATERAL_EPOCH_BUDGET",
+    "FUGAL_COLLATERAL_MAX_TIMEOUTS",
+    "FUGAL_API_TIMEOUT",
+    "FUGAL_API_RETRIES",
+    "FUGAL_BACKBONE",
+    "FUGAL_BACKBONE_BATCH_SIZE",
+    "FUGAL_MIN_VALIDATOR_STAKE",
+    "FUGAL_REVEAL_BUCKET",
+    "FUGAL_REVEAL_DELAY_EPOCHS",
+    "FUGAL_HEAD_ARCHIVE_DIR",
+    "FUGAL_ARCHIVE_ENDPOINTS",
+    "FUGAL_FALLBACK_ENDPOINTS",
+    "FUGAL_WEIGHTS_SET_RETRIES",
+)

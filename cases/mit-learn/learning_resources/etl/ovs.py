@@ -1,0 +1,506 @@
+"""ODL Video Service (OVS) ETL"""
+
+import logging
+from collections import defaultdict
+from collections.abc import Generator
+from urllib.parse import ParseResult, quote, urlencode, urlparse, urlunparse
+
+import requests
+from django.conf import settings
+from django.db.models import QuerySet
+
+from learning_resources.constants import (
+    VIDEO_SHORT_RESOURCE_CATEGORY,
+    Availability,
+    LearningResourceType,
+    PlatformType,
+)
+from learning_resources.etl.constants import ETLSource
+from learning_resources.etl.loaders import update_index
+from learning_resources.etl.utils import extract_text_from_url
+from learning_resources.models import LearningResource
+from main.constants import (
+    ALLOWED_HTML_ATTRIBUTES_WITH_LINKS,
+    ALLOWED_HTML_TAGS_WITH_LINKS,
+)
+from main.utils import clean_data
+
+log = logging.getLogger(__name__)
+
+OVS_API_PATH = "/api/v0/public/videos/"
+
+
+def allowed_media_hosts() -> set[str]:
+    """
+    Return the set of hosts that OVS media urls are allowed to point at.
+
+    Returns:
+        set of lowercased host patterns, including the OVS API host
+    """
+    hosts = {host.lower() for host in settings.OVS_ALLOWED_MEDIA_HOSTS if host}
+    api_host = urlparse(settings.OVS_API_BASE_URL or "").hostname
+    if api_host:
+        hosts.add(api_host.lower())
+    return hosts
+
+
+def parse_media_url(url: object) -> ParseResult | None:
+    """
+    Parse a url from an OVS payload, returning None if it cannot be trusted.
+
+    Payload values are untrusted, so they are not necessarily strings and not
+    necessarily parseable (urlparse raises on, for example, an unterminated ipv6
+    host). A netloc containing a backslash or userinfo is refused outright:
+    urllib reads `https://evil.io\\@allowed.example` as a url on
+    allowed.example, while browsers read it as a url on evil.io, so comparing
+    urllib's hostname against the allowlist would not mean what it appears to.
+
+    Args:
+        url: the value to parse
+
+    Returns:
+        the parsed url, or None if it is unusable
+    """
+    if not isinstance(url, str) or not url:
+        return None
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    if "\\" in parsed.netloc or "@" in parsed.netloc:
+        return None
+    return parsed
+
+
+def allowed_media_hostname(url: object) -> str | None:
+    """
+    Return the hostname of a url that points at an allowlisted OVS media host.
+
+    Args:
+        url: the url to check
+
+    Returns:
+        the lowercased hostname, or None if the url is not allowed
+    """
+    parsed = parse_media_url(url)
+    if parsed is None or parsed.scheme != "https":
+        return None
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        return None
+    if any(
+        hostname == allowed or (allowed.startswith(".") and hostname.endswith(allowed))
+        for allowed in allowed_media_hosts()
+    ):
+        return hostname
+    return None
+
+
+def is_allowed_media_url(url: object) -> bool:
+    """
+    Check that a url from an OVS payload points at an allowlisted host over https.
+
+    OVS payloads (including webhook payloads, which are untrusted input) carry
+    absolute urls for thumbnails, streaming sources and subtitles. We fetch some
+    of those urls server-side and hand the rest to browsers, so a forged payload
+    could otherwise direct requests at an arbitrary, possibly internal, host.
+
+    Args:
+        url: the url to check
+
+    Returns:
+        True if the url is an https url on an allowlisted host
+    """
+    return allowed_media_hostname(url) is not None
+
+
+def _get_cloudfront_domain(video_data: dict) -> str | None:
+    """
+    Extract the CloudFront domain from thumbnail or source URLs.
+
+    Only urls on an allowlisted host are considered, so the returned domain can
+    safely be used to build further urls.
+
+    Args:
+        video_data: OVS video API response dict
+
+    Returns:
+        CloudFront domain string or None
+    """
+    # Try thumbnails first
+    for thumbnail in video_data.get("videothumbnail_set", []):
+        hostname = allowed_media_hostname(thumbnail.get("cloudfront_url"))
+        if hostname:
+            return hostname
+    # Fall back to sources
+    for source in video_data.get("sources", []):
+        hostname = allowed_media_hostname(source.get("src"))
+        if hostname:
+            return hostname
+    return None
+
+
+def _build_caption_urls(video_data: dict) -> list[dict]:
+    """
+    Build a list of caption URL dicts from the OVS videosubtitle_set.
+
+    Uses the CloudFront domain from thumbnails/sources to construct URLs.
+
+    Args:
+        video_data: OVS video API response dict
+
+    Returns:
+        list of dicts with language and url keys
+    """
+    cf_domain = _get_cloudfront_domain(video_data)
+    if not cf_domain:
+        return []
+
+    captions = []
+    for subtitle in video_data.get("videosubtitle_set", []):
+        s3_object_key = subtitle.get("s3_object_key")
+        if not isinstance(s3_object_key, str):
+            continue
+        s3_key = quote(s3_object_key.lstrip("/"))
+        if s3_key:
+            url = f"https://{cf_domain}/{s3_key}"
+            if not is_allowed_media_url(url):
+                log.warning("Skipping OVS caption url on disallowed host: %s", url)
+                continue
+            captions.append(
+                {
+                    "language": subtitle.get("language", "en"),
+                    "language_name": subtitle.get("language_name", ""),
+                    "url": url,
+                }
+            )
+    return captions
+
+
+def _get_cover_image_url(video_data: dict) -> str | None:
+    """
+    Get the cover image URL from the first thumbnail in videothumbnail_set.
+
+    Args:
+        video_data: OVS video API response dict
+
+    Returns:
+        Cover image CloudFront URL or None
+    """
+    thumbnails = video_data.get("videothumbnail_set", [])
+    if thumbnails:
+        cover_url = thumbnails[0].get("cloudfront_url")
+        if is_allowed_media_url(cover_url):
+            return cover_url
+        log.warning("Ignoring OVS cover image url on disallowed host: %s", cover_url)
+    return None
+
+
+def _get_source_url(video_data: dict) -> str | None:
+    """
+    Get the primary streaming source URL.
+
+    Args:
+        video_data: OVS video API response dict
+
+    Returns:
+        HLS streaming URL or None
+    """
+    for source in video_data.get("sources", []):
+        src = source.get("src")
+        if not src:
+            continue
+        # parse before looking at the path: an unparseable or non-string src is
+        # not a url we can reason about at all
+        parsed = parse_media_url(src)
+        if parsed is None or not is_allowed_media_url(src):
+            log.warning("Ignoring OVS streaming source on disallowed host: %s", src)
+            continue
+        if parsed.path.endswith(".m3u8"):
+            return src
+    return None
+
+
+def clean_description(description: object) -> str:
+    """
+    Sanitize an OVS description before it is stored.
+
+    OVS descriptions are rich text authored in OVS, and every surface that shows
+    them here renders them as markup, so an unsanitized value would be live HTML
+    from a source we do not control. Links are kept - they are the point of the
+    feature - which is the same allowlist the podcast ETL uses for show notes.
+
+    Args:
+        description: the description from the OVS payload, which is untrusted
+            and not necessarily a string
+
+    Returns:
+        the sanitized description, or "" when there was nothing usable
+    """
+    if not isinstance(description, str):
+        return ""
+    return clean_data(
+        description,
+        tags=ALLOWED_HTML_TAGS_WITH_LINKS,
+        attributes=ALLOWED_HTML_ATTRIBUTES_WITH_LINKS,
+    )
+
+
+def _duration_to_iso8601(duration_seconds: float) -> str:
+    """
+    Convert a duration in seconds to ISO 8601 duration string.
+
+    Args:
+        duration_seconds: duration as a float
+
+    Returns:
+        ISO 8601 duration string (e.g. "PT1H30M15S")
+    """
+    if not duration_seconds:
+        return "PT0S"
+    total_seconds = int(duration_seconds)
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+    parts = ["PT"]
+    if hours:
+        parts.append(f"{hours}H")
+    if minutes:
+        parts.append(f"{minutes}M")
+    if seconds or not (hours or minutes):
+        parts.append(f"{seconds}S")
+    return "".join(parts)
+
+
+def _get_resource_url(video_data: dict) -> str:
+    """
+    Get the user-facing URL for a video resource.
+
+    Uses cta_link if it points at an allowlisted host, otherwise builds a URL
+    from OVS_API_BASE_URL.
+
+    Args:
+        video_data: OVS video API response dict
+
+    Returns:
+        URL string for the resource
+    """
+    cta_link = video_data.get("cta_link")
+    if cta_link:
+        if is_allowed_media_url(cta_link):
+            return cta_link
+        log.warning("Ignoring OVS cta_link on disallowed host: %s", cta_link)
+    base_url = settings.OVS_API_BASE_URL.rstrip("/")
+    return f"{base_url}/videos/{quote(str(video_data['key']))}"
+
+
+def extract(*, url=None) -> Generator[dict, None, None]:
+    """
+    Extract public non-YouTube videos from the OVS API.
+
+    Handles pagination via the `next` field in the response.
+
+    Args:
+        url: optional override for the full API URL
+
+    Yields:
+        dict: individual video data dicts from the API
+    """
+    if not url and not settings.OVS_API_BASE_URL:
+        log.warning("OVS_API_BASE_URL is not configured; skipping OVS ETL")
+        return
+    api_url = url or f"{settings.OVS_API_BASE_URL.rstrip('/')}{OVS_API_PATH}"
+
+    next_url = api_url
+    while next_url:
+        # Ensure include_in_learn=true is on every paginated URL
+        parsed = urlparse(next_url)
+        if "include_in_learn" not in parsed.query:
+            separator = "&" if parsed.query else ""
+            new_query = (
+                f"{parsed.query}{separator}{urlencode({'include_in_learn': 'true'})}"
+            )
+            next_url = urlunparse(parsed._replace(query=new_query))
+
+        log.info("Fetching OVS videos from %s", next_url)
+        response = requests.get(next_url, timeout=settings.REQUESTS_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+
+        for video in data.get("results", []):
+            if video.get("is_public") and video.get("status") == "Complete":
+                yield video
+
+        next_url = data.get("next")
+
+
+def transform_video(video_data: dict) -> dict | None:
+    """
+    Transform a single OVS video into LearningResource format.
+
+    Args:
+        video_data: single video dict from the OVS API
+
+    Returns:
+        dict matching the load_video() expected format
+    """
+    source_url = _get_source_url(video_data)
+    if not source_url:
+        log.warning(
+            "Skipping OVS video %s: no m3u8 source found",
+            video_data.get("key", "<unknown>"),
+        )
+        return None
+
+    cover_image_url = _get_cover_image_url(video_data)
+    image_data = {"url": cover_image_url} if cover_image_url else None
+
+    video_dict = {
+        "readable_id": video_data["key"],
+        "platform": PlatformType.ovs.name,
+        "etl_source": ETLSource.ovs.name,
+        "resource_type": LearningResourceType.video.name,
+        "title": video_data.get("title", ""),
+        "description": clean_description(video_data.get("description", "")),
+        "url": _get_resource_url(video_data),
+        "image": image_data,
+        "last_modified": video_data.get("created_at"),
+        "availability": Availability.anytime.name,
+        "published": True,
+        "video": {
+            "duration": _duration_to_iso8601(video_data.get("duration", 0)),
+            "streaming_url": source_url,
+            "caption_urls": _build_caption_urls(video_data),
+            "cover_image_url": cover_image_url or "",
+        },
+    }
+
+    if (video_data.get("collection") or {}).get("for_shorts", False):
+        video_dict["resource_category"] = VIDEO_SHORT_RESOURCE_CATEGORY
+    return video_dict
+
+
+def transform_collection(collection_data: dict) -> dict:
+    """
+    Transform an OVS collection into a playlist dict.
+
+    Args:
+        collection_data: the collection dict from an OVS video response
+
+    Returns:
+        dict with playlist metadata (without videos, which are added later)
+    """
+    base_url = settings.OVS_API_BASE_URL.rstrip("/")
+    return {
+        "playlist_id": collection_data["key"],
+        "platform": PlatformType.ovs.name,
+        "title": collection_data.get("title", ""),
+        "description": clean_description(collection_data.get("description", "")),
+        "url": f"{base_url}/collections/{quote(str(collection_data['key']))}",
+        "published": True,
+    }
+
+
+def transform(extracted_videos) -> Generator[dict, None, None]:
+    """
+    Transform extracted OVS videos, grouped by collection into playlists.
+
+    Args:
+        extracted_videos: iterable of video dicts from extract()
+
+    Yields:
+        dict: playlist data with nested videos list
+    """
+    collections = {}
+    collection_videos = defaultdict(list)
+
+    for video_data in extracted_videos:
+        collection = video_data.get("collection")
+        if not collection or not collection.get("key"):
+            continue
+        collection_key = collection["key"]
+        transformed_video = transform_video(video_data)
+        if not transformed_video:
+            continue
+        if collection_key not in collections:
+            collections[collection_key] = transform_collection(collection)
+        collection_videos[collection_key].append(transformed_video)
+
+    for collection_key, playlist_data in collections.items():
+        videos = collection_videos[collection_key]
+        if not videos:
+            continue
+        playlist_data["videos"] = videos
+        yield playlist_data
+
+
+def _fetch_transcript(caption_urls: list[dict]) -> str:
+    """
+    Fetch English transcript text from a list of caption URLs using Tika.
+
+    Args:
+        caption_urls: list of dicts with language and url keys
+
+    Returns:
+        Extracted transcript text, or empty string if unavailable
+    """
+    for caption in caption_urls:
+        if caption.get("language") == "en":
+            if not is_allowed_media_url(caption.get("url")):
+                log.warning(
+                    "Refusing to fetch transcript from disallowed host: %s",
+                    caption.get("url"),
+                )
+                break
+            try:
+                result = extract_text_from_url(caption["url"], mime_type="text/vtt")
+                if result and result.get("content"):
+                    return result["content"].strip()
+            except requests.RequestException:
+                log.exception("Failed to fetch transcript from %s", caption["url"])
+            break
+    return ""
+
+
+def get_ovs_videos_for_transcripts_job(
+    *, overwrite: bool = False
+) -> QuerySet[LearningResource]:
+    """
+    Get OVS video resources that need transcripts.
+
+    Args:
+        overwrite: if True, include videos that already have transcripts
+
+    Returns:
+        QuerySet of LearningResource objects
+    """
+    video_resources = LearningResource.objects.select_related("video").filter(
+        published=True,
+        resource_type=LearningResourceType.video.name,
+        platform__code=PlatformType.ovs.name,
+        video__caption_urls__contains=[{"language": "en"}],
+    )
+
+    if not overwrite:
+        video_resources = video_resources.filter(video__transcript="")
+
+    return video_resources
+
+
+def get_ovs_transcripts(video_resources: QuerySet[LearningResource]) -> None:
+    """
+    Fetch transcripts for OVS video resources from their caption URLs.
+
+    Args:
+        video_resources: iterable of LearningResource objects with related video
+    """
+    for resource in video_resources:
+        caption_urls = resource.video.caption_urls
+        if not caption_urls:
+            continue
+        transcript = _fetch_transcript(caption_urls)
+        if transcript:
+            video = resource.video
+            video.transcript = transcript
+            video.save()
+            update_index(resource, newly_created=False)

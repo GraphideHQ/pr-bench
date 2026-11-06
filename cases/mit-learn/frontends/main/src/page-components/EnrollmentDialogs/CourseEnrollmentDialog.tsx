@@ -1,0 +1,469 @@
+import React from "react"
+import {
+  FormDialog,
+  SimpleSelectOption,
+  SimpleSelectField,
+  styled,
+  Stack,
+  Typography,
+  PlainList,
+  Link,
+} from "ol-components"
+import NiceModal, { muiDialogV5 } from "@ebay/nice-modal-react"
+import {
+  CourseRunV2,
+  CourseWithCourseRunsSerializerV2,
+} from "@mitodl/mitxonline-api-axios/v2"
+import { formatDate, LocalDate } from "ol-utilities"
+import { RiCheckLine, RiArrowRightLine, RiAwardFill } from "@remixicon/react"
+import { Alert, Button, ButtonProps } from "@mitodl/smoot-design"
+import {
+  ENROLL_FAILURE_MESSAGE,
+  canPurchaseRun,
+  enrollmentAlertSuccessUrl,
+  formatPrice,
+  getEnrollmentType,
+  mitxonlineLegacyUrl,
+} from "@/common/mitxonline"
+import { useCreateEnrollment } from "api/mitxonline-hooks/enrollment"
+import { SILENCE_ERROR_TOAST } from "api/mutation-meta"
+import { badRequestDetail } from "api/mutation-errors"
+import ErrorMessageWithSupport from "@/components/ErrorMessageWithSupport/ErrorMessageWithSupport"
+import { useReplaceBasketItem } from "@/common/mitxonline/useReplaceBasketItem"
+import { useComplianceGate } from "@/common/mitxonline/useComplianceGate"
+import { useRouter } from "next-nprogress-bar"
+import { useQuery } from "@tanstack/react-query"
+import { productQueries } from "api/mitxonline-hooks/products"
+import { analytics } from "@/common/analytics"
+
+interface CourseEnrollmentDialogProps {
+  course: CourseWithCourseRunsSerializerV2
+  /**
+   * Called after a course enrollment is successfully created
+   * By default, redirects to dashboard home.
+   */
+  onCourseEnroll?: (run: CourseRunV2) => void
+}
+
+const StyledSimpleSelectField = styled(SimpleSelectField)(({ theme }) => ({
+  "&&& label": {
+    ...theme.typography.subtitle1,
+    marginBottom: "8px",
+  },
+})) as typeof SimpleSelectField
+
+const UnderlinedLink = styled(Link)({
+  textDecoration: "underline",
+})
+
+const StyledFormDialog = styled(FormDialog)({
+  ".MuiPaper-root": {
+    maxWidth: "750px",
+  },
+})
+
+type BigButtonProps = {
+  label: string
+  sublabel: string
+  endIcon: React.ReactNode
+} & Omit<ButtonProps, "children" | "endIcon" | "startIcon" | "variant" | "size">
+const BigButton = styled(
+  ({ label, sublabel, endIcon, ...others }: BigButtonProps) => {
+    return (
+      <Button variant="primary" {...others}>
+        <span>
+          <span className="label">{label}</span>
+          <br />
+          <span className="sublabel">{sublabel}</span>
+        </span>
+        {endIcon}
+      </Button>
+    )
+  },
+)(({ theme }) => ({
+  // mostly inheriting colors, hover, etc from regular button.
+  padding: "16px 32px",
+  boxShadow: "none",
+  display: "inline-flex",
+  alignItems: "center",
+  gap: "32px",
+  textAlign: "left",
+  justifyContent: "flex-start",
+  svg: {
+    width: "24px",
+    height: "24px",
+  },
+  ...theme.typography.h5,
+  [theme.breakpoints.down("sm")]: {
+    ...theme.typography.subtitle2,
+    padding: "12px 20px",
+    gap: "16px",
+    justifyContent: "space-between",
+  },
+  ".label": {
+    fontWeight: theme.typography.fontWeightBold,
+  },
+}))
+
+const CertificateBox = styled.div<{ disabled?: boolean }>(
+  ({ theme, disabled }) => [
+    {
+      padding: "16px",
+      display: "flex",
+      width: "100%",
+      justifyContent: "space-between",
+      alignItems: "center",
+      background: "rgba(3, 21, 45, 0.05)",
+      borderRadius: "4px",
+      border: "1px solid  #DFE5EC",
+      gap: "24px",
+      [theme.breakpoints.down("sm")]: {
+        flexDirection: "column",
+        alignItems: "stretch",
+        gap: "12px",
+      },
+    },
+    disabled && {
+      background: "rgba(3, 21, 45, 0.025)",
+      color: theme.custom.colors.silverGrayDark,
+    },
+  ],
+)
+const CertDate = styled.span<{ disabled?: boolean }>(({ theme, disabled }) => [
+  { ...theme.typography.body1 },
+  !disabled && { color: theme.custom.colors.red },
+])
+
+const CertificatePriceRoot = styled.div(({ theme }) => ({
+  display: "flex",
+  alignItems: "flex-start",
+  justifyContent: "flex-start",
+  gap: "12px",
+  svg: {
+    width: "40px",
+    height: "40px",
+  },
+  ...theme.typography.h5,
+  [theme.breakpoints.down("sm")]: {
+    svg: {
+      width: "32px",
+      height: "32px",
+    },
+    ...theme.typography.subtitle1,
+  },
+}))
+
+const CertificateReasonsList = styled(PlainList)(({ theme }) => ({
+  display: "grid",
+  rowGap: "24px",
+  columnGap: "40px",
+  gridTemplateColumns: "1fr 1fr",
+  [theme.breakpoints.down("sm")]: {
+    gridTemplateColumns: "1fr",
+  },
+}))
+const CertificateReasonItem = styled.li(({ theme }) => ({
+  display: "flex",
+  alignItems: "flex-start",
+  gap: "8px",
+  ...theme.typography.body2,
+  svg: {
+    width: "20px",
+    height: "20px",
+    color: theme.custom.colors.green,
+  },
+  "> *": { flexShrink: 0 },
+}))
+const CERT_REASONS = [
+  "Certificate is signed by MIT faculty",
+  "Highlight on your resume/CV",
+  "Demonstrates knowledge and skills taught in this course",
+  "Share on your social channels & LinkedIn",
+  "Enhance your college & earn a promotion",
+  "Enhance your college application with an earned certificate from MIT",
+]
+
+const StrickenText = styled.span(({ theme }) => ({
+  textDecoration: "line-through",
+  color: theme.custom.colors.silverGrayDark,
+  ...theme.typography.body2,
+}))
+type DisplayPrice = {
+  /** What checkout charges this learner. */
+  finalPrice: string
+  /** The product's undiscounted price, struck through when the two differ. */
+  originalPrice: string
+  /**
+   * Whether the learner is approved for financial assistance -- which is not the
+   * same as aid having produced `finalPrice`. A learner approved at a tier that
+   * discounts nothing, or one whose aid a cheaper discount beat, is approved and
+   * paying a price aid did not set, so the copy this drives says "approved"
+   * rather than "applied".
+   */
+  approvedFinancialAid: boolean
+}
+
+const NumericPriceDisplay: React.FC<{
+  price: DisplayPrice | null
+}> = ({ price }) => {
+  if (!price) return null
+  if (price.finalPrice === price.originalPrice) return price.finalPrice
+  return (
+    <span>
+      {price.finalPrice} <StrickenText>{price.originalPrice}</StrickenText>
+    </span>
+  )
+}
+
+const CertificateUpsell: React.FC<{
+  course?: CourseWithCourseRunsSerializerV2
+  courseRun?: CourseRunV2
+}> = ({ course, courseRun }) => {
+  const product = courseRun?.products[0]
+  const financialAidUrl = course?.page?.financial_assistance_form_url ?? ""
+  const enrollmentType = getEnrollmentType(courseRun?.enrollment_modes)
+  const enabled =
+    (enrollmentType === "both" || enrollmentType === "paid") &&
+    !!(product && courseRun && canPurchaseRun(courseRun))
+  // Renders its own inline error below (replaceBasketItem.isError), so suppress
+  // the global error toast.
+  const replaceBasketItem = useReplaceBasketItem({ meta: SILENCE_ERROR_TOAST })
+  // The quote endpoint rejects anonymous requests, which this dialog cannot
+  // produce: it is only ever opened from the dashboard, behind
+  // RestrictedRoute requires={Permission.Authenticated}.
+  //
+  // Not gated on a financial assistance form either: a learner can hold an
+  // automatic or user-tied discount on a course that offers no aid, and the
+  // quote prices those too.
+  const userPricing = useQuery({
+    ...productQueries.userPricingDetail({
+      productId: product?.id ?? 0,
+    }),
+    enabled,
+    // The browser query client throws 400/401/403 into the route's error
+    // boundary, which would replace the page behind this dialog over a stale
+    // mitxonline session. A quote we cannot get falls back to the list price.
+    throwOnError: false,
+  })
+  const price: DisplayPrice | null = enabled
+    ? {
+        // The quoted price, rather than a discount reapplied here: checkout
+        // picks one discount from everything the learner holds, and only it
+        // knows which one wins.
+        finalPrice: formatPrice(userPricing.data?.user_price ?? product.price, {
+          avoidCents: true,
+        }),
+        originalPrice: formatPrice(product.price, { avoidCents: true }),
+        approvedFinancialAid: !!userPricing.data?.product_flexible_price?.id,
+      }
+    : null
+  const hasFinancialAssistance = !!financialAidUrl
+  const deadlineUI = courseRun?.upgrade_deadline ? (
+    <>
+      Payment due: <LocalDate date={courseRun.upgrade_deadline} />
+    </>
+  ) : null
+  return (
+    <Stack gap="32px" alignItems="flex-start">
+      <Typography variant="subtitle1">
+        Would you like to get a certificate for this course?
+      </Typography>
+      <CertificateReasonsList>
+        {CERT_REASONS.map((reason, index) => (
+          // reasons are static, index key is OK
+          <CertificateReasonItem key={index}>
+            <RiCheckLine aria-hidden="true" />
+            {reason}
+          </CertificateReasonItem>
+        ))}
+      </CertificateReasonsList>
+      <CertificateBox disabled={!enabled}>
+        <CertificatePriceRoot>
+          <RiAwardFill />
+          <Stack gap="4px">
+            <strong>
+              Get Certificate <NumericPriceDisplay price={price} />
+            </strong>
+            {hasFinancialAssistance && price ? (
+              <UnderlinedLink
+                color="black"
+                href={mitxonlineLegacyUrl(financialAidUrl)}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                {price.approvedFinancialAid
+                  ? "Financial assistance approved"
+                  : "Financial assistance available"}
+              </UnderlinedLink>
+            ) : null}
+            <CertDate disabled={!enabled}>
+              {enabled ? deadlineUI : "Not available"}
+            </CertDate>
+          </Stack>
+        </CertificatePriceRoot>
+        <BigButton
+          label="Add to Cart"
+          sublabel="to get a Certificate"
+          endIcon={<RiArrowRightLine aria-hidden="true" />}
+          disabled={!enabled}
+          onClick={() => {
+            if (!product) return
+            analytics.addedToCart({
+              courseId: course?.readable_id ?? String(product.id),
+              courseName: course?.title,
+              coursePrice: product.price ? parseFloat(product.price) : 0,
+            })
+            analytics.checkoutStarted({
+              courseName: course?.title,
+              courseId: course?.readable_id ?? String(product.id),
+              value: product.price ? parseFloat(product.price) : 0,
+            })
+            replaceBasketItem.mutate(
+              product.id,
+              courseRun ? { type: "course_run", id: courseRun.id } : undefined,
+            )
+          }}
+        />
+      </CertificateBox>
+      {!!replaceBasketItem.error && (
+        <Alert severity="error">
+          <ErrorMessageWithSupport>
+            {badRequestDetail(replaceBasketItem.error) ??
+              ENROLL_FAILURE_MESSAGE}
+          </ErrorMessageWithSupport>
+        </Alert>
+      )}
+    </Stack>
+  )
+}
+
+const getRunOptions = (
+  course: CourseWithCourseRunsSerializerV2,
+): SimpleSelectOption[] => {
+  return course.courseruns
+    .filter((run) => run.is_enrollable)
+    .map((run) => {
+      const dates = [run.start_date, run.end_date]
+        .filter((d) => typeof d === "string")
+        .map((d) => formatDate(d))
+        .join(" - ")
+      return {
+        label: canPurchaseRun(run)
+          ? dates
+          : `${dates} (No certificate available)`,
+        value: `${run.id}`,
+      }
+    })
+}
+
+const RUN_DEFAULT_OPTION: SimpleSelectOption = {
+  label: "Please Select",
+  value: "",
+  disabled: true,
+}
+
+const CourseEnrollmentDialogInner: React.FC<CourseEnrollmentDialogProps> = ({
+  course,
+  onCourseEnroll,
+}) => {
+  const modal = NiceModal.useModal()
+  const runOptions = getRunOptions(course)
+  const options: SimpleSelectOption[] = [RUN_DEFAULT_OPTION, ...runOptions]
+  const getDefaultOption = () => {
+    // if multiple options, force a choice
+    return runOptions.length === 1 ? runOptions[0].value : ""
+  }
+  const [chosenRun, setChosenRun] = React.useState<string>(getDefaultOption)
+  const run = course.courseruns.find((r) => `${r.id}` === chosenRun)
+  const enrollmentType = getEnrollmentType(run?.enrollment_modes)
+  // Renders its own inline error below (createEnrollment.isError), so suppress
+  // the global error toast.
+  const createEnrollment = useCreateEnrollment({ meta: SILENCE_ERROR_TOAST })
+  const router = useRouter()
+  // The "Add to Cart" path inside CertificateUpsell is gated by
+  // useReplaceBasketItem; this free-enrollment submit gates here.
+  const { mutateWithCompliance } = useComplianceGate()
+  return (
+    <StyledFormDialog
+      {...muiDialogV5(modal)}
+      title={course.title ?? ""}
+      fullWidth
+      confirmText={
+        enrollmentType === "free" || enrollmentType === "both"
+          ? "Enroll for Free without a certificate"
+          : null
+      }
+      onSubmit={async (e) => {
+        e.preventDefault()
+        if (!run) return
+        await mutateWithCompliance(
+          createEnrollment,
+          {
+            run_id: run.id,
+          },
+          {
+            onSuccess: () => {
+              analytics.courseEnrolled(course.title)
+              if (onCourseEnroll) {
+                onCourseEnroll(run)
+              } else {
+                router.push(
+                  enrollmentAlertSuccessUrl({
+                    title: course.title ?? "your enrollment",
+                  }),
+                )
+              }
+              modal.hide()
+            },
+          },
+        )
+      }}
+      onReset={() => setChosenRun(getDefaultOption())}
+      maxWidth={false}
+      disabled={!run}
+    >
+      <Stack
+        sx={(theme) => ({
+          color: theme.custom.colors.darkGray2,
+        })}
+        gap="24px"
+      >
+        <StyledSimpleSelectField
+          label="Choose a date:"
+          options={options}
+          value={chosenRun}
+          onChange={(e) => setChosenRun(e.target.value)}
+          fullWidth
+        />
+        <CertificateUpsell course={course} courseRun={run} />
+        {createEnrollment.isError && (
+          <div ref={(el) => el?.scrollIntoView()}>
+            <Alert severity="error">
+              <ErrorMessageWithSupport>
+                {badRequestDetail(createEnrollment.error) ??
+                  "There was a problem enrolling you in this course. Please try again later."}
+              </ErrorMessageWithSupport>
+            </Alert>
+          </div>
+        )}
+      </Stack>
+    </StyledFormDialog>
+  )
+}
+
+const CourseEnrollmentDialog = NiceModal.create(CourseEnrollmentDialogInner)
+
+export default CourseEnrollmentDialog
+
+export {
+  StyledSimpleSelectField,
+  StyledFormDialog,
+  CertificateUpsell,
+  BigButton,
+  CertificateBox,
+  CertificatePriceRoot,
+  CertificateReasonItem,
+  CertificateReasonsList,
+  StrickenText,
+  UnderlinedLink,
+}

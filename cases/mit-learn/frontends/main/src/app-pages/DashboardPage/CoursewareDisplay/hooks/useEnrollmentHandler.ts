@@ -1,0 +1,225 @@
+import { useReplaceBasketItem } from "@/common/mitxonline/useReplaceBasketItem"
+import {
+  CourseRunV2,
+  CourseWithCourseRunsSerializerV2,
+} from "@mitodl/mitxonline-api-axios/v2"
+import {
+  useCreateB2bEnrollment,
+  useCreateEnrollment,
+  useCreateVerifiedProgramEnrollment,
+} from "api/mitxonline-hooks/enrollment"
+import React from "react"
+import NiceModal from "@ebay/nice-modal-react"
+import { getCourseEnrollmentAction } from "@/common/mitxonline"
+import { useComplianceGate } from "@/common/mitxonline/useComplianceGate"
+import CourseEnrollmentDialog from "@/page-components/EnrollmentDialogs/CourseEnrollmentDialog"
+import { analytics } from "@/common/analytics"
+import { canOpenCourseware } from "../courseDateUtils"
+import { mitxUserQueries } from "api/mitxonline-hooks/user"
+import { useQuery } from "@tanstack/react-query"
+import { badRequestDetailOr } from "api/mutation-errors"
+
+const ENROLL_COURSE_ERROR =
+  "Something went wrong enrolling you in this course. Please try again."
+const ENROLL_PROGRAM_ERROR =
+  "Something went wrong enrolling you in this program. Please try again."
+
+// Prefer the server's own 400 explanation over the static copy. The bare
+// `badRequestDetailOr()` falls through to the global handler's generic message.
+const COURSE_ENROLL_META = Object.freeze({
+  getErrorMessage: badRequestDetailOr(ENROLL_COURSE_ERROR),
+  contactSupport: true,
+})
+const PROGRAM_ENROLL_META = Object.freeze({
+  getErrorMessage: badRequestDetailOr(ENROLL_PROGRAM_ERROR),
+  contactSupport: true,
+})
+const CHECKOUT_META = Object.freeze({
+  getErrorMessage: badRequestDetailOr(),
+  contactSupport: true,
+})
+
+export const useEnrollmentHandler = () => {
+  const createB2bEnrollment = useCreateB2bEnrollment({
+    meta: COURSE_ENROLL_META,
+  })
+  const createEnrollment = useCreateEnrollment({ meta: COURSE_ENROLL_META })
+  const createVerifiedProgramEnrollment = useCreateVerifiedProgramEnrollment({
+    meta: PROGRAM_ENROLL_META,
+  })
+  const replaceBasketItem = useReplaceBasketItem({ meta: CHECKOUT_META })
+  const { mutateWithCompliance } = useComplianceGate()
+  const mitxOnlineUser = useQuery(mitxUserQueries.me())
+  const isStaff = mitxOnlineUser.data?.is_staff
+
+  const enroll = React.useCallback(
+    async ({
+      course,
+      readableId,
+      href,
+      selectedCoursewareUrl,
+      isB2B,
+      isVerifiedProgram,
+      programCoursewareId,
+      programReadableIds,
+      b2bProgramId,
+      startDate,
+    }: {
+      course: CourseWithCourseRunsSerializerV2
+      readableId?: string
+      href?: string
+      selectedCoursewareUrl?: string
+      isB2B?: boolean
+      isVerifiedProgram?: boolean
+      programCoursewareId?: string
+      programReadableIds?: string[]
+      b2bProgramId?: string
+      startDate?: string | null
+    }) => {
+      /**
+       * Enrolling early is allowed, so only redirect once the courseware is
+       * open. Otherwise the learner stays put and the card they clicked
+       * re-renders as enrolled, showing when the run starts.
+       */
+      const finishEnrollment = (url: string, runStartDate?: string | null) => {
+        if (!canOpenCourseware(runStartDate, { isStaff })) return
+        window.location.href = url
+      }
+
+      if (isB2B) {
+        if (!readableId) {
+          console.warn("Cannot enroll in B2B course: missing required data", {
+            readableId,
+            href,
+          })
+          return
+        }
+        // A selected variant run may not be present in `course.courseruns`
+        // (variant runs come from a separate endpoint and aren't always in the
+        // course payload), so this find() can miss. `href` is the displayed
+        // run's URL, passed explicitly by the card for exactly this reason — it
+        // must take precedence, or variant enrollment redirects silently break.
+        const matchedRun = (course.courseruns ?? []).find(
+          (run) => run.courseware_id === readableId,
+        )
+        const destinationUrl = href ?? matchedRun?.courseware_url
+        if (!destinationUrl) {
+          console.warn("Cannot enroll in B2B course: missing destination URL", {
+            readableId,
+            href,
+          })
+          return
+        }
+
+        await mutateWithCompliance(
+          createB2bEnrollment,
+          {
+            readable_id: readableId,
+            B2BEnrollRequestRequest: b2bProgramId
+              ? { program_id: b2bProgramId }
+              : undefined,
+          },
+          {
+            onSuccess: () => {
+              finishEnrollment(destinationUrl, startDate)
+            },
+          },
+        )
+      } else if (
+        isVerifiedProgram &&
+        readableId &&
+        (programReadableIds?.length || programCoursewareId)
+      ) {
+        if (!href) {
+          console.warn(
+            "Cannot enroll in verified program course: missing href",
+            { href },
+          )
+          return
+        }
+        // See the B2B note above: the displayed run may be absent from
+        // course.courseruns, so selectedCoursewareUrl/href must take precedence
+        // over this find().
+        const verifiedDestination =
+          selectedCoursewareUrl ??
+          (course.courseruns ?? []).find(
+            (run) => run.courseware_id === readableId,
+          )?.courseware_url ??
+          href
+        const requestBody = programReadableIds?.length
+          ? programReadableIds
+          : programCoursewareId
+            ? [programCoursewareId]
+            : []
+        await mutateWithCompliance(
+          createVerifiedProgramEnrollment,
+          { courserun_id: readableId, request_body: requestBody },
+          {
+            onSuccess: () => {
+              finishEnrollment(verifiedDestination ?? href, startDate)
+            },
+          },
+        )
+      } else {
+        const enrollmentAction = getCourseEnrollmentAction(course)
+
+        if (enrollmentAction.type === "audit") {
+          await mutateWithCompliance(
+            createEnrollment,
+            { run_id: enrollmentAction.run.id },
+            {
+              onSuccess: () => {
+                analytics.courseEnrolled(course.title)
+                const destination =
+                  selectedCoursewareUrl ??
+                  enrollmentAction.run.courseware_url ??
+                  href
+                if (destination) {
+                  finishEnrollment(destination, enrollmentAction.run.start_date)
+                }
+              },
+            },
+          )
+          return
+        }
+
+        if (enrollmentAction.type === "checkout") {
+          analytics.checkoutStarted({
+            courseName: course.title,
+            courseId: course.readable_id,
+            value: enrollmentAction.product.price
+              ? parseFloat(enrollmentAction.product.price)
+              : 0,
+          })
+          replaceBasketItem.mutate(enrollmentAction.product.id, {
+            type: "course_run",
+            id: enrollmentAction.run.id,
+          })
+          return
+        }
+
+        const onCourseEnroll = (run: CourseRunV2) => {
+          finishEnrollment(run.courseware_url!, run.start_date)
+        }
+        NiceModal.show(CourseEnrollmentDialog, { course, onCourseEnroll })
+      }
+    },
+    [
+      mutateWithCompliance,
+      createB2bEnrollment,
+      createEnrollment,
+      createVerifiedProgramEnrollment,
+      replaceBasketItem,
+      isStaff,
+    ],
+  )
+
+  return {
+    enroll,
+    isPending:
+      createB2bEnrollment.isPending ||
+      createEnrollment.isPending ||
+      createVerifiedProgramEnrollment.isPending ||
+      replaceBasketItem.isPending,
+  }
+}

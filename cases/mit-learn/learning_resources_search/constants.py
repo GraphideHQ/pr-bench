@@ -1,0 +1,548 @@
+"""Constants for search"""
+
+from dataclasses import dataclass
+from enum import Enum
+
+from opensearchpy.exceptions import ConnectionError as ESConnectionError
+from urllib3.exceptions import TimeoutError as UrlTimeoutError
+
+from learning_resources.constants import (
+    CONTENT_FILE_LARGE_FIELDS,
+    LEARNING_RESOURCE_SORTBY_OPTIONS,
+)
+
+ALIAS_ALL_INDICES = "all"
+COURSE_TYPE = "course"
+PROGRAM_TYPE = "program"
+CONTENT_FILE_TYPE = "content_file"
+PODCAST_TYPE = "podcast"
+PODCAST_EPISODE_TYPE = "podcast_episode"
+LEARNING_PATH_TYPE = "learning_path"
+VIDEO_TYPE = "video"
+VIDEO_PLAYLIST_TYPE = "video_playlist"
+DOCUMENT_TYPE = "document"
+PERCOLATE_INDEX_TYPE = "percolator"
+CURRENT_INDEX = "current_index"
+REINDEXING_INDEX = "reindexing_index"
+BOTH_INDEXES = "all_indexes"
+HYBRID_COMBINED_INDEX = "combined_hybrid"
+LEARNING_RESOURCE = "learning_resource"
+HYBRID_SEARCH_MODE = "hybrid"
+HYBRID_SEARCH_PIPELINE_NAME = "hybrid_search_pipeline"
+
+HYBRID_SEARCH_PIPELINE_BODY = {
+    "description": "Post processor for hybrid search",
+    "phase_results_processors": [
+        {
+            "normalization-processor": {
+                "normalization": {"technique": "min_max"},
+                "combination": {
+                    "technique": "arithmetic_mean",
+                    "parameters": {"weights": [0.8, 0.2]},
+                },
+            }
+        }
+    ],
+}
+
+
+class IndexestoUpdate(Enum):
+    """
+    Enum for index to update
+    """
+
+    current_index = "current_index"
+    reindexing_index = "reindexing_index"
+    all_indexes = "all_indexes"
+
+
+# TaskJob.task_name for recreate_index jobs
+REINDEX_TASK_NAME = "recreate_index"
+
+
+class ReindexBatchKind(Enum):
+    """
+    Enum for the kinds of TaskBatch used by recreate_index jobs
+    """
+
+    learning_resources = "learning_resources"
+    content_files = "content_files"
+    percolate = "percolate"
+    dispatch_content_files = "dispatch_content_files"
+
+
+LEARNING_RESOURCE_TYPES = (
+    COURSE_TYPE,
+    PROGRAM_TYPE,
+    PODCAST_TYPE,
+    PODCAST_EPISODE_TYPE,
+    VIDEO_TYPE,
+    VIDEO_PLAYLIST_TYPE,
+    DOCUMENT_TYPE,
+)
+
+
+BASE_INDEXES = (PERCOLATE_INDEX_TYPE, HYBRID_COMBINED_INDEX)
+
+ALL_INDEX_TYPES = BASE_INDEXES + LEARNING_RESOURCE_TYPES
+
+SCRIPTING_LANG = "painless"
+UPDATE_CONFLICT_SETTING = "proceed"
+
+
+@dataclass
+class FilterConfig:
+    path: str
+    case_sensitive: bool = False
+
+
+SEARCH_FILTERS = {
+    "resource_type": FilterConfig("resource_type"),
+    "certification": FilterConfig("certification"),
+    "certification_type": FilterConfig("certification_type.code"),
+    "professional": FilterConfig("professional"),
+    "free": FilterConfig("free"),
+    "id": FilterConfig("id", case_sensitive=True),
+    "course_feature": FilterConfig("course_feature"),
+    "content_feature_type": FilterConfig("content_feature_type"),
+    "run_id": FilterConfig("run_id", case_sensitive=True),
+    "resource_id": FilterConfig("resource_id", case_sensitive=True),
+    "topic": FilterConfig("topics.name"),
+    "ocw_topic": FilterConfig("ocw_topics"),
+    "level": FilterConfig("runs.level.code"),
+    "department": FilterConfig("departments.department_id"),
+    "platform": FilterConfig("platform.code"),
+    "offered_by": FilterConfig("offered_by.code"),
+    "delivery": FilterConfig("delivery.code"),
+    "resource_type_group": FilterConfig("resource_type_group"),
+    "resource_category": FilterConfig("resource_category"),
+}
+
+SEARCH_NESTED_FILTERS = {
+    "topic": "topics.name",
+    "level": "runs.level.code",
+    "department": "departments.department_id",
+    "platform": "platform.code",
+    "offered_by": "offered_by.code",
+}
+
+ENGLISH_TEXT_FIELD = {
+    "type": "text",
+    "fields": {"english": {"type": "text", "analyzer": "custom_english"}},
+}
+
+ENGLISH_TEXT_FIELD_WITH_SUGGEST = {
+    "type": "text",
+    "fields": {
+        "english": {"type": "text", "analyzer": "custom_english"},
+        "trigram": {"type": "text", "analyzer": "trigram"},
+    },
+}
+
+
+LEARNING_RESOURCE_MAP = {
+    "resource_relations": {"type": "join", "relations": {"resource": "content_file"}},
+    "id": {"type": "long"},
+    "certification": {"type": "boolean"},
+    "certification_type": {
+        "type": "nested",
+        "properties": {
+            "code": {"type": "keyword"},
+            "name": ENGLISH_TEXT_FIELD,
+        },
+    },
+    "free": {"type": "boolean"},
+    "is_learning_material": {"type": "boolean"},
+    "is_incomplete_or_stale": {"type": "boolean"},
+    "delivery": {
+        "type": "nested",
+        "properties": {
+            "code": {"type": "keyword"},
+            "name": {"type": "keyword"},
+        },
+    },
+    "views": {"type": "integer"},
+    "pace": {
+        "type": "nested",
+        "properties": {
+            "code": {"type": "keyword"},
+            "name": {"type": "keyword"},
+        },
+    },
+    "format": {
+        "type": "nested",
+        "properties": {
+            "code": {"type": "keyword"},
+            "name": {"type": "keyword"},
+        },
+    },
+    "readable_id": {"type": "keyword"},
+    "title": ENGLISH_TEXT_FIELD_WITH_SUGGEST,
+    "description": ENGLISH_TEXT_FIELD_WITH_SUGGEST,
+    "full_description": ENGLISH_TEXT_FIELD,
+    "last_modified": {"type": "date"},
+    "created_on": {"type": "date"},
+    "languages": {"type": "keyword"},
+    "image": {
+        "type": "nested",
+        "properties": {
+            "url": {"type": "keyword"},
+            "description": ENGLISH_TEXT_FIELD_WITH_SUGGEST,
+            "alt": ENGLISH_TEXT_FIELD,
+        },
+    },
+    "platform": {
+        "type": "nested",
+        "properties": {
+            "code": {"type": "keyword"},
+            "name": {"type": "keyword"},
+        },
+    },
+    "departments": {
+        "type": "nested",
+        "properties": {
+            "department_id": {"type": "keyword"},
+            "name": {"type": "keyword"},
+            "channel_url": {"type": "keyword"},
+            "school": {
+                "type": "nested",
+                "properties": {
+                    "id": {"type": "long"},
+                    "name": {"type": "keyword"},
+                    "url": {"type": "keyword"},
+                },
+            },
+        },
+    },
+    "professional": {"type": "boolean"},
+    "resource_type": {"type": "keyword"},
+    "resource_category": {"type": "keyword"},
+    "resource_type_group": {"type": "keyword"},
+    "topics": {
+        "type": "nested",
+        "properties": {
+            "id": {"type": "long"},
+            "name": {"type": "keyword"},
+            "channel_url": {"type": "keyword"},
+        },
+    },
+    "ocw_topics": {
+        "type": "keyword",
+        "fields": {"english": {"type": "text", "analyzer": "custom_english"}},
+    },
+    "offered_by": {
+        "type": "nested",
+        "properties": {
+            "code": {"type": "keyword"},
+            "name": {"type": "keyword"},
+            "channel_url": {"type": "keyword"},
+        },
+    },
+    "course_feature": {"type": "keyword"},
+    "course": {
+        "properties": {
+            "course_numbers": {
+                "type": "nested",
+                "properties": {
+                    "value": {"type": "keyword"},
+                    "sort_coursenum": {"type": "keyword"},
+                    "department": {
+                        "properties": {
+                            "department_id": {"type": "keyword"},
+                            "name": {"type": "keyword"},
+                            "channel_url": {"type": "keyword"},
+                            "school": {
+                                "type": "nested",
+                                "properties": {
+                                    "id": {"type": "long"},
+                                    "name": {"type": "keyword"},
+                                    "url": {"type": "keyword"},
+                                },
+                            },
+                        }
+                    },
+                    "primary": {"type": "boolean"},
+                },
+            }
+        }
+    },
+    "podcast_episode": {
+        "properties": {
+            "transcript": ENGLISH_TEXT_FIELD,
+        }
+    },
+    "video": {
+        "properties": {
+            "duration": {"type": "keyword"},
+            "transcript": ENGLISH_TEXT_FIELD,
+        }
+    },
+    "runs": {
+        "type": "nested",
+        "properties": {
+            "id": {"type": "long"},
+            "run_is": {"type": "keyword"},
+            "title": ENGLISH_TEXT_FIELD_WITH_SUGGEST,
+            "description": ENGLISH_TEXT_FIELD_WITH_SUGGEST,
+            "full_description": ENGLISH_TEXT_FIELD,
+            "last_modified": {"type": "date"},
+            "languages": {"type": "keyword"},
+            "slug": {"type": "keyword"},
+            "availability": {"type": "keyword"},
+            "delivery": {
+                "type": "nested",
+                "properties": {
+                    "code": {"type": "keyword"},
+                    "name": {"type": "keyword"},
+                },
+            },
+            "pace": {
+                "type": "nested",
+                "properties": {
+                    "code": {"type": "keyword"},
+                    "name": {"type": "keyword"},
+                },
+            },
+            "format": {
+                "type": "nested",
+                "properties": {
+                    "code": {"type": "keyword"},
+                    "name": {"type": "keyword"},
+                },
+            },
+            "semester": {"type": "keyword"},
+            "year": {"type": "keyword"},
+            "start_date": {"type": "date"},
+            "end_date": {"type": "date"},
+            "enrollment_start": {"type": "date"},
+            "enrollment_end": {"type": "date"},
+            "level": {
+                "type": "nested",
+                "properties": {
+                    "code": {"type": "keyword"},
+                    "name": ENGLISH_TEXT_FIELD,
+                },
+            },
+            "instructors": {
+                "type": "nested",
+                "properties": {
+                    "id": {"type": "long"},
+                    "first_name": {"type": "keyword"},
+                    "last_name": {"type": "keyword"},
+                    "full_name": ENGLISH_TEXT_FIELD,
+                },
+            },
+            "prices": {"type": "scaled_float", "scaling_factor": 100},
+            "resource_prices": {
+                "type": "nested",
+                "properties": {
+                    "amount": {"type": "scaled_float", "scaling_factor": 100},
+                    "currency": {"type": "keyword"},
+                },
+            },
+            "location": {"type": "keyword"},
+        },
+    },
+    "best_run_id": {"type": "long"},
+    "next_start_date": {"type": "date"},
+    "resource_age_date": {"type": "date"},
+    "featured_rank": {"type": "float"},
+    "completeness": {"type": "float"},
+    "license_cc": {"type": "boolean"},
+    "continuing_ed_credits": {"type": "float"},
+    "location": {"type": "keyword"},
+    "resource_prices": {
+        "type": "nested",
+        "properties": {
+            "amount": {"type": "scaled_float", "scaling_factor": 100},
+            "currency": {"type": "keyword"},
+        },
+    },
+    "duration": {"type": "keyword"},
+    "min_weeks": {"type": "integer"},
+    "max_weeks": {"type": "integer"},
+    "time_commitment": {"type": "keyword"},
+    "min_weekly_hours": {"type": "integer"},
+    "max_weekly_hours": {"type": "integer"},
+}
+
+EMBEDDING_FIELDS = {
+    "vector_embedding": {
+        "type": "knn_vector",
+        "space_type": "cosinesimil",
+        "method": {"name": "hnsw", "space_type": "cosinesimil", "engine": "faiss"},
+    }
+}
+
+
+CONTENT_FILE_MAP = {
+    "id": {"type": "long"},
+    "run_id": {"type": "long"},
+    "run_readble_id": {"type": "keyword"},
+    "run_title": ENGLISH_TEXT_FIELD,
+    "run_slug": {"type": "keyword"},
+    "departments": {
+        "type": "nested",
+        "properties": {
+            "department_id": {"type": "keyword"},
+            "name": {"type": "keyword"},
+            "channel_url": {"type": "keyword"},
+            "school": {
+                "type": "nested",
+                "properties": {
+                    "id": {"type": "long"},
+                    "name": {"type": "keyword"},
+                    "url": {"type": "keyword"},
+                },
+            },
+        },
+    },
+    "semester": {"type": "keyword"},
+    "year": {"type": "keyword"},
+    "key": {"type": "keyword"},
+    "uid": {"type": "keyword"},
+    "title": ENGLISH_TEXT_FIELD_WITH_SUGGEST,
+    "description": ENGLISH_TEXT_FIELD_WITH_SUGGEST,
+    "url": {"type": "keyword"},
+    "file_type": {"type": "keyword"},
+    "content_type": {"type": "keyword"},
+    "content_feature_type": {"type": "keyword"},
+    "content": ENGLISH_TEXT_FIELD,
+    "content_title": ENGLISH_TEXT_FIELD,
+    "content_author": ENGLISH_TEXT_FIELD,
+    "content_language": {"type": "keyword"},
+    "image_src": {"type": "keyword"},
+    "resource_id": {"type": "long"},
+    "resource_readable_id": {"type": "keyword"},
+    "course_number": {"type": "keyword"},
+    "offered_by": {
+        "type": "nested",
+        "properties": {
+            "code": {"type": "keyword"},
+            "name": {"type": "keyword"},
+        },
+    },
+    "platform": {
+        "type": "nested",
+        "properties": {
+            "code": {"type": "keyword"},
+            "name": {"type": "keyword"},
+        },
+    },
+    "youtube_id": {"type": "keyword"},
+}
+
+
+PERCOLATE_INDEX_MAP = {"query": {"type": "percolator"}}
+
+LEARNING_RESOURCE_QUERY_FIELDS = [
+    "title.english^3",
+    "description.english^2",
+    "full_description.english",
+    "platform.name",
+    "readable_id",
+    "offered_by",
+    "course_feature",
+    "ocw_topics.english",
+    "video.transcript.english",
+    "podcast_episode.transcript.english",
+]
+
+TOPICS_QUERY_FIELDS = ["topics.name"]
+DEPARTMENT_QUERY_FIELDS = ["departments.department_id", "departments.name"]
+CERTIFICATION_TYPE_QUERY_FIELDS = ["certification_type.name.english^5"]
+
+COURSE_QUERY_FIELDS = [
+    "course.course_numbers.value^5",
+]
+
+RUNS_QUERY_FIELDS = [
+    "runs.year",
+    "runs.semester",
+]
+
+RUN_INSTRUCTORS_QUERY_FIELDS = [
+    "runs.instructors.last_name^5",
+    "runs.instructors.full_name^5",
+]
+
+RUN_LEVEL_QUERY_FIELDS = ["runs.level.name^5"]
+
+
+CONTENT_FILE_QUERY_FIELDS = [
+    "content.english",
+    "title.english",
+    "content_title.english",
+    "description.english",
+    "content_feature_type",
+]
+
+LEARNING_MATERIAL_CONTENT_FILE_QUERY_FIELDS = [
+    "content_files.content.english",
+    "content_files.course_number^5",
+    "content_files.run_title.english^5",
+]
+
+
+LEARNING_MATERIAL_MAP = {
+    "content_files": {"type": "nested", "properties": CONTENT_FILE_MAP},
+    **LEARNING_RESOURCE_MAP,
+}
+
+
+MAPPING = {
+    COURSE_TYPE: {**LEARNING_RESOURCE_MAP, **CONTENT_FILE_MAP},
+    DOCUMENT_TYPE: LEARNING_MATERIAL_MAP,
+    PROGRAM_TYPE: {**LEARNING_RESOURCE_MAP, **CONTENT_FILE_MAP},
+    PODCAST_TYPE: LEARNING_RESOURCE_MAP,
+    PODCAST_EPISODE_TYPE: LEARNING_RESOURCE_MAP,
+    LEARNING_PATH_TYPE: LEARNING_RESOURCE_MAP,
+    VIDEO_TYPE: LEARNING_MATERIAL_MAP,
+    VIDEO_PLAYLIST_TYPE: LEARNING_RESOURCE_MAP,
+    PERCOLATE_INDEX_TYPE: {
+        **PERCOLATE_INDEX_MAP,
+        **LEARNING_MATERIAL_MAP,
+        **CONTENT_FILE_MAP,
+    },
+}
+
+SEARCH_CONN_EXCEPTIONS = (ESConnectionError, UrlTimeoutError)
+
+SOURCE_EXCLUDED_FIELDS = [
+    "created_on",
+    "course.course_numbers.sort_coursenum",
+    "course.course_numbers.primary",
+    "resource_relations",
+    "is_learning_material",
+    "resource_age_date",
+    "featured_rank",
+    "is_incomplete_or_stale",
+    *CONTENT_FILE_LARGE_FIELDS,
+    "vector_embedding",
+    "video.transcript",
+    "podcast_episode.transcript",
+    # Indexed by dynamic mapping until the serializer stopped emitting it;
+    # excluded so existing indices stop returning the raw feed XML in hits.
+    "podcast_episode.rss",
+    *[f"content_files.{field}" for field in CONTENT_FILE_LARGE_FIELDS],
+]
+
+LEARNING_RESOURCE_SEARCH_SORTBY_OPTIONS = {
+    "featured": {
+        "title": "Featured",
+        "sort": "featured_rank",
+    },
+    **LEARNING_RESOURCE_SORTBY_OPTIONS,
+}
+
+SYNONYMS = [
+    "ai, ml, artificial intelligence, machine learning",
+    "math, mathematics",
+    "chem, chemistry",
+    "bio, biology",
+    "econ, economics",
+    "natural language processing, nlp",
+    "large language model, llm",
+    "micromasters, micro masters",
+    "scm, supply chain management",
+]

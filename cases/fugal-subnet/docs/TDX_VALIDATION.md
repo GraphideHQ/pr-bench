@@ -1,0 +1,254 @@
+# Validating Real TDX Attestation
+
+Everything in this repo can be exercised locally except two checks, and they
+are the two that matter most for I8. This document is how to close them.
+
+## What is not covered locally, and why
+
+`scripts/dress_rehearsal.py` runs the real miner and validator against a real
+chain and enforces the entire binding chain — report_data, assigned slice,
+committed head, advertised bundle, exploration assignment, cost consistency.
+Two things it cannot enforce:
+
+| Check | Why not locally |
+|---|---|
+| **DCAP signature chain** | Needs a genuine Intel-signed quote, which needs real TDX silicon |
+| **`measurement_id` match** | Needs real MRTD/RTMR registers, which only a TDX CPU fills in |
+
+A consumer CPU cannot produce either. Intel TDX requires 4th-generation Xeon
+Scalable (Sapphire Rapids) or newer; on anything else there is no
+`/dev/tdx_guest` and no quote generator, so `--live` has nothing to verify.
+
+Mock mode is not a weaker version of these checks — it is their absence. It
+skips exactly DCAP and measurement matching and enforces everything else, which
+is why a mock run is still worth something and why it is not sufficient.
+
+## Provisioning a confidential VM
+
+Pick whichever cloud you already have an account with. Both cost roughly
+$0.20/hour; the whole exercise is under an hour, so budget ~$1.
+
+TDX is only available on 4th-gen Xeon Scalable (Sapphire Rapids) and newer, and
+only in some regions. If a zone rejects the machine type, that zone has no TDX
+capacity — try another rather than changing the type.
+
+### GCP
+
+```bash
+gcloud compute instances create fugal-tdx \
+  --zone=us-central1-a \
+  --machine-type=c3-standard-4 \
+  --confidential-compute-type=TDX \
+  --maintenance-policy=TERMINATE \
+  --image=ubuntu-2404-noble-amd64-v20260903 \
+  --image-project=ubuntu-os-cloud \
+  --boot-disk-size=50GB \
+  --boot-disk-type=pd-balanced
+
+gcloud compute ssh fugal-tdx --zone=us-central1-a
+```
+
+Pin the exact image, not `--image-family`. A family resolves to whatever is
+newest at create time, so two runs a week apart silently boot different kernels
+and produce different RTMR1/RTMR2 — the measurement changing becomes noise
+instead of signal. List what is currently available with:
+
+```bash
+gcloud compute images list \
+  --filter="guestOsFeatures[].type:(TDX_CAPABLE) AND family~ubuntu" \
+  --format="table(name,family)"
+```
+
+`--boot-disk-type=pd-balanced` is also deliberate: TDX instances support
+Balanced Persistent Disk over NVMe only, and being explicit turns a confusing
+boot failure into no failure at all.
+
+### Azure
+
+```bash
+az group create --name fugal-tdx-rg --location eastus2
+
+az vm create \
+  --resource-group fugal-tdx-rg \
+  --name fugal-tdx \
+  --size Standard_DC4es_v5 \
+  --image Canonical:ubuntu-24_04-lts:cvm:latest \
+  --security-type ConfidentialVM \
+  --os-disk-security-encryption-type VMGuestStateOnly \
+  --enable-vtpm true \
+  --enable-secure-boot true \
+  --admin-username azureuser \
+  --generate-ssh-keys
+
+az ssh vm --resource-group fugal-tdx-rg --name fugal-tdx
+```
+
+Ubuntu 24.04 is specified deliberately: its kernel has the configfs-tsm
+interface the quote generator uses, and an older image will not expose it.
+The kernel version moves — 24.04 shipped 6.8 and now ships 6.17.0-1022-gcp —
+which is exactly why the image version is pinned rather than the family, and
+why RTMR1/RTMR2 (and therefore `measurement_id`) change on kernel updates.
+
+## Verify you actually got a TD
+
+Before anything else. Every step below is meaningless if this fails.
+
+```bash
+ls -l /dev/tdx_guest                       # must exist
+ls -d /sys/kernel/config/tsm/report        # the quote interface
+```
+
+If `/dev/tdx_guest` is missing, confidential compute is not enabled on this VM —
+you have an ordinary machine. Delete it and re-create with the flags above.
+
+If the configfs path is missing but `/dev/tdx_guest` exists, load the module:
+
+```bash
+sudo modprobe tsm 2>/dev/null || true
+sudo mount -t configfs none /sys/kernel/config 2>/dev/null || true
+ls -d /sys/kernel/config/tsm/report
+```
+
+## Get a raw quote before running any of this repo's code
+
+Do this first. It proves the kernel path works, so that if
+`tdx_measurement.py` then fails you know the fault is ours and not the guest's.
+
+```bash
+sudo mkdir /sys/kernel/config/tsm/report/test0
+cat /sys/kernel/config/tsm/report/test0/provider          # expect: tdx_guest
+sudo sh -c 'dd if=/dev/urandom bs=64 count=1 > /sys/kernel/config/tsm/report/test0/inblob'
+sudo sh -c 'wc -c < /sys/kernel/config/tsm/report/test0/outblob'   # expect ~4-5 KB
+sudo rmdir /sys/kernel/config/tsm/report/test0
+```
+
+`No such device or address` on the `mkdir` means configfs-tsm is not wired up in
+this guest, and nothing downstream can work. A quote of a few hundred bytes
+means something answered but it is not a TDX v4 quote — `parse_quote` will
+reject it, correctly.
+
+## Setup
+
+```bash
+sudo apt-get update && sudo apt-get install -y git curl
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+
+git clone https://github.com/fugal-ai/fugal-subnet.git
+cd fugal-subnet
+uv sync --extra tee                        # installs dcap-qvl, pinned
+```
+
+`dcap-qvl` is a declared dependency of the `tee` extra, not a manual install. A
+validator running `--live` without it cannot verify any attestation.
+
+## Getting the measurement of your image
+
+`FUGAL_TEE_MEASUREMENTS` holds entries of the form `<base>:<app_identity>`.
+The base is `measurement_id()` — `sha256(MRTD || RTMR1 || RTMR2)`, see
+`fugal_subnet/tee/attestation.py`. It is **not** a source hash, and deliberately
+not anything the workload writes about itself: the whole point is that an
+attacker running modified code inside a genuine TD produces a valid quote, and
+only the measurement registers distinguish them.
+
+RTMR0 is excluded because it records the host-chosen virtual hardware
+configuration (vCPU count, memory), which proves nothing about the code and
+would fork the approved list by instance size. RTMR3 is excluded because it is
+application-extendable and includes per-deploy values; what is approved from it
+is the `compose-hash` event replayed out of the log, which is the `app_identity`
+half of the entry. Measured on GCP `c3` with the dstack 0.6.0-rc0 image, across
+three deploys and two instance sizes in September 2026, the base was
+
+    12a1f2f56907f80576be553f3d71031ec86f2848877ac05c82db5d8627fc9141
+
+and on two fresh deploys on **2026-11-03** it is
+
+    f4be9383e31c6cc87707b2b01ace9114ed958435b524425677e63d65065aa427
+
+with RTMR1 and RTMR2 identical between the two dates and MRTD/RTMR0 changed:
+the image is the same, the cloud's TDX firmware is not. The base is a
+measurement of image **and** platform; take it from a live TD when you publish.
+
+Run this on the TD to print the measurement of the image you are about to
+approve. Quote generation needs write access to configfs, so run it as root:
+
+```bash
+sudo -E $(which uv) run python scripts/tdx_measurement.py
+```
+
+That is the `base` half. The `app_identity` half is the compose hash of the
+frozen `app-compose.json` the miner image was deployed with
+(`scripts/compute_app_identity.py --compose deploy/dstack/app-compose.frozen-<date>.json
+--base <base>` prints the full entry). Add the PAIR to the validator's
+environment:
+
+```bash
+export FUGAL_TEE_MEASUREMENTS=<base>:<compose_hash>
+```
+
+A bare `<base>` is refused by `--live` at startup, and `verify_proof` rejects a
+proof that matches only a bare base. A bare base approves any application on
+the image, and the application is what fixes the model upstream — see
+`docs/INVARIANTS.md`, "The model upstream is miner-controlled".
+
+Publish it for other validators the same way any consensus parameter is
+published — a change to this list is a change to what code the subnet accepts.
+
+## The two checks
+
+```bash
+sudo -E $(which uv) run python scripts/tdx_measurement.py --verify
+```
+
+This asserts what cannot be asserted anywhere else:
+
+1. A genuine quote from this machine passes `verify_dcap()` against Intel's
+   collateral.
+2. `verify_proof(..., mock=False)` **rejects** a proof whose measurement is not
+   on the approved list — the "modified harness in a real TDX VM" attack from
+   `run_tee_attacks.py`, which is blocked there against a synthetic quote and
+   should be blocked here against a real one.
+
+Both passed on 2026-09-07 on GCP `c3` under dstack 0.6.0-rc0
+(`MAINNET_LAUNCH.md`, "What is still unverified"); re-run them on the reviewed
+runtime before launch. The second is the one that matters: passing DCAP only
+proves the hardware is real.
+
+## Tearing down
+
+Do not leave a confidential VM running.
+
+```bash
+# GCP
+gcloud compute instances delete fugal-tdx --zone=us-central1-a --quiet
+
+# Azure
+az group delete --name fugal-tdx-rg --yes --no-wait
+```
+
+## Running live
+
+```bash
+# Miner: a dstack TD running deploy/dstack/docker-compose.yaml, provisioned with
+# scripts/provision_td.py (MINER_GUIDE, "Running Under dstack"). A --live miner
+# on a stock VM produces a quote with no compose-hash event and is rejected.
+
+# Validator (does not need TDX — it verifies, it does not attest). Also needs
+# the tee extra installed, data/reference_frame.json present and
+# FUGAL_EPOCH_INTERVAL equal to tempo x 12 (MAINNET_LAUNCH §0-2).
+FUGAL_TEE_MEASUREMENTS=<base>:<compose_hash> FUGAL_EPOCH_INTERVAL=4320 \
+  python neurons/validator.py --netuid <N> --live
+```
+
+Validators do not need confidential hardware. Only miners do.
+
+## What to record
+
+Capture, for the record:
+
+- the `measurement_id` and which image produced it
+- the output of `--verify`, both checks
+- one full `reveal.json` from a live epoch
+
+That set is what lets a third party confirm the subnet was verifying
+attestations rather than accepting assertions.

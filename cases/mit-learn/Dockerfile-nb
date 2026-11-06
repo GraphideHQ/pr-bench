@@ -1,0 +1,10 @@
+FROM mit-learn-web
+
+USER root
+
+WORKDIR /tmp
+
+RUN uv pip install --force-reinstall jupyter
+
+USER mitodl
+WORKDIR /src

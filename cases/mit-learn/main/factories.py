@@ -1,0 +1,77 @@
+"""
+Factory for Users
+"""
+
+import uuid
+
+import ulid
+from django.conf import settings
+from factory import (
+    Faker,
+    LazyFunction,
+    RelatedFactory,
+    SelfAttribute,
+    Sequence,
+    SubFactory,
+    Trait,
+)
+from factory.django import DjangoModelFactory
+from factory.fuzzy import FuzzyText
+
+from main.models import TaskBatch, TaskJob
+
+
+class UserFactory(DjangoModelFactory):
+    """Factory for Users"""
+
+    username = LazyFunction(lambda: ulid.new().str)
+    email = FuzzyText(suffix="@example.com")
+    first_name = Faker("first_name")
+    last_name = Faker("last_name")
+
+    profile = RelatedFactory("profiles.factories.ProfileFactory", "user")
+
+    scim_external_id = Faker("uuid4")
+    scim_username = SelfAttribute("email")
+
+    global_id = SelfAttribute("scim_external_id")
+
+    unsubscribe_uuid = LazyFunction(uuid.uuid4)
+
+    class Meta:
+        model = settings.AUTH_USER_MODEL
+        skip_postgeneration_save = True
+
+    class Params:
+        no_profile = Trait(profile=None)
+
+
+class GroupFactory(DjangoModelFactory):
+    """Factory for Groups"""
+
+    name = FuzzyText()
+
+    class Meta:
+        model = "auth.Group"
+
+
+class TaskJobFactory(DjangoModelFactory):
+    """Factory for TaskJobs"""
+
+    task_name = FuzzyText()
+    params = LazyFunction(dict)
+
+    class Meta:
+        model = TaskJob
+
+
+class TaskBatchFactory(DjangoModelFactory):
+    """Factory for TaskBatches"""
+
+    job = SubFactory(TaskJobFactory)
+    batch_key = Sequence(lambda n: f"batch:{n}")
+    kind = FuzzyText()
+    params = LazyFunction(dict)
+
+    class Meta:
+        model = TaskBatch

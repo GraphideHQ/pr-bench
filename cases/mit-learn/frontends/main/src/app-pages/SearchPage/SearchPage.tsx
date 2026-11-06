@@ -1,0 +1,297 @@
+"use client"
+import { keyBy } from "lodash"
+
+import React, { useCallback, useMemo, useEffect, useState } from "react"
+import type {
+  FacetManifest,
+  UseResourceSearchParamsProps,
+} from "@mitodl/course-search-utils"
+import { useSetSearchParams } from "@mitodl/course-search-utils/next"
+import { useAppSearchParams } from "@/common/useAppSearchParams"
+import { useResourceSearchParams } from "@mitodl/course-search-utils"
+import { useTrackedFilterSetters } from "@/common/analytics/searchFilters"
+import SearchDisplay from "@/page-components/SearchDisplay/SearchDisplay"
+import {
+  AdminTitleContainer,
+  ExplanationContainer,
+} from "@/page-components/SearchDisplay/adminStyles"
+import HybridSearchDisplay from "@/page-components/SearchDisplay/HybridSearchDisplay"
+import { styled, Container, theme, Typography } from "ol-components"
+import { Checkbox, VisuallyHidden } from "@mitodl/smoot-design"
+import { SearchField } from "@/page-components/SearchField/SearchField"
+import { useOfferorsList } from "api/hooks/learningResources"
+import { defaultFacetNames, getExtraFacetNames } from "./searchRequests"
+import getFacetManifest from "@/page-components/SearchDisplay/getFacetManifest"
+import dynamic from "next/dynamic"
+import { useUserMe } from "api/hooks/user"
+import { useHybridSearchEnabled } from "@/common/useHybridSearchEnabled"
+
+const LearningResourceDrawer = dynamic(
+  () =>
+    import("@/page-components/LearningResourceDrawer/LearningResourceDrawer"),
+)
+
+const cssGradient = `
+  linear-gradient(
+    to bottom,
+    ${theme.custom.colors.lightGray2} 0%,
+    ${theme.custom.colors.lightGray1} 165px
+  )
+`
+
+const Page = styled.div`
+  background: ${cssGradient};
+
+  ${({ theme }) => theme.breakpoints.up("md")} {
+    background:
+      url("/images/search_page_vector.png") no-repeat top left / 35%,
+      ${cssGradient};
+  }
+`
+
+const Header = styled.div`
+  height: 165px;
+
+  ${({ theme }) => theme.breakpoints.down("md")} {
+    height: 75px;
+  }
+
+  display: flex;
+  align-items: center;
+`
+
+const SearchFieldContainer = styled(Container)({
+  display: "flex",
+  justifyContent: "center",
+})
+
+const SearchFieldWrapper = styled.div(({ theme }) => ({
+  position: "relative",
+  [theme.breakpoints.down("sm")]: {
+    width: "100%",
+  },
+  [theme.breakpoints.up("sm")]: {
+    width: "570px",
+  },
+}))
+
+const StyledSearchField = styled(SearchField)({
+  width: "100%",
+})
+
+const constantSearchParams = {}
+
+const useFacetManifest = (
+  resourceTypeGroup: string | null,
+  extraFacetNames: string[],
+) => {
+  const offerorsQuery = useOfferorsList()
+  const offerors = useMemo(() => {
+    return keyBy(offerorsQuery.data?.results ?? [], (o) => o.code)
+  }, [offerorsQuery.data?.results])
+  const facetManifest = useMemo(
+    () => getFacetManifest(offerors, resourceTypeGroup, extraFacetNames),
+    [offerors, resourceTypeGroup, extraFacetNames],
+  )
+  return facetManifest
+}
+
+const SearchPage: React.FC = () => {
+  const searchParams = useAppSearchParams()
+  const setSearchParams = useSetSearchParams()
+  const extraFacetNames = useMemo(
+    () => getExtraFacetNames(searchParams, defaultFacetNames) ?? [],
+    [searchParams],
+  )
+  // Facets shown by default plus any additional facets present in the URL.
+  const augmentedFacetNames = useMemo(
+    () =>
+      [
+        ...(defaultFacetNames ?? []),
+        ...extraFacetNames,
+      ] as UseResourceSearchParamsProps["facets"],
+    [extraFacetNames],
+  )
+  // The professional toggle is not aggregated, but must be treated as a facet
+  // so "Clear all filters" resets it.
+  const searchParamFacets = useMemo(
+    () =>
+      [
+        ...(augmentedFacetNames ?? []),
+        "professional",
+      ] as UseResourceSearchParamsProps["facets"],
+    [augmentedFacetNames],
+  )
+  const facetManifest = useFacetManifest(
+    searchParams.get("resource_type_group"),
+    extraFacetNames,
+  )
+  const isHybridSearch = useHybridSearchEnabled()
+  const [fetchTime, setFetchTime] = useState<number | null>(null)
+  const { data: user } = useUserMe()
+
+  const vectorSearchAdminOption = (
+    <>
+      <AdminTitleContainer>Vector Hybrid Search</AdminTitleContainer>
+      <Checkbox
+        // smoot-design's Checkbox renders a bare input unless given `label`;
+        // it does not forward aria-label.
+        label="Use hybrid search"
+        checked={isHybridSearch}
+        onChange={(e) =>
+          setSearchParams((prev) => {
+            const next = new URLSearchParams(prev)
+            // Set explicitly either way: hybrid search is the default, so
+            // unchecking has to override the flag rather than clear the param.
+            next.set("vector_search", e.target.checked ? "true" : "false")
+            return next
+          })
+        }
+      />
+      <ExplanationContainer>
+        Hybrid search is the default. Uncheck to compare against the OpenSearch
+        endpoint.
+      </ExplanationContainer>
+    </>
+  )
+
+  const formatFetchTime = (ms: number) => {
+    if (ms > 1000) {
+      return `${(ms / 1000).toFixed(2)}s`
+    }
+    return `${Math.round(ms)}ms`
+  }
+
+  const setPage = useCallback(
+    (newPage: number) => {
+      setSearchParams((current) => {
+        const copy = new URLSearchParams(current)
+        if (newPage === 1) {
+          copy.delete("page")
+        } else {
+          copy.set("page", newPage.toString())
+        }
+        return copy
+      })
+    },
+    [setSearchParams],
+  )
+
+  const onFacetsChange = useCallback(() => {
+    setPage(1)
+  }, [setPage])
+
+  const {
+    params,
+    hasFacets,
+    clearAllFacets,
+    toggleParamValue: rawToggleParamValue,
+    currentText,
+    setCurrentText,
+    setCurrentTextAndQuery,
+    setParamValue: rawSetParamValue,
+  } = useResourceSearchParams({
+    searchParams,
+    setSearchParams,
+    facets: searchParamFacets,
+    onFacetsChange,
+  })
+
+  /* Wrapped here rather than inside the results display, so every page hands
+     its controls setters that report what they change -- see
+     `useTrackedFilterSetters`. */
+  const { setParamValue, toggleParamValue } = useTrackedFilterSetters({
+    setParamValue: rawSetParamValue,
+    toggleParamValue: rawToggleParamValue,
+  })
+
+  const page = +(searchParams.get("page") ?? "1")
+
+  useEffect(() => {
+    setCurrentText(params.q ?? "")
+  }, [params, setCurrentText])
+
+  return (
+    <Page>
+      <LearningResourceDrawer />
+      <VisuallyHidden>
+        <h1>Search</h1>
+      </VisuallyHidden>
+      <Header>
+        <SearchFieldContainer>
+          <SearchFieldWrapper>
+            <StyledSearchField
+              value={currentText}
+              size="large"
+              onChange={(e) => setCurrentText(e.target.value)}
+              onSubmit={(e) => {
+                setCurrentTextAndQuery(e.target.value)
+              }}
+              onClear={() => {
+                setCurrentTextAndQuery("")
+              }}
+              setPage={setPage}
+            />
+            {user?.is_learning_path_editor && fetchTime !== null && (
+              <Typography
+                variant="body3"
+                color="text.secondary"
+                sx={{
+                  position: "absolute",
+                  left: "100%",
+                  top: "50%",
+                  transform: "translateY(-50%)",
+                  paddingLeft: "16px",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                Search took {formatFetchTime(fetchTime)}
+              </Typography>
+            )}
+          </SearchFieldWrapper>
+        </SearchFieldContainer>
+      </Header>
+      {isHybridSearch ? (
+        <HybridSearchDisplay
+          onFetchTimeChange={setFetchTime}
+          filterHeadingEl="h2"
+          resultsHeadingEl="h2"
+          page={page}
+          setSearchParams={setSearchParams}
+          requestParams={params}
+          setPage={setPage}
+          facetManifest={facetManifest as FacetManifest}
+          facetNames={augmentedFacetNames}
+          constantSearchParams={constantSearchParams}
+          hasFacets={hasFacets}
+          setParamValue={setParamValue}
+          clearAllFacets={clearAllFacets}
+          toggleParamValue={toggleParamValue}
+          showProfessionalToggle
+          adminOptionsSlot={vectorSearchAdminOption}
+        />
+      ) : (
+        <SearchDisplay
+          onFetchTimeChange={setFetchTime}
+          filterHeadingEl="h2"
+          resultsHeadingEl="h2"
+          page={page}
+          setSearchParams={setSearchParams}
+          requestParams={params}
+          setPage={setPage}
+          facetManifest={facetManifest as FacetManifest}
+          facetNames={augmentedFacetNames}
+          constantSearchParams={constantSearchParams}
+          hasFacets={hasFacets}
+          setParamValue={setParamValue}
+          clearAllFacets={clearAllFacets}
+          toggleParamValue={toggleParamValue}
+          showProfessionalToggle
+          adminOptionsSlot={vectorSearchAdminOption}
+        />
+      )}
+    </Page>
+  )
+}
+
+export default SearchPage

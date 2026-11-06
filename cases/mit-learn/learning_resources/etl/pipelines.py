@@ -1,0 +1,246 @@
+"""ETL pipelines"""
+
+import logging
+from datetime import datetime
+
+import boto3
+from django.conf import settings
+from toolz import compose, curry
+
+from learning_resources.constants import LearningResourceType
+from learning_resources.etl import (
+    loaders,
+    mitpe,
+    mitxonline,
+    ocw,
+    oll,
+    ovs,
+    podcast,
+    posthog,
+    sloan,
+    xpro,
+)
+from learning_resources.etl.constants import (
+    CourseLoaderConfig,
+    ETLSource,
+    ProgramLoaderConfig,
+)
+from learning_resources.etl.exceptions import ExtractException
+from learning_resources.etl.ownership import CONTENT_FILE, may_write, when_owned
+from learning_resources.models import LearningResource
+
+log = logging.getLogger(__name__)
+
+load_programs = curry(loaders.load_programs)
+load_courses = curry(loaders.load_courses)
+
+COURSE = LearningResourceType.course.name
+PROGRAM = LearningResourceType.program.name
+
+
+mitxonline_programs_etl = when_owned(
+    ETLSource.mitxonline.name,
+    PROGRAM,
+    compose(
+        load_programs(
+            ETLSource.mitxonline.name,
+            config=ProgramLoaderConfig(
+                courses=CourseLoaderConfig(fetch_only=True), prune=True
+            ),
+        ),
+        mitxonline.transform_programs,
+        mitxonline.extract_programs,
+    ),
+)
+mitxonline_courses_etl = when_owned(
+    ETLSource.mitxonline.name,
+    COURSE,
+    compose(
+        load_courses(ETLSource.mitxonline.name, config=CourseLoaderConfig(prune=True)),
+        mitxonline.transform_courses,
+        mitxonline.extract_courses,
+    ),
+)
+
+oll_etl = when_owned(
+    ETLSource.oll.name,
+    COURSE,
+    compose(
+        load_courses(ETLSource.oll.name, config=CourseLoaderConfig(prune=True)),
+        oll.transform,
+        oll.extract,
+    ),
+)
+
+
+sloan_courses_etl = when_owned(
+    ETLSource.see.name,
+    COURSE,
+    compose(
+        load_courses(ETLSource.see.name, config=CourseLoaderConfig(prune=True)),
+        sloan.transform_courses,
+        sloan.extract,
+    ),
+)
+
+
+xpro_programs_etl = when_owned(
+    ETLSource.xpro.name,
+    PROGRAM,
+    compose(
+        load_programs(
+            ETLSource.xpro.name,
+            config=ProgramLoaderConfig(
+                courses=CourseLoaderConfig(fetch_only=True), prune=True
+            ),
+        ),
+        xpro.transform_programs,
+        xpro.extract_programs,
+    ),
+)
+xpro_courses_etl = when_owned(
+    ETLSource.xpro.name,
+    COURSE,
+    compose(
+        load_courses(ETLSource.xpro.name, config=CourseLoaderConfig(prune=True)),
+        xpro.transform_courses,
+        xpro.extract_courses,
+    ),
+)
+
+
+def podcast_etl() -> list[LearningResource]:
+    """Execute the podcast ETL pipeline"""
+    # A podcast and its episodes load together, so legacy needs both types.
+    if not may_write(
+        ETLSource.podcast.name,
+        [LearningResourceType.podcast.name, LearningResourceType.podcast_episode.name],
+    ):
+        return []
+
+    # extract fills tracked_ids as it runs, so load_podcasts must drain the
+    # generator before it reads the list - which its load loop does
+    tracked_ids = []
+    return loaders.load_podcasts(
+        podcast.transform(podcast.extract(tracked_ids=tracked_ids)),
+        tracked_ids=tracked_ids,
+    )
+
+
+def ocw_courses_etl(
+    *,
+    url_paths: list[str],
+    force_overwrite: bool,
+    start_timestamp: datetime | None = None,
+    skip_content_files: bool = settings.OCW_SKIP_CONTENT_FILES,
+):
+    """
+    Sync OCW courses to the database
+
+    Args:
+        url_paths (list of str): The course url paths to process
+        force_overwrite (bool): force incoming course data to overwrite existing data
+        start_timestamp (datetime or None): backpopulate start time
+        skip_content_files (bool): skip loading content files
+    """
+    if not may_write(ETLSource.ocw.name, COURSE):
+        return
+    skip_content_files = skip_content_files or not may_write(
+        ETLSource.ocw.name, CONTENT_FILE
+    )
+
+    s3_resource = boto3.resource(
+        "s3",
+        aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+    )
+    exceptions = []
+    for url_path in url_paths:
+        try:
+            data = ocw.extract_course(
+                url_path=url_path,
+                s3_resource=s3_resource,
+                force_overwrite=force_overwrite,
+                start_timestamp=start_timestamp,
+            )
+            if data:
+                ocw_course_data = ocw.transform_course(data)
+                course_resource = loaders.load_course(ocw_course_data)
+                course_run = course_resource.runs.filter(published=True).first()
+
+                if course_resource and not skip_content_files:
+                    content_file_ids = loaders.load_content_files(
+                        course_run,
+                        ocw.transform_content_files(
+                            s3_resource, url_path, force_overwrite
+                        ),
+                        calc_completeness=True,
+                    )
+
+                    if content_file_ids:
+                        loaders.load_learning_materials(course_run, content_file_ids)
+            else:
+                log.info("No course data found for %s", url_path)
+        except:  # noqa: E722
+            log.exception("Error encountered parsing OCW json for %s", url_path)
+            exceptions.append(url_path)
+    if exceptions:
+        message = "Some OCW urls raised errors: {exception}".format(
+            exception=",".join(exceptions)
+        )
+        raise ExtractException(message)
+
+
+ovs_etl = when_owned(
+    ETLSource.ovs.name,
+    [LearningResourceType.video_playlist.name, LearningResourceType.video.name],
+    compose(loaders.load_ovs_playlists, ovs.transform, ovs.extract),
+)
+
+posthog_etl = compose(
+    posthog.load_posthog_lrd_view_events,
+    posthog.posthog_transform_lrd_view_events,
+    posthog.posthog_extract_lrd_view_events,
+)
+
+
+def mitpe_etl() -> tuple[list[LearningResource], list[LearningResource]]:
+    """
+    ETL for professional education courses and programs.
+
+    This pipeline is structured a bit differently than others because the source API
+    and the transform/extract functions return both courses and programs.
+    """
+    owns_courses = may_write(ETLSource.mitpe.name, COURSE)
+    owns_programs = may_write(ETLSource.mitpe.name, PROGRAM)
+    if not (owns_courses or owns_programs):
+        return [], []
+
+    courses_data, programs_data = mitpe.transform(mitpe.extract())
+    return (
+        loaders.load_courses(
+            ETLSource.mitpe.name, courses_data, config=CourseLoaderConfig(prune=True)
+        )
+        if owns_courses
+        else [],
+        loaders.load_programs(
+            ETLSource.mitpe.name,
+            programs_data,
+            config=ProgramLoaderConfig(prune=True, courses=CourseLoaderConfig()),
+        )
+        if owns_programs
+        else [],
+    )
+
+
+def mit_climate_etl() -> list[dict]:
+    """
+    ETL for MIT Climate articles.
+    """
+    from learning_resources.etl.mit_climate import extract_articles
+
+    if not may_write(ETLSource.mit_climate.name, LearningResourceType.document.name):
+        return []
+
+    articles_data = extract_articles()
+    return loaders.load_documents(ETLSource.mit_climate.name, articles_data)

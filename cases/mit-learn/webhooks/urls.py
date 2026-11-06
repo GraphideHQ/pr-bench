@@ -1,0 +1,34 @@
+from django.urls import include, re_path
+from rest_framework.routers import SimpleRouter
+
+from webhooks import views
+
+app_name = "webhooks"
+router = SimpleRouter()
+
+v1_urls = [
+    re_path(
+        r"^content_files/$",
+        views.ContentFileWebhookView.as_view(),
+        name="content_file_webhook",
+    ),
+    re_path(
+        r"^content_files/delete/",
+        views.ContentFileDeleteWebhookView.as_view(),
+        name="content_file_delete_webhook",
+    ),
+    re_path(
+        r"^ovs_videos/$",
+        views.OVSVideoWebhookView.as_view(),
+        name="ovs_video_webhook",
+    ),
+    re_path(
+        r"^learning_resources/$",
+        views.LearningResourceWebhookView.as_view(),
+        name="learning_resources_webhook",
+    ),
+]
+
+urlpatterns = [
+    re_path(r"^api/v1/webhooks/", include((v1_urls, "v1"))),
+]

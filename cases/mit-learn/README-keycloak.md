@@ -1,0 +1,136 @@
+# Keycloak and APISIX Integration
+
+The "docker-compose.services.yml" file includes Keycloak and APISIX containers
+that you can use for authentication instead of spinning up separate ones or
+using the deployed instances. It's not enabled by default, but you can run it if
+you prefer not to run your own Keycloak/APISIX instances.
+
+## Default Settings
+
+There are some defaults that are part of this.
+
+_SSL Certificate_: There's a self-signed cert that's in `config/keycloak/tls` -
+if you'd rather set up your own (or you have a real cert or something to use),
+you can drop the PEM files in there. See the README there for info.
+
+_Realm_: There's a `ol-local-realm.json` in `config/keycloak` that will get
+loaded by Keycloak when it starts up, and will set up a realm for you with some
+users and a client so you don't have to set it up yourself. The realm it creates
+is called `ol-local`.
+
+The users it sets up are:
+
+| User                | Password  |
+| ------------------- | --------- |
+| `student@odl.local` | `student` |
+| `prof@odl.local`    | `prof`    |
+| `admin@odl.local`   | `admin`   |
+
+The client it sets up is called `apisix`. You can change the passwords and get
+the secret in the admin.
+
+## Making it Work
+
+The Keycloak instance is part of the `keycloak` profile in the Composer file, so
+be sure that you have the following set in your .env file:
+`COMPOSE_PROFILES=backend,frontend,keycloak,apisix`. (If you
+start the app without the profile, you can still start Keycloak later by
+specifying the profile.)
+
+`DISABLE_APISIX_USER_MIDDLEWARE=True` is the default in `env/backend.env`
+(without APISIX actually running, nothing verifies the `X-Userinfo` header
+Django would otherwise trust, so this is disabled unless you opt in). Add
+`DISABLE_APISIX_USER_MIDDLEWARE=False` to your `backend.local.env` file so
+Django will trust the header APISIX sets after a real Keycloak login.
+
+When you run `docker compose up`, the Keycloak and APISIX containers should start up.
+APISIX is on port 8065, Keycloak on port 8066. Now you should be able to log in at
+`https://open.odl.local:8065/login` with one of the users mentioned above, or
+just click "Log in" from the home page at http://open.odl.local:8062. Try
+logging out and back in a couple times to make sure it works.
+
+Not using Keycloak/APISIX is the default (`DISABLE_APISIX_USER_MIDDLEWARE=True`,
+`COMPOSE_PROFILES=backend,frontend`) -- no extra steps needed. If you've
+already switched into Keycloak/APISIX mode above and want to switch back:
+
+1. Change the value of `MITOL_API_BASE_URL` to `http://api.open.odl.local:8063`
+   in your `shared.local.env` file.
+2. Set `COMPOSE_PROFILES=backend,frontend` in your .env file
+3. Remove (or set to `True`) `DISABLE_APISIX_USER_MIDDLEWARE` in your
+   `backend.local.env` file
+
+### Changing email and password
+
+The settings page at `/dashboard/settings` lets users change their email and
+password by handing off to Keycloak ("application initiated actions"). Two
+things have to be in place for `kc_action=UPDATE_EMAIL` to work:
+
+1. Keycloak must be started with the `update-email` feature. `UPDATE_EMAIL` is
+   still a preview feature, so it is listed explicitly in the `keycloak`
+   service's `--features` flag in `docker-compose.services.yml`.
+2. The `UPDATE_EMAIL` required action must be registered in the realm. It is in
+   `config/keycloak/realms/ol-local-realm.json`, but `--import-realm` skips
+   realms that already exist in the database. If you set Keycloak up before this
+   was added, register it once via Keycloak admin
+   (Authentication → Required actions → Register → Update Email), or reset the
+   Keycloak database so the realm re-imports.
+
+Without both, Keycloak fails the request with a generic "Unexpected error when
+handling authentication request to identity provider" page, and its logs show
+`NullPointerException ... "requiredActionProvider" is null`.
+
+`UPDATE_PASSWORD` is a built-in action and needs neither step.
+
+Note that deployed realms have `verify_email` enabled, so submitting the form
+there emails a confirmation link rather than changing the address immediately,
+and the new address reaches Learn when Keycloak pushes it over SCIM. The local
+realm has verification off, so the change applies straight away.
+
+### Controlling user provisioning from APISIX headers
+
+By default, `ApisixUserMiddleware` creates users it hasn't seen before, but does _not_
+update existing users or their profiles from the APISIX userinfo headers. Two settings in
+`backend.local.env` control that:
+
+- `MITOL_APIGATEWAY_USERINFO_CREATE` (defaults to `True`) - controls whether the
+  middleware will create _new_ users. If `False`, users have to be pre-created (for
+  example via SCIM) before they can authenticate; an unknown identity is treated as
+  anonymous.
+- `MITOL_APIGATEWAY_USERINFO_UPDATE` (defaults to `False`) - controls whether the
+  middleware will update _existing_ users. While it is `False`, neither the `User` nor its
+  `Profile` is written from the headers, so a backchannel (SCIM) needs to keep that data
+  in sync with Keycloak. Set it to `True` if nothing else is keeping users up to date.
+
+These names match the settings in
+[mitol-django-apigateway](https://github.com/mitodl/ol-django/tree/main/src/apigateway),
+which this middleware is intended to be replaced by.
+
+### MITx Online integration
+
+The user dashboard at `/dashboard` includes some integration with the MITx Online
+application (https://github.com/mitodl/mitxonline). In order for the same session to
+be shared between the two applications, they need to both be accessed through the same
+instance of APISIX. The dev APISIX configuration (`config/apisix/apisix.yaml`) includes
+two routes:
+
+- MITx Online frontend: Set by `MITX_ONLINE_DOMAIN`, defaulting to `mitxonline.odl.local`, accessed through http://mitxonline.odl.local:8065/
+- Path prefixed API: Set by `MITOL_API_DOMAIN`, defaulting to `open.odl.local`, accessed through http://open.odl.local:8065/mitxonline/
+
+For local development you will need to configure some local DNS entries in your hosts file,
+pointing them at your local IP address. This is necessary so that the APISIX container can
+reach out to both the Learn Django server as well as the MITx Online Django server as upstreams.
+
+Here is an example of what the `hosts` entries might look like, assuming a local IP of 192.168.1.50:
+
+```
+192.168.1.50 open.odl.local
+192.168.1.50 api.open.odl.local
+192.168.1.50 kc.ol.local
+192.168.1.50 mitxonline.odl.local
+```
+
+In your MITx Online application, you will also need to set all the `KEYCLOAK_` prefixed env vars
+to be the same as they are here in MIT Learn. You will also need to set `CORS_ALLOWED_ORIGINS`,
+`CSRF_TRUSTED_ORIGINS` and `ALLOWED_REDIRECT_HOSTS` in both apps to allow them to communicate
+with one another. MITx Online additionally uses `SOCIAL_AUTH_ALLOWED_REDIRECT_HOSTS`; MIT Learn
+does not, since it no longer uses python-social-auth.

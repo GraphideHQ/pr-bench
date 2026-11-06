@@ -1,0 +1,421 @@
+import { env } from "@/env"
+import type {
+  BaseProduct,
+  CourseRunV2,
+  CourseWithCourseRunsSerializerV2,
+  EnrollmentMode,
+  V2ProgramRequirement,
+} from "@mitodl/mitxonline-api-axios/v2"
+import { NodeTypeEnum } from "@mitodl/mitxonline-api-axios/v2"
+import { EnrollmentModeEnum } from "@mitodl/mitxonline-api-axios/v3"
+
+const NEXT_PUBLIC_MITX_ONLINE_LEGACY_BASE_URL = env(
+  "NEXT_PUBLIC_MITX_ONLINE_LEGACY_BASE_URL",
+)
+
+const canPurchaseRun = (run: CourseRunV2): boolean => {
+  // Prefer to handle this on backend
+  // See https://github.com/mitodl/hq/issues/9450
+  return (
+    run.is_enrollable &&
+    !run.is_archived &&
+    run.is_upgradable &&
+    Boolean(run.products?.length)
+  )
+}
+
+/**
+ * Format the numeric part of a price:
+ * ```ts
+ * formatPrice(100) // "$100"
+ * formatPrice(100.5) // "$100.50"
+ * formatPrice(100, { avoidCents: false }) // "$100.00"
+ * formatPrice(100.5, { avoidCents: false }) // "$100.50"
+ * ```
+ */
+const formatPrice = (
+  amount: number | string,
+  { avoidCents = true } = {},
+): string => {
+  const num = Number(amount)
+  const fractionDigits = avoidCents && Number.isInteger(num) ? 0 : 2
+  return num.toLocaleString("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: fractionDigits,
+    maximumFractionDigits: fractionDigits,
+  })
+}
+
+type PriceRange = {
+  min: number
+  max: number
+}
+
+/**
+ * The price range a course or program advertises, or null when it advertises a
+ * single price. `min_price`/`max_price` are CMS-authored; staff set them equal
+ * when there is one price, so a range means `min < max`.
+ */
+const toPriceRange = (resource: {
+  min_price?: number | null
+  max_price?: number | null
+}): PriceRange | null => {
+  const { min_price: min, max_price: max } = resource
+  if (typeof min !== "number" || typeof max !== "number") return null
+  return min < max ? { min, max } : null
+}
+
+/**
+ * Format a price range as `$250 – $1,000`, or as a single price when
+ * `min === max`. The en dash and its surrounding spaces match `getDisplayPrice`
+ * in ol-utilities, so a resource reads the same here as in the resource drawer.
+ */
+const formatPriceRange = (
+  { min, max }: PriceRange,
+  { avoidCents = true } = {},
+): string =>
+  min < max
+    ? `${formatPrice(min, { avoidCents })} – ${formatPrice(max, { avoidCents })}`
+    : formatPrice(min, { avoidCents })
+
+/**
+ * The price to display for a course or program: its advertised range when it has
+ * one, otherwise the price of the product you would actually buy. Falls back to
+ * the advertised price when there is no product, and returns null when neither
+ * is known.
+ */
+const formatResourcePrice = (
+  resource: { min_price?: number | null; max_price?: number | null },
+  productPrice: string | number | null | undefined,
+  { avoidCents = true } = {},
+): string | null => {
+  const range = toPriceRange(resource)
+  if (range) return formatPriceRange(range, { avoidCents })
+  if (productPrice !== null && productPrice !== undefined) {
+    return formatPrice(productPrice, { avoidCents })
+  }
+  const advertised = resource.min_price ?? resource.max_price
+  if (typeof advertised !== "number") return null
+  return formatPrice(advertised, { avoidCents })
+}
+
+/**
+ * Adding the `ecom-service=true` query parameter hides the MITxOnline-branded header
+ * on the MITxOnline site.
+ */
+const ECOM_SERVICE_KEY = "ecom-service"
+const mitxonlineLegacyUrl = (relative: string) => {
+  const url = new URL(relative, NEXT_PUBLIC_MITX_ONLINE_LEGACY_BASE_URL)
+  const search = new URLSearchParams(url.search)
+  search.set(ECOM_SERVICE_KEY, "true")
+  url.search = search.toString()
+  return url.toString()
+}
+
+type EnrollmentType = "none" | "free" | "paid" | "both"
+
+type CourseRunEnrollmentActionNone = { type: "none" }
+type CourseRunEnrollmentActionAudit = {
+  type: "audit"
+  run: CourseRunV2
+}
+type CourseRunEnrollmentActionCheckout = {
+  type: "checkout"
+  run: CourseRunV2
+  product: BaseProduct
+}
+type CourseRunEnrollmentActionDialog = { type: "dialog" }
+
+type CourseEnrollmentAction =
+  | CourseRunEnrollmentActionNone
+  | CourseRunEnrollmentActionAudit
+  | CourseRunEnrollmentActionCheckout
+  | CourseRunEnrollmentActionDialog
+
+const getEnrollmentType = (
+  modes: EnrollmentMode[] | undefined,
+): EnrollmentType => {
+  if (!modes || modes.length === 0) return "none"
+  const hasFree = modes.some((m) => !m.requires_payment)
+  const hasPaid = modes.some((m) => m.requires_payment)
+  if (hasFree && hasPaid) return "both"
+  if (hasFree) return "free"
+  return "paid"
+}
+
+/**
+ * Determine course enrollment action using enrollable runs only.
+ * If there is a choice to be made by the user, open the dialog.
+ * Otherwise, direct them to the appropriate action (audit, checkout, or none).
+ *
+ * Rules:
+ * - Multiple enrollable runs -> dialog
+ * - Single enrollable run with both modes -> dialog
+ * - Single enrollable run with audit only -> one-click enrollment
+ * - Single enrollable run with verified only -> checkout
+ */
+const getCourseEnrollmentAction = (
+  course: CourseWithCourseRunsSerializerV2,
+): CourseEnrollmentAction => {
+  const enrollableRuns = (course.courseruns ?? []).filter(
+    (run) => run.is_enrollable,
+  )
+  const selectedRun = getBestRun(course, { enrollableOnly: true })
+
+  if (!selectedRun) return { type: "none" }
+  if (enrollableRuns.length > 1) return { type: "dialog" }
+
+  const enrollmentType = getEnrollmentType(selectedRun.enrollment_modes)
+  if (enrollmentType === "both") return { type: "dialog" }
+  if (enrollmentType === "free") return { type: "audit", run: selectedRun }
+  if (enrollmentType === "paid") {
+    const product = selectedRun.products?.[0]
+    if (!product) return { type: "none" }
+    return { type: "checkout", run: selectedRun, product }
+  }
+  return { type: "none" }
+}
+
+type ProgramRequirementSection = {
+  /**
+   * The source operator node, returned as a convenience back-reference for
+   * consumers that still need raw-tree operations (e.g. the dashboard's
+   * `getRequirementsProgress(V2ProgramRequirement[])`). It is NOT an invitation
+   * to bypass the derived fields (`items`, `operator`, `requiredCount`,
+   * `rawTitle`, `elective`). Note: `id === node.id` — a convenience stable
+   * identifier.
+   */
+  node: V2ProgramRequirement
+  id: number | null | undefined
+  elective: boolean
+  operator: string | null
+  requiredCount: number
+  rawTitle: string | null
+  items: { type: "course" | "program"; id: number }[]
+}
+
+/**
+ * Parse a program's req_tree into ordered operator sections.
+ *
+ * Structure-only: returns ids + operator metadata + rawTitle.
+ * No default/fallback titles, no display copy, no completion/progress logic,
+ * no entity resolution, no logging. Consumer is responsible for all of that.
+ *
+ * Note: the product `parseReqTree` (`ProductPages/util.ts`) will migrate onto
+ * this helper in a later separate PR — that is why two structurally-similar
+ * functions currently coexist.
+ *
+ * The parser walks the tree recursively for parity with the legacy
+ * `extractResourcesFromNode`. The flat-`req_tree` invariant (operators never
+ * nest operators) makes recursion equivalent to iterating direct children, so
+ * this stays consistent with `getRequirementsProgress`, which counts direct
+ * children only.
+ */
+const parseProgramRequirementSections = (
+  reqTree: V2ProgramRequirement[],
+): ProgramRequirementSection[] => {
+  return reqTree
+    .filter((node) => node.data.node_type === NodeTypeEnum.Operator)
+    .map((node) => {
+      const items: { type: "course" | "program"; id: number }[] = []
+      const walk = (children: V2ProgramRequirement[]) => {
+        for (const child of children) {
+          if (
+            child.data.node_type === NodeTypeEnum.Course &&
+            typeof child.data.course === "number"
+          ) {
+            items.push({ type: "course", id: child.data.course })
+          } else if (
+            child.data.node_type === NodeTypeEnum.Program &&
+            typeof child.data.required_program === "number"
+          ) {
+            items.push({ type: "program", id: child.data.required_program })
+          }
+          if (child.children) walk(child.children)
+        }
+      }
+      walk(node.children ?? [])
+
+      // Mirrors parseReqTree's formula exactly on purpose (including NaN when
+      // operator_value is absent/non-numeric) so the deferred product migration
+      // is a behavior no-op — do not "fix" the NaN path here.
+      const requiredCount =
+        node.data.operator === "min_number_of"
+          ? Number(node.data.operator_value)
+          : items.length
+
+      return {
+        node,
+        id: node.id,
+        elective: node.data.elective_flag ?? false,
+        operator: node.data.operator ?? null,
+        requiredCount,
+        rawTitle: node.data.title ?? null,
+        items,
+      }
+    })
+}
+
+/**
+ * Extract all course and program IDs from a program's req_tree.
+ * This is the single source of truth for which courses/programs belong to a program.
+ */
+const getIdsFromReqTree = (
+  nodes: V2ProgramRequirement[],
+): { courseIds: number[]; programIds: number[] } => {
+  const courseIds: number[] = []
+  const programIds: number[] = []
+  const walk = (children: V2ProgramRequirement[]) => {
+    for (const node of children) {
+      if (
+        node.data.node_type === NodeTypeEnum.Course &&
+        typeof node.data.course === "number"
+      ) {
+        courseIds.push(node.data.course)
+      } else if (
+        node.data.node_type === NodeTypeEnum.Program &&
+        typeof node.data.required_program === "number"
+      ) {
+        programIds.push(node.data.required_program)
+      }
+      if (node.children) walk(node.children)
+    }
+  }
+  walk(nodes)
+  return { courseIds, programIds }
+}
+
+type ProgramTrack = {
+  node: V2ProgramRequirement
+  id: number | null | undefined
+  title: string
+  description: string
+  /** The track's own operator groups, e.g. its required courses and electives. */
+  sections: ProgramRequirementSection[]
+}
+
+type TrackedProgramRequirements = {
+  /** The top-level `min_number_of` operator whose children are the tracks. */
+  container: V2ProgramRequirement
+  /** Top-level sections ordered before the tracks container, e.g. core courses. */
+  sectionsBeforeTracks: ProgramRequirementSection[]
+  tracks: ProgramTrack[]
+  /** Top-level sections ordered after the tracks container, e.g. a capstone. */
+  sectionsAfterTracks: ProgramRequirementSection[]
+}
+
+const isTracksContainer = (node: V2ProgramRequirement): boolean =>
+  node.data.node_type === NodeTypeEnum.Operator &&
+  !!node.children?.length &&
+  node.children.every((child) => child.data.node_type === NodeTypeEnum.Track)
+
+/**
+ * Parse a tracked program's req_tree: a learner completes the top-level groups
+ * plus any one track.
+ *
+ * Returns `null` when the tree has no tracks container, so callers can keep
+ * using `parseProgramRequirementSections` for every other program. mitxonline
+ * allows at most one container; if a tree somehow has more, the first wins and
+ * the rest are treated as ordinary sections.
+ *
+ * `parseProgramRequirementSections` should not be given a tracked tree
+ * directly: it walks the container recursively and returns every track's
+ * courses as one section.
+ */
+const parseTrackedProgramRequirements = (
+  reqTree: V2ProgramRequirement[],
+): TrackedProgramRequirements | null => {
+  const containerIndex = reqTree.findIndex(isTracksContainer)
+  if (containerIndex === -1) return null
+  const container = reqTree[containerIndex]
+
+  const tracks: ProgramTrack[] = (container.children ?? []).map((track) => ({
+    node: track,
+    id: track.id,
+    title: track.data.title ?? "",
+    description: track.data.description ?? "",
+    sections: parseProgramRequirementSections(track.children ?? []),
+  }))
+
+  return {
+    container,
+    sectionsBeforeTracks: parseProgramRequirementSections(
+      reqTree.slice(0, containerIndex),
+    ),
+    tracks,
+    sectionsAfterTracks: parseProgramRequirementSections(
+      reqTree.slice(containerIndex + 1),
+    ),
+  }
+}
+
+export * from "./enrollmentAlert"
+
+/**
+ * Returns the best run for a course.
+ *
+ * Prefers the run matching `next_run_id` among candidates; falls back to the
+ * candidate with the most recent start date (runs without a start date sort
+ * last). This ensures that when `next_run_id` is unset (e.g. non-enrollable
+ * capstone exams), the newest run is shown rather than an arbitrary one.
+ *
+ * @param opts.enrollableOnly - only consider runs where `is_enrollable` is true
+ *   (use this on the dashboard where enrollment is the goal)
+ */
+const getBestRun = (
+  course: CourseWithCourseRunsSerializerV2,
+  opts?: { enrollableOnly?: boolean },
+): CourseRunV2 | undefined => {
+  const { enrollableOnly = false } = opts ?? {}
+  let runs = course.courseruns ?? []
+  if (enrollableOnly) runs = runs.filter((run) => run.is_enrollable)
+
+  if (course.next_run_id !== null && course.next_run_id !== undefined) {
+    const next = runs.find((run) => run.id === course.next_run_id)
+    if (next) return next
+  }
+
+  return runs.reduce<CourseRunV2 | undefined>((best, run) => {
+    if (!best) return run
+    const bestMs = best.start_date ? new Date(best.start_date).getTime() : NaN
+    const runMs = run.start_date ? new Date(run.start_date).getTime() : NaN
+    // Prefer a run with a valid date over one without; among valid dates prefer later.
+    if (isNaN(bestMs) && !isNaN(runMs)) return run
+    if (!isNaN(bestMs) && isNaN(runMs)) return best
+    return runMs > bestMs ? run : best
+  }, undefined)
+}
+
+const isVerifiedEnrollmentMode = (mode?: string | null) => {
+  return mode === EnrollmentModeEnum.Verified
+}
+
+/** Fallback enrollment-failure copy, shared by the enroll areas and dialogs. */
+const ENROLL_FAILURE_MESSAGE =
+  "There was a problem processing your enrollment. Please try again."
+
+export {
+  ENROLL_FAILURE_MESSAGE,
+  formatPrice,
+  formatPriceRange,
+  formatResourcePrice,
+  toPriceRange,
+  canPurchaseRun,
+  mitxonlineLegacyUrl,
+  getEnrollmentType,
+  getCourseEnrollmentAction,
+  getIdsFromReqTree,
+  parseProgramRequirementSections,
+  parseTrackedProgramRequirements,
+  getBestRun,
+  isVerifiedEnrollmentMode,
+}
+export type {
+  PriceRange,
+  EnrollmentType,
+  CourseEnrollmentAction,
+  ProgramRequirementSection,
+  ProgramTrack,
+  TrackedProgramRequirements,
+}

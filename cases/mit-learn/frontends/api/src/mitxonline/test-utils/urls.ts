@@ -1,0 +1,200 @@
+import type { OrdersApiOrdersHistoryListRequest } from "@mitodl/mitxonline-api-axios/v0"
+import type {
+  CoursesApiApiV2CoursesListRequest,
+  CourseCertificatesApiCourseCertificatesRetrieveRequest,
+  ProgramCertificatesApiProgramCertificatesRetrieveRequest,
+  ProgramCollectionsApiProgramCollectionsListRequest,
+  ProgramsApiProgramsListV2Request,
+} from "@mitodl/mitxonline-api-axios/v2"
+import type { CoursesApiCourseVariantRunsV3Request } from "@mitodl/mitxonline-api-axios/v3"
+import { queryify } from "ol-test-utilities"
+import mitxAxios from "../axios"
+
+// Keep these helpers absolute so the shared request mock can distinguish Learn
+// and MITx requests by origin; switching to path-only URLs would reintroduce
+// cross-backend collisions in tests. The base URL is read from the configured
+// axios instance (the single source of truth).
+const getApiBaseUrl = () => mitxAxios.defaults.baseURL
+
+const userMe = {
+  get: () => `${getApiBaseUrl()}/api/v0/users/me`,
+}
+
+const countries = {
+  list: () => `${getApiBaseUrl()}/api/v0/countries/`,
+}
+
+const enrollment = {
+  courseEnrollment: (id?: number) =>
+    `${getApiBaseUrl()}/api/v1/enrollments/${id ? `${id}/` : ""}`,
+  enrollmentsListV1: () => `${getApiBaseUrl()}/api/v1/enrollments/`,
+  enrollmentsListV2: () => `${getApiBaseUrl()}/api/v2/enrollments/`,
+  enrollmentsListV3: () => `${getApiBaseUrl()}/api/v3/enrollments/`,
+}
+
+const programEnrollments = {
+  enrollmentsListV3: () => `${getApiBaseUrl()}/api/v3/program_enrollments/`,
+  programEnrollment: (programId: number) =>
+    `${getApiBaseUrl()}/api/v3/program_enrollments/${programId}/`,
+}
+
+const b2b = {
+  courseEnrollment: (readableId?: string) =>
+    `${getApiBaseUrl()}/api/v0/b2b/enroll/${readableId}/`,
+  dataConsent: (contractId: number) =>
+    `${getApiBaseUrl()}/api/v0/b2b/data_consent/${contractId}/`,
+}
+
+const programs = {
+  programsList: (opts?: ProgramsApiProgramsListV2Request) =>
+    `${getApiBaseUrl()}/api/v2/programs/${queryify(opts, { explode: false })}`,
+  programDetail: (id: number) => `${getApiBaseUrl()}/api/v2/programs/${id}/`,
+}
+
+const programCollections = {
+  programCollectionsList: (
+    opts?: ProgramCollectionsApiProgramCollectionsListRequest,
+  ) => `${getApiBaseUrl()}/api/v2/program-collections/${queryify(opts)}`,
+}
+
+const courses = {
+  coursesList: (opts?: CoursesApiApiV2CoursesListRequest) =>
+    `${getApiBaseUrl()}/api/v2/courses/${queryify(opts, { explode: false })}`,
+  courseOutline: (coursewareId: string) =>
+    `${getApiBaseUrl()}/api/v3/courses/${encodeURIComponent(coursewareId)}/ol_openedx_outline/`,
+  courseVariantRuns: (opts: CoursesApiCourseVariantRunsV3Request) =>
+    `${getApiBaseUrl()}/api/v3/courses/variant_runs/${queryify(opts)}`,
+}
+
+const pages = {
+  coursePages: (readableId: string) =>
+    `${getApiBaseUrl()}/api/v2/pages/?fields=*&type=cms.coursepage&readable_id=${encodeURIComponent(
+      readableId,
+    )}`,
+  programPages: (readableId: string) =>
+    `${getApiBaseUrl()}/api/v2/pages/?fields=*&type=cms.programpage&readable_id=${encodeURIComponent(
+      readableId,
+    )}`,
+}
+
+const organization = {
+  managerOrganizationsList: () =>
+    `${getApiBaseUrl()}/api/v0/b2b/manager/organizations/`,
+}
+
+const b2bAttach = {
+  b2bAttachView: (code: string) =>
+    `${getApiBaseUrl()}/api/v0/b2b/attach/${code}/`,
+}
+
+const contracts = {
+  managerContractDetail: (orgId: number, contractId: number) =>
+    `${getApiBaseUrl()}/api/v0/b2b/manager/organizations/${orgId}/contracts/${contractId}/`,
+  managerContractCodes: (
+    orgId: number,
+    contractId: number,
+    params?: {
+      page?: number
+      page_size?: number
+      search_term?: string
+      status?: string
+    },
+  ) => {
+    // queryify does not filter undefined values, so strip them first to avoid e.g. search_term=undefined in the URL
+    const clean = params
+      ? Object.fromEntries(
+          Object.entries(params).filter(([, v]) => v !== undefined),
+        )
+      : undefined
+    return `${getApiBaseUrl()}/api/v0/b2b/manager/organizations/${orgId}/contracts/${contractId}/codes/${queryify(clean)}`
+  },
+  managerContractBulkAssign: (orgId: number, contractId: number) =>
+    `${getApiBaseUrl()}/api/v0/b2b/manager/organizations/${orgId}/contracts/${contractId}/codes/bulk_assign/`,
+  managerContractCodeRemind: (
+    orgId: number,
+    contractId: number,
+    code: string,
+  ) =>
+    `${getApiBaseUrl()}/api/v0/b2b/manager/organizations/${orgId}/contracts/${contractId}/codes/${code}/remind/`,
+  managerContractCodeRevoke: (
+    orgId: number,
+    contractId: number,
+    code: string,
+  ) =>
+    `${getApiBaseUrl()}/api/v0/b2b/manager/organizations/${orgId}/contracts/${contractId}/codes/${code}/revoke/`,
+  managerContractCodeReassign: (
+    orgId: number,
+    contractId: number,
+    code: string,
+  ) =>
+    `${getApiBaseUrl()}/api/v0/b2b/manager/organizations/${orgId}/contracts/${contractId}/codes/${code}/reassign/`,
+  managerContractSendTestEmail: (orgId: number, contractId: number) =>
+    `${getApiBaseUrl()}/api/v0/b2b/manager/organizations/${orgId}/contracts/${contractId}/codes/send_test_email/`,
+}
+
+const certificates = {
+  courseCertificatesRetrieve: (
+    params: CourseCertificatesApiCourseCertificatesRetrieveRequest,
+  ) => `${getApiBaseUrl()}/api/v2/course_certificates/${params.uuid}/`,
+  programCertificatesRetrieve: (
+    params: ProgramCertificatesApiProgramCertificatesRetrieveRequest,
+  ) => `${getApiBaseUrl()}/api/v2/program_certificates/${params.uuid}/`,
+}
+
+const products = {
+  userPricingDetail: (productId: number) =>
+    `${getApiBaseUrl()}/api/v0/products/${productId}/user_pricing/`,
+}
+
+const baskets = {
+  createFromProduct: (productId: number) =>
+    `${getApiBaseUrl()}/api/v0/baskets/create_from_product/${productId}/`,
+  clear: () => `${getApiBaseUrl()}/api/v0/baskets/clear/`,
+}
+
+const orders = {
+  receipt: (orderId: number) =>
+    `${getApiBaseUrl()}/api/v0/orders/receipt/${orderId}/`,
+  historyList: (params?: OrdersApiOrdersHistoryListRequest) =>
+    `${getApiBaseUrl()}/api/v0/orders/history/${queryify(params)}`,
+  refundRequests: () => `${getApiBaseUrl()}/api/v0/orders/refund-requests/`,
+}
+
+const enrollmentEligibility = {
+  courseRun: (runId: number) =>
+    `${getApiBaseUrl()}/api/v3/course_runs/${runId}/enrollment-eligible/`,
+  program: (programId: number) =>
+    `${getApiBaseUrl()}/api/v3/programs/${programId}/enrollment-eligible/`,
+}
+
+const verifiedProgramEnrollments = {
+  create: (courserunId: string) =>
+    `${getApiBaseUrl()}/api/v2/verified_program_enrollments/${encodeURIComponent(courserunId)}/`,
+}
+
+const notificationPreferences = {
+  get: () => `${getApiBaseUrl()}/api/notification-preferences/`,
+  put: () => `${getApiBaseUrl()}/api/notification-preferences/`,
+}
+
+export {
+  b2b,
+  b2bAttach,
+  userMe,
+  countries,
+  enrollment,
+  programs,
+  programCollections,
+  courses,
+  pages,
+  organization,
+  programEnrollments,
+  contracts,
+  certificates,
+  products,
+  baskets,
+  orders,
+  verifiedProgramEnrollments,
+  enrollmentEligibility,
+  notificationPreferences,
+}

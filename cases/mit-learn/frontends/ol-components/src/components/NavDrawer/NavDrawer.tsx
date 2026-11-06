@@ -1,0 +1,299 @@
+import Drawer, { DrawerProps } from "@mui/material/Drawer"
+import ClickAwayListener from "@mui/material/ClickAwayListener"
+import { FocusTrap } from "@mui/base/FocusTrap"
+import styled from "@emotion/styled"
+import Link from "next/link"
+import React, { ReactElement } from "react"
+import { RiCloseLargeLine } from "@remixicon/react"
+import { ActionButton } from "@mitodl/smoot-design"
+import {
+  HEADER_HEIGHT,
+  HEADER_HEIGHT_MD,
+} from "../ThemeProvider/MITLearnGlobalStyles"
+
+const DrawerContent = styled.div(({ theme }) => ({
+  paddingTop: HEADER_HEIGHT,
+  width: "366px",
+  height: "100%",
+  background: theme.custom.colors.white,
+  borderRight: `1px solid ${theme.custom.colors.lightGray2}`,
+  [theme.breakpoints.down("md")]: {
+    paddingTop: HEADER_HEIGHT_MD,
+  },
+}))
+
+const NavSection = styled.div({
+  display: "flex",
+  flexDirection: "column",
+  alignItems: "flex-start",
+  alignSelf: "stretch",
+  padding: "24px 32px 8px 32px",
+  gap: "12px",
+})
+
+const NavSectionHeader = styled.div<{ hasButton: boolean }>(
+  ({ theme, hasButton }) => [
+    {
+      display: "flex",
+      alignItems: "center",
+      alignSelf: "stretch",
+      color: theme.custom.colors.darkGray1,
+      ...theme.typography.subtitle3,
+    },
+    hasButton && {
+      justifyContent: "space-between",
+      height: "16px",
+    },
+  ],
+)
+
+const NavSectionDivider = styled.hr(({ theme }) => ({
+  border: "none",
+  borderTop: `1px solid ${theme.custom.colors.lightGray2}`,
+  margin: "0 0 4px",
+  width: "100%",
+}))
+
+const NavItemsContainer = styled.div(({ theme }) => ({
+  display: "flex",
+  flexDirection: "column",
+  alignItems: "flex-start",
+  alignSelf: "stretch",
+  gap: "12px",
+  color: theme.custom.colors.silverGrayDark,
+}))
+
+const NavItemLink = styled(Link)({
+  display: "flex",
+  alignItems: "flex-start",
+  alignSelf: "stretch",
+  textDecoration: "none !important",
+})
+
+const NavItemContainer = styled.div(({ theme }) => ({
+  display: "flex",
+  padding: "4px 0",
+  alignItems: "flex-start",
+  alignSelf: "stretch",
+  gap: "16px",
+  "&:hover": {
+    color: theme.custom.colors.darkGray2,
+    ".nav-link-icon": {
+      opacity: "1",
+    },
+    ".nav-link-text": {
+      color: theme.custom.colors.red,
+      textDecorationLine: "underline",
+      textDecorationColor: theme.custom.colors.red,
+    },
+  },
+}))
+
+const NavIconContainer = styled.div({
+  display: "flex",
+  alignItems: "flex-start",
+})
+
+const NavTextContainer = styled.div({
+  display: "flex",
+  flex: "1 0 0",
+  flexDirection: "column",
+  alignItems: "flex-start",
+  alignSelf: "center",
+  gap: "4px",
+})
+
+const CloseButton = styled(ActionButton)(({ theme }) => ({
+  svg: { fontSize: "18px" },
+  color: theme.custom.colors.darkGray1,
+  transform: "translateX(12px)",
+}))
+
+const NavLinkText = styled.div(({ theme }) => ({
+  color: theme.custom.colors.darkGray2,
+  ...theme.typography.subtitle3,
+}))
+
+const NavLinkDescription = styled.div(({ theme }) => ({
+  alignSelf: "stretch",
+  ...theme.typography.body3,
+}))
+
+export interface NavData {
+  sections: NavSection[]
+}
+
+interface NavSection {
+  title?: string
+  divider?: boolean
+  items: NavItem[]
+}
+
+interface NavItem {
+  title: string
+  icon?: ReactElement
+  description?: string
+  href: string
+  posthogEvent?: string
+}
+
+type NavItemProps = NavItem & {
+  onClick?: () => void
+}
+
+const NavItem: React.FC<NavItemProps> = (props) => {
+  const { title, icon, description, href, onClick } = props
+
+  const navItem = (
+    <NavItemContainer>
+      <NavIconContainer style={{ paddingTop: description ? "4px" : "" }}>
+        {icon}
+      </NavIconContainer>
+      <NavTextContainer>
+        <NavLinkText className="nav-link-text" data-testid="nav-link-text">
+          {title}
+        </NavLinkText>
+        {description ? (
+          <NavLinkDescription data-testid="nav-link-description">
+            {description}
+          </NavLinkDescription>
+        ) : null}
+      </NavTextContainer>
+    </NavItemContainer>
+  )
+  return (
+    <NavItemLink href={href} onClick={onClick} data-testid="nav-link">
+      {navItem}
+    </NavItemLink>
+  )
+}
+
+type NavDrawerProps = {
+  navData: NavData
+  onClose: () => void
+  /**
+   * Returns a list of HTMLElements that should not trigger the drawer to close
+   * on click-away
+   */
+  getClickAwayExcluded?: () => (Element | null)[]
+  posthogCapture?: (event: string) => void
+} & DrawerProps
+
+const NavDrawer = ({
+  navData,
+  onClose,
+  getClickAwayExcluded = () => [],
+  posthogCapture,
+  ...others
+}: NavDrawerProps) => {
+  const navSections = navData.sections.map((section, i) => {
+    const navItemElements = section.items.map((item) => (
+      <NavItem
+        key={item.title}
+        title={item.title}
+        icon={item.icon}
+        description={item.description}
+        href={item.href}
+        posthogEvent={item.posthogEvent}
+        onClick={() => {
+          if (item.posthogEvent && posthogCapture) {
+            posthogCapture(item.posthogEvent)
+          }
+          onClose()
+        }}
+      />
+    ))
+    // The close button lives in the first section's header, so a section
+    // without a title must not be first.
+    const showHeader = Boolean(section.title) || i === 0
+    return (
+      <NavSection key={section.title || `section-${i}`}>
+        {section.divider ? <NavSectionDivider /> : null}
+        {showHeader ? (
+          <NavSectionHeader hasButton={i === 0}>
+            {section.title}
+            {i === 0 && (
+              <CloseButton
+                aria-label="Close Navigation"
+                onClick={onClose}
+                variant="text"
+                size="small"
+              >
+                <RiCloseLargeLine aria-hidden />
+              </CloseButton>
+            )}
+          </NavSectionHeader>
+        ) : null}
+        <NavItemsContainer>{navItemElements}</NavItemsContainer>
+      </NavSection>
+    )
+  })
+
+  return (
+    /**
+     * ClickAwayListener + FocusTrap ensure the drawer behaves like a modal:
+     *  - clicking outside the drawer closes it
+     *  - the drawer traps focus
+     *
+     * But the drawer is persistent in that:
+     *  - Events (clicks, scrolls) outside the drawer fire on the underlying
+     *    content, not on an overlay element.
+     */
+    <ClickAwayListener
+      onClickAway={(e) => {
+        if (!others.open) return
+        const excluded = getClickAwayExcluded()
+        const target = e.target
+        if (
+          target instanceof Element &&
+          excluded?.some((el) => el?.contains(target))
+        ) {
+          return
+        }
+        onClose()
+      }}
+    >
+      <div role="presentation">
+        <Drawer
+          anchor="left"
+          variant="persistent"
+          elevation={0}
+          hideBackdrop={true}
+          PaperProps={{
+            sx: {
+              borderRight: "none",
+              boxShadow: "0px 6px 24px 0px rgba(37, 38, 43, 0.10)",
+              zIndex: (theme) => theme.zIndex.appBar - 1,
+              overscrollBehavior: "contain",
+            },
+          }}
+          {...others}
+        >
+          <FocusTrap open={!!others.open}>
+            {/*
+              A persistent Drawer is not a MUI Modal, so it gets no built-in
+              Escape handling. The Close Navigation button above is the
+              primary keyboard exit; this listener adds the Escape shortcut a
+              user expects from a drawer. The panel is a focus-trapped region
+              rather than a control, so there is no interactive role for it.
+            */}
+            {/* eslint-disable-next-line styled-components-a11y/no-static-element-interactions */}
+            <DrawerContent
+              onKeyUp={(e) => {
+                if (e.key === "Escape") {
+                  onClose()
+                }
+              }}
+              tabIndex={-1}
+            >
+              {navSections}
+            </DrawerContent>
+          </FocusTrap>
+        </Drawer>
+      </div>
+    </ClickAwayListener>
+  )
+}
+
+export { NavDrawer }
+export type { NavDrawerProps }

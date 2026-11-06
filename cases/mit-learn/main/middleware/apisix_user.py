@@ -1,0 +1,382 @@
+"""APISIX Middleware for MIT Learn."""
+
+import base64
+import json
+import logging
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any
+
+from django.conf import settings
+from django.contrib.auth import get_user_model, login, logout
+from django.contrib.auth.middleware import RemoteUserMiddleware
+from django.core.exceptions import ObjectDoesNotExist
+from django.db import IntegrityError, transaction
+from django.db.models import Q
+from django.http import HttpRequest
+from posthog import Posthog
+
+from authentication.api import user_created_actions
+from main.constants import PostHogEvents
+from main.utils import now_in_utc
+from profiles.models import filter_profile_props
+
+log = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from users.models import User
+
+# User fields synced from the APISIX user headers (defaults match update_or_create).
+USER_SYNC_FIELDS = (
+    "global_id",
+    "email",
+    "username",
+    "first_name",
+    "last_name",
+)
+
+
+def user_fields_from_headers(decoded_headers: Mapping[str, Any]) -> dict[str, Any]:
+    """Map the decoded user headers to the synced User fields."""
+    return {
+        "global_id": decoded_headers.get("global_id"),
+        "email": decoded_headers.get("email", ""),
+        "username": decoded_headers.get("username", ""),
+        "first_name": decoded_headers.get("first_name", ""),
+        "last_name": decoded_headers.get("last_name", ""),
+    }
+
+
+def user_needs_update(user: "User", user_fields: Mapping[str, Any]) -> bool:
+    """Return True if any synced User field differs from the headers."""
+    return any(getattr(user, field) != user_fields[field] for field in USER_SYNC_FIELDS)
+
+
+def profile_needs_update(user: "User", profile_data: Mapping[str, Any] | None) -> bool:
+    """Return True if the profile is missing or any synced field differs."""
+    try:
+        profile = user.profile
+    except ObjectDoesNotExist:
+        return True
+    props = filter_profile_props(profile_data) if profile_data else {}
+    return any(getattr(profile, key) != value for key, value in props.items())
+
+
+def decode_apisix_headers(
+    request: HttpRequest, header: str, model: str = settings.AUTH_USER_MODEL
+) -> dict[str, Any] | None:
+    """
+    Decode APISIX-specific headers and return the username as a dict.
+
+    Args:
+        request: Django request object
+        header: Header to decode
+        model: Model to decode the header for (user or profile)
+
+    Returns:
+        dict containing model attributes from APISIX/Keycloak
+    """
+    if model not in settings.APISIX_USERDATA_MAP:
+        error = f"Model {model} is invalid"
+        raise ValueError(error, model)
+
+    data_mapping = settings.APISIX_USERDATA_MAP[model]
+
+    x_userinfo = request.META.get(header, None)
+    if not x_userinfo:
+        return None
+
+    try:
+        apisix_result = json.loads(base64.b64decode(x_userinfo))
+        if not apisix_result:
+            err_msg = "decode_apisix_headers: No APISIX-specific header found"
+            raise KeyError(err_msg)
+    except json.JSONDecodeError:
+        log.debug(
+            "decode_apisix_headers: Got bad APISIX-specific header: %s",
+            request.META.get("HTTP_X_USERINFO", ""),
+        )
+
+        return None
+
+    log.debug("decode_apisix_headers: Got %s", apisix_result)
+    return {
+        modelKey: apisix_result[data_mapping[modelKey]]
+        for modelKey in data_mapping
+        if data_mapping[modelKey] in apisix_result
+    }
+
+
+def resolve_apisix_user(
+    request: HttpRequest,
+    global_id: str,
+    email: str,
+    user_fields: Mapping[str, Any],
+) -> "tuple[User | None, bool]":
+    """
+    Find the user matching the APISIX headers, creating one if that's allowed.
+
+    Args:
+        request: Django request object
+        global_id: global_id from the APISIX headers
+        email: email from the APISIX headers
+        user_fields: User field values to create a new user with
+
+    Returns:
+        (user, created) tuple. user is None if the identity is ambiguous, or if
+        it's unknown and MITOL_APIGATEWAY_USERINFO_CREATE is disabled. A legacy
+        user matched by email gets global_id set before it's returned.
+
+    """
+    User = get_user_model()
+
+    if (
+        request.user
+        and request.user.is_authenticated
+        and request.user.global_id == global_id
+    ):
+        return request.user, False
+
+    def match(**email_lookup):
+        # Without an email the lookup would claim any legacy user whose email
+        # is blank, so only the global_id can match.
+        query = Q(global_id=global_id)
+        if email:
+            query |= Q(global_id__isnull=True, **email_lookup)
+        return User.objects.filter(query).select_related("profile")
+
+    candidates = match(email=email)
+
+    try:
+        try:
+            user, created = candidates.get(), False
+        except User.DoesNotExist:
+            # Only fall back to a case-insensitive email match when nothing
+            # matched exactly, so a legacy row differing only in email case
+            # doesn't make an already-linked user ambiguous. The global_id match
+            # stays in so a row a concurrent request just linked or created is
+            # found, including on get_or_create's retry after an IntegrityError.
+            candidates = match(email__iexact=email)
+            if settings.MITOL_APIGATEWAY_USERINFO_CREATE:
+                user, created = candidates.get_or_create(defaults=user_fields)
+            else:
+                user, created = candidates.get(), False
+    except User.MultipleObjectsReturned:
+        log.exception(
+            "resolve_apisix_user: ambiguous_apisix_identity global_id=%s email=%s "
+            "user_ids=%s",
+            global_id,
+            email,
+            list(candidates.values_list("id", flat=True)),
+        )
+        return None, False
+    except User.DoesNotExist:
+        log.debug(
+            "resolve_apisix_user: User %s not found and user creation is disabled",
+            global_id,
+        )
+        return None, False
+
+    # Link a legacy user matched by email to its Keycloak identity even when
+    # MITOL_APIGATEWAY_USERINFO_UPDATE is off, otherwise it stays matched by
+    # email on every request and is never linked.
+    if user.global_id is None and not link_legacy_user(user, global_id, email):
+        return None, False
+
+    return user, created
+
+
+def link_legacy_user(user: "User", global_id: str, email: str) -> bool:
+    """
+    Set global_id on a legacy user that was matched by email.
+
+    The row is claimed only while it's still unlinked: a concurrent request for
+    another subject with a matching email may have loaded it too, and a plain
+    save would let both requests authenticate as it.
+
+    Args:
+        user: the unlinked legacy user
+        global_id: global_id from the APISIX headers
+        email: email from the APISIX headers
+
+    Returns:
+        True if the user is now linked to global_id, False if a concurrent
+        request linked it, or another user, to a subject first.
+
+    """
+    User = get_user_model()
+    try:
+        with transaction.atomic():
+            User.objects.filter(pk=user.pk, global_id__isnull=True).update(
+                global_id=global_id, updated_on=now_in_utc()
+            )
+    except IntegrityError:
+        # A concurrent request for the same subject linked a different legacy
+        # row first, e.g. one matched by the email from before an email change.
+        # Both rows now match this subject, so later requests are ambiguous too.
+        log.exception(
+            "link_legacy_user: global_id_linked_to_other_user "
+            "global_id=%s email=%s user_id=%s",
+            global_id,
+            email,
+            user.pk,
+        )
+        return False
+    user.refresh_from_db(fields=["global_id", "updated_on"])
+    if user.global_id != global_id:
+        log.error(
+            "link_legacy_user: legacy_user_claimed_by_other_subject "
+            "global_id=%s email=%s user_id=%s",
+            global_id,
+            email,
+            user.pk,
+        )
+        return False
+    return True
+
+
+def get_user_from_apisix_headers(
+    request: HttpRequest,
+    decoded_headers: Mapping[str, Any] | None,
+    original_header: str,
+) -> "User | None":
+    """
+    Get a user based on the APISIX headers, create user/profile if needed.
+
+    Args:
+        request: Django request object
+        decoded_headers: Decoded APISIX headers
+        original_header: Original header
+
+    Returns:
+        User object, or None if no valid user could be resolved
+
+    """
+
+    User = get_user_model()
+
+    if not decoded_headers:
+        return None
+
+    global_id = decoded_headers.get("global_id")
+    if not global_id:
+        log.error("No global_id found in APISIX headers")
+        return None
+    email = decoded_headers.get("email", "")
+
+    profile_data = decode_apisix_headers(
+        request, original_header, model="profiles.Profile"
+    )
+    user_fields = user_fields_from_headers(decoded_headers)
+
+    user, created = resolve_apisix_user(request, global_id, email, user_fields)
+    if user is None:
+        return None
+
+    if created:
+        log.info(
+            "get_user_from_apisix_headers: User %s not found, created new",
+            global_id,
+        )
+        # Send user creation event to PostHog
+        if settings.POSTHOG_PROJECT_API_KEY:
+            posthog = Posthog(
+                settings.POSTHOG_PROJECT_API_KEY, host=settings.POSTHOG_API_HOST
+            )
+            # Identify by global_id, not user.id: this posthog project is
+            # shared with other MIT applications that use their own integer
+            # user ids, so integer ids collide across applications.
+            posthog.capture(
+                event=PostHogEvents.ACCOUNT_CREATED.value,
+                distinct_id=global_id,
+                properties={
+                    "$current_url": request.build_absolute_uri(),
+                    "global_id": global_id,
+                    "email": email,
+                    "first_name": decoded_headers.get("first_name", ""),
+                    "last_name": decoded_headers.get("last_name", ""),
+                },
+            )
+
+        user.set_unusable_password()
+        user.is_active = True
+        user.save()
+    elif settings.MITOL_APIGATEWAY_USERINFO_UPDATE and user_needs_update(
+        user, user_fields
+    ):
+        for field, value in user_fields.items():
+            setattr(user, field, value)
+        user.save(update_fields=[*user_fields, "updated_on"])
+
+    if created:
+        user_created_actions(user=user, is_new=True, details=profile_data)
+        user = User.objects.select_related("profile").get(pk=user.pk)
+    elif settings.MITOL_APIGATEWAY_USERINFO_UPDATE and profile_needs_update(
+        user, profile_data
+    ):
+        log.debug(
+            "get_user_from_apisix_headers: Updating profile for %s",
+            global_id,
+        )
+        user_created_actions(user=user, is_new=False, details=profile_data)
+        user = User.objects.select_related("profile").get(pk=user.pk)
+
+    return user
+
+
+class ApisixUserMiddleware(RemoteUserMiddleware):
+    """Checks for and processes APISIX-specific headers."""
+
+    header = "HTTP_X_USERINFO"
+
+    def process_request(self, request: HttpRequest) -> None:
+        """
+        Modify the header to contain username, pass off to RemoteUserMiddleware
+        """
+        if settings.DISABLE_APISIX_USER_MIDDLEWARE:
+            return super().process_request(request)
+        apisix_user = None
+        if request.META.get(self.header):
+            new_header = decode_apisix_headers(
+                request, self.header, model=settings.AUTH_USER_MODEL
+            )
+            request.META["REMOTE_USER"] = new_header
+
+            try:
+                apisix_user = get_user_from_apisix_headers(
+                    request, new_header, self.header
+                )
+            except KeyError:
+                if self.force_logout_if_no_header and request.user.is_authenticated:
+                    log.debug("Forcing user logout because no APISIX user was found")
+                    logout(request)
+                return None
+        if apisix_user:
+            if request.user.is_authenticated and request.user == apisix_user:
+                # Already logged in as this user: skip login() so we don't cycle
+                # the session and write last_login on every request.
+                request.user = apisix_user
+                return None
+
+            if request.user.is_authenticated and request.user != apisix_user:
+                # The user is authenticated, but doesn't match the user we got
+                # from APISIX. So, log them out so the APISIX user takes
+                # precedence.
+                log.debug(
+                    "Forcing user logout because request user doesn't match APISIX user"
+                )
+                logout(request)
+
+            request.user = apisix_user
+            login(
+                request,
+                apisix_user,
+                backend="django.contrib.auth.backends.ModelBackend",
+            )
+
+        if not apisix_user and request.user.is_authenticated:
+            # If we didn't get a user from APISIX, but the user is still
+            # authenticated, log them out.
+            log.debug("Forcing user logout because no APISIX user was found")
+            logout(request)
+
+        return None

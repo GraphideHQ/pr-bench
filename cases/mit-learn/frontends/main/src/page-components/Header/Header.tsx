@@ -1,0 +1,272 @@
+"use client"
+
+import React, { FunctionComponent } from "react"
+import {
+  styled,
+  AppBar,
+  NavDrawer,
+  Toolbar,
+  HEADER_HEIGHT,
+  HEADER_HEIGHT_MD,
+} from "ol-components"
+import { usePathname } from "next/navigation"
+import { ActionButtonLink, ButtonLink } from "@mitodl/smoot-design"
+import { RiSearch2Line, RiGlobalLine } from "@remixicon/react"
+import { useToggle } from "ol-utilities"
+import MITLogoLink from "@/components/MITLogoLink/MITLogoLink"
+import UserMenu from "./UserMenu"
+import { MenuButton } from "./MenuButton"
+import HeaderNavLink from "./HeaderNavLink"
+import { navData } from "./navData"
+import { SEARCH, ORGANIZATIONAL_LEARNING, DASHBOARD_HOME } from "@/common/urls"
+import { useUserMe } from "api/hooks/user"
+import { analytics } from "@/common/analytics"
+import { PostHogEvents } from "@/common/constants"
+
+const Bar = styled(AppBar)(({ theme }) => ({
+  padding: "16px 8px",
+  backgroundColor: theme.custom.colors.navGray,
+  boxShadow: "none",
+  display: "flex",
+  justifyContent: "space-between",
+  flexDirection: "column",
+  ".MuiToolbar-root": {
+    minHeight: "auto",
+  },
+  height: HEADER_HEIGHT,
+  [theme.breakpoints.down("md")]: {
+    height: HEADER_HEIGHT_MD,
+    padding: "0",
+  },
+}))
+
+const FlexContainer = styled.div({
+  display: "flex",
+  alignItems: "center",
+})
+
+const DesktopOnly = styled(FlexContainer)(({ theme }) => ({
+  [theme.breakpoints.up("md")]: {
+    display: "flex",
+  },
+  [theme.breakpoints.down("md")]: {
+    display: "none",
+  },
+}))
+
+const MobileOnly = styled(FlexContainer)(({ theme }) => ({
+  [theme.breakpoints.down("md")]: {
+    display: "flex",
+  },
+  [theme.breakpoints.up("md")]: {
+    display: "none",
+  },
+}))
+
+const StyledToolbar = styled(Toolbar)({
+  flex: 1,
+})
+
+const StyledLearnLogoLink = styled(MITLogoLink)(({ theme }) => ({
+  img: {
+    height: "24px",
+    width: "auto",
+    [theme.breakpoints.down("md")]: {
+      height: "16px",
+    },
+  },
+}))
+
+/**
+ * The MIT logo at the right end of the header. Sits beside the user menu
+ * rather than inside it; smoot-design's UserMenu owns the menu alone.
+ */
+const StyledMITLogoLink = styled(MITLogoLink)(({ theme }) => ({
+  img: {
+    width: "64px",
+    height: "32px",
+    marginLeft: "16px",
+    [theme.breakpoints.down("md")]: {
+      width: "48px",
+      height: "24px",
+      marginLeft: "0",
+    },
+  },
+}))
+
+const DashboardLink = styled(ButtonLink)(({ theme }) => ({
+  fontSize: theme.typography.body3.fontSize,
+  marginRight: "24px",
+  [theme.breakpoints.down("md")]: {
+    display: "none",
+  },
+}))
+
+const Spacer = styled.div({
+  flex: "1",
+})
+
+const LeftSpacer = styled.div(({ theme }) => ({
+  width: "24px",
+  [theme.breakpoints.down("md")]: {
+    width: "16px",
+  },
+}))
+
+const StyledSearchButton = styled(ActionButtonLink)(({ theme }) => ({
+  width: "auto",
+  height: "auto",
+  padding: "4px 16px",
+  "&:hover": {
+    svg: {
+      opacity: 1,
+    },
+  },
+  [theme.breakpoints.down("md")]: {
+    padding: "0",
+  },
+  alignItems: "center",
+  display: "inline-flex",
+  justifyContent: "center",
+}))
+
+const StyledSearchIcon = styled(RiSearch2Line)(({ theme }) => ({
+  width: "24px",
+  height: "24px",
+  color: theme.custom.colors.white,
+  opacity: 0.5,
+  margin: "4px 0",
+  [theme.breakpoints.down("md")]: {
+    opacity: 1,
+  },
+}))
+
+const SearchButton: FunctionComponent = () => {
+  return (
+    <StyledSearchButton
+      edge="circular"
+      variant="text"
+      href={SEARCH}
+      aria-label="Search"
+    >
+      <StyledSearchIcon />
+    </StyledSearchButton>
+  )
+}
+
+const LoggedOutView: FunctionComponent = () => {
+  return (
+    <FlexContainer>
+      <DesktopOnly>
+        <SearchButton />
+        <UserMenu variant="desktop" />
+        <StyledMITLogoLink logo="mit_white" />
+      </DesktopOnly>
+      <MobileOnly>
+        <SearchButton />
+        <UserMenu variant="mobile" />
+        <StyledMITLogoLink logo="mit_white" />
+      </MobileOnly>
+    </FlexContainer>
+  )
+}
+
+const LoggedInView: FunctionComponent = () => {
+  const pathname = usePathname()
+  return (
+    <FlexContainer>
+      <SearchButton />
+      <UserMenu />
+      {!pathname.startsWith(DASHBOARD_HOME) ? (
+        <DashboardLink variant="tertiary" href={DASHBOARD_HOME}>
+          Dashboard
+        </DashboardLink>
+      ) : null}
+      <StyledMITLogoLink logo="mit_white" />
+    </FlexContainer>
+  )
+}
+
+const UserView: FunctionComponent = () => {
+  const { isLoading, data: user } = useUserMe()
+  if (isLoading) {
+    return null
+  }
+  return user?.is_authenticated ? <LoggedInView /> : <LoggedOutView />
+}
+
+const Header: FunctionComponent = () => {
+  const [drawerOpen, toggleDrawer] = useToggle(false)
+  const desktopTrigger = React.useRef<HTMLButtonElement>(null)
+  const mobileTrigger = React.useRef<HTMLButtonElement>(null)
+  const menuClick = () => {
+    analytics.navDrawerToggled(!drawerOpen)
+    toggleDrawer.toggle()
+  }
+
+  return (
+    <div>
+      <Bar position="fixed">
+        <StyledToolbar variant="dense">
+          <DesktopOnly>
+            <StyledLearnLogoLink logo="learn" />
+            <LeftSpacer />
+            <MenuButton
+              ref={desktopTrigger}
+              text="Explore MIT"
+              onClick={menuClick}
+              // "Selected" for a drawer trigger reads as "its drawer is open".
+              active={drawerOpen}
+            />
+            <HeaderNavLink
+              href={ORGANIZATIONAL_LEARNING}
+              label="For Organizations"
+              icon={<RiGlobalLine aria-hidden />}
+              onClick={() =>
+                analytics.navItemClicked(
+                  PostHogEvents.ClickedNavForOrganizations,
+                  { placement: "headerBar" },
+                )
+              }
+            />
+          </DesktopOnly>
+          <MobileOnly>
+            <MenuButton
+              ref={mobileTrigger}
+              onClick={menuClick}
+              active={drawerOpen}
+              aria-label="Explore MIT"
+            />
+            <LeftSpacer />
+            <StyledLearnLogoLink logo="learn" />
+          </MobileOnly>
+          <Spacer />
+          <UserView />
+        </StyledToolbar>
+      </Bar>
+
+      <NavDrawer
+        getClickAwayExcluded={() => [
+          desktopTrigger.current,
+          mobileTrigger.current,
+        ]}
+        navData={navData}
+        open={drawerOpen}
+        onClose={() => {
+          analytics.navDrawerToggled(false)
+          toggleDrawer.off()
+        }}
+        /**
+         * Stamped here rather than inside NavDrawer so the placement vocabulary
+         * stays in the app: several nav events fire from both the header bar
+         * and the drawer, and without this they are indistinguishable.
+         */
+        posthogCapture={(event) =>
+          analytics.navItemClicked(event, { placement: "navDrawer" })
+        }
+      />
+    </div>
+  )
+}
+
+export default Header

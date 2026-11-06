@@ -1,0 +1,28 @@
+# Read the Docs configuration file
+# See https://docs.readthedocs.io/en/stable/config-file/v2.html
+# for details
+
+---
+version: 2
+
+sphinx:
+  configuration: docs/conf.py
+  fail_on_warning: true
+
+python:
+  install:
+    - method: pip
+      path: .
+      extra_requirements:
+        - jwt  # aiohttp_mcp.jwt is autodoc'd in api.rst and imports PyJWT.
+    - requirements: requirements-docs.txt
+
+submodules:
+  include: all
+  exclude: []
+  recursive: true
+
+build:
+  os: ubuntu-26.04
+  tools:
+    python: "3.14"

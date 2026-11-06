@@ -1,0 +1,526 @@
+import React from "react"
+import {
+  urls,
+  factories,
+  RequirementTreeBuilder,
+} from "api/mitxonline-test-utils"
+import {
+  setMockResponse,
+  urls as learnUrls,
+  factories as learnFactories,
+  makeRequest,
+} from "api/test-utils"
+import type {
+  V2ProgramDetail,
+  ProgramPageItem,
+  CourseWithCourseRunsSerializerV2,
+} from "@mitodl/mitxonline-api-axios/v2"
+import { DisplayModeEnum } from "@mitodl/mitxonline-api-axios/v2"
+import {
+  renderWithProviders,
+  waitFor,
+  screen,
+  within,
+  user,
+} from "@/test-utils"
+import { assertHeadings } from "ol-test-utilities"
+import ProgramAsCoursePage from "./ProgramAsCoursePage"
+import { notFound } from "next/navigation"
+import {
+  STAY_UPDATED_FORM_ID,
+  withHubspotFormId,
+} from "./test-utils/stayUpdated"
+import invariant from "tiny-invariant"
+import { getIdsFromReqTree } from "@/common/mitxonline"
+
+jest.mock("posthog-js/react")
+
+const makeProgramAsCourse: typeof factories.programs.program = (
+  overrides = {},
+) =>
+  factories.programs.program({
+    display_mode: DisplayModeEnum.Course,
+    ...overrides,
+  })
+const makePage = factories.pages.programPageItem
+
+// Enrollment status can be slow to resolve, so wait longer for the enroll
+// button to leave its loading state before asserting on it.
+const ENROLL_STATUS_TIMEOUT = 5000
+
+const setupApis = ({
+  program,
+  page,
+}: {
+  program: V2ProgramDetail
+  page: ProgramPageItem
+}): {
+  courses: CourseWithCourseRunsSerializerV2[]
+  childPrograms: V2ProgramDetail[]
+} => {
+  setMockResponse.get(
+    urls.programs.programsList({
+      readable_id: program.readable_id,
+      live: true,
+    }),
+    { results: [program] },
+  )
+  setMockResponse.get(urls.pages.programPages(program.readable_id), {
+    items: [page],
+  })
+
+  const { courseIds, programIds } = getIdsFromReqTree(program.req_tree)
+  const courses: CourseWithCourseRunsSerializerV2[] = courseIds.map((id) =>
+    factories.courses.course({ id }),
+  )
+
+  if (courseIds.length > 0) {
+    setMockResponse.get(
+      urls.courses.coursesList({
+        id: courses.map((c) => c.id),
+        page_size: courses.length,
+      }),
+      { results: courses },
+    )
+  }
+
+  const childPrograms: V2ProgramDetail[] = programIds.map((id) =>
+    factories.programs.program({ id }),
+  )
+
+  if (programIds.length > 0) {
+    setMockResponse.get(
+      urls.programs.programsList({
+        id: programIds,
+        page_size: programIds.length,
+      }),
+      { results: childPrograms },
+    )
+  }
+
+  setMockResponse.get(
+    learnUrls.userMe.get(),
+    learnFactories.user.user({ is_authenticated: false }),
+  )
+  // Clicking enroll consults the MITx Online profile through the compliance
+  // gate; the factory default has nothing missing, so it passes straight through.
+  setMockResponse.get(urls.userMe.get(), factories.user.user())
+
+  const stayUpdatedFormId = page.hubspot_form_id?.trim()
+  if (stayUpdatedFormId) {
+    setMockResponse.get(
+      learnUrls.hubspot.details({ form_id: stayUpdatedFormId }),
+      learnFactories.hubspot.form({
+        id: stayUpdatedFormId,
+        name: "Stay Updated",
+      }),
+    )
+  }
+  setMockResponse.get(urls.programEnrollments.enrollmentsListV3(), [])
+
+  return { courses, childPrograms }
+}
+
+describe("ProgramAsCoursePage", () => {
+  test("Page has expected headings", async () => {
+    const reqTree = new RequirementTreeBuilder()
+    const op = reqTree.addOperator({ operator: "all_of" })
+    op.addCourse()
+    op.addCourse()
+
+    const program = makeProgramAsCourse({
+      certificate_available: true,
+      enrollment_modes: [
+        factories.courses.enrollmentMode({ requires_payment: true }),
+      ],
+      products: [factories.courses.product({ price: "250" })],
+      req_tree: reqTree.serialize(),
+    })
+    const page = makePage({ program_details: program })
+    invariant(page.faculty.length > 0)
+    setupApis({ program, page })
+    renderWithProviders(
+      <ProgramAsCoursePage readableId={program.readable_id} />,
+    )
+
+    await waitFor(() => {
+      assertHeadings([
+        { level: 1, name: page.title },
+        { level: 2, name: "Course Information" },
+        { level: 3, name: "Certificate Track" },
+        { level: 2, name: "About this Course" },
+        { level: 2, name: "What you'll learn" },
+        { level: 2, name: "Modules" },
+        { level: 2, name: "How you'll learn" },
+        { level: 2, name: "Prerequisites" },
+        { level: 2, name: "Meet your instructors" },
+        { level: 3, name: page.faculty[0].instructor_name },
+        { level: 2, name: "FAQs" },
+        ...page.faqs.map((faq) => ({ level: 3, name: faq.question })),
+        { level: 2, name: "What learners are saying" },
+      ])
+    })
+  })
+
+  test("Renders an enrollment button", async () => {
+    const program = makeProgramAsCourse({
+      enrollment_modes: [
+        factories.courses.enrollmentMode({ requires_payment: false }),
+      ],
+    })
+    const page = makePage({ program_details: program })
+    setupApis({ program, page })
+    renderWithProviders(
+      <ProgramAsCoursePage readableId={program.readable_id} />,
+    )
+    const buttons = await screen.findAllByRole(
+      "button",
+      { name: "Start Learning" },
+      { timeout: ENROLL_STATUS_TIMEOUT },
+    )
+    expect(buttons.length).toBeGreaterThanOrEqual(1)
+  })
+
+  test("Returns 404 if no program found", async () => {
+    setMockResponse.get(
+      urls.programs.programsList({ readable_id: "readable_id", live: true }),
+      { results: [] },
+    )
+    setMockResponse.get(urls.pages.programPages("readable_id"), {
+      items: [],
+    })
+    renderWithProviders(<ProgramAsCoursePage readableId="readable_id" />)
+    await waitFor(() => {
+      expect(notFound).toHaveBeenCalled()
+    })
+  })
+
+  test("Returns 404 if program has live=false", async () => {
+    const program = makeProgramAsCourse()
+    const page = makePage({ program_details: program })
+    // Simulate live=false: the API filters it out, returning empty results
+    setMockResponse.get(
+      urls.programs.programsList({
+        readable_id: program.readable_id,
+        live: true,
+      }),
+      { results: [] },
+    )
+    setMockResponse.get(urls.pages.programPages(program.readable_id), {
+      items: [page],
+    })
+    renderWithProviders(
+      <ProgramAsCoursePage readableId={program.readable_id} />,
+    )
+    await waitFor(() => {
+      expect(notFound).toHaveBeenCalled()
+    })
+  })
+
+  test("Renders Modules section with course titles (single root)", async () => {
+    const reqTree = new RequirementTreeBuilder()
+    const op = reqTree.addOperator({ operator: "all_of", title: "All Modules" })
+    op.addCourse()
+    op.addCourse()
+
+    const program = makeProgramAsCourse({
+      req_tree: reqTree.serialize(),
+    })
+    const page = makePage({ program_details: program })
+    const { courses } = setupApis({ program, page })
+
+    renderWithProviders(
+      <ProgramAsCoursePage readableId={program.readable_id} />,
+    )
+
+    await screen.findByRole("heading", { name: "Modules" })
+    expect(screen.getByText("This course has 2 modules")).toBeInTheDocument()
+
+    // Course titles should be shown (findBy first, then getBy for the rest since
+    // all items render together when dataLoading transitions to false)
+    await screen.findByText(courses[0].title)
+    courses.slice(1).forEach((course) => {
+      expect(screen.getByText(course.title)).toBeInTheDocument()
+    })
+
+    // No h3 subsection headings within Modules section (flat list, single root)
+    const modulesSection = screen.getByRole("region", { name: "Modules" })
+    expect(
+      within(modulesSection).queryByRole("heading", { level: 3 }),
+    ).not.toBeInTheDocument()
+  })
+
+  test("Renders Modules subsections as fallback when multiple roots", async () => {
+    jest.spyOn(console, "warn").mockImplementation()
+    const reqTree = new RequirementTreeBuilder()
+    const op1 = reqTree.addOperator({
+      operator: "all_of",
+      title: "Core Modules",
+    })
+    op1.addCourse()
+    const op2 = reqTree.addOperator({
+      operator: "all_of",
+      title: "Advanced Modules",
+    })
+    op2.addCourse()
+
+    const program = makeProgramAsCourse({
+      req_tree: reqTree.serialize(),
+    })
+    const page = makePage({ program_details: program })
+    const { courses } = setupApis({ program, page })
+
+    renderWithProviders(
+      <ProgramAsCoursePage readableId={program.readable_id} />,
+    )
+
+    await screen.findByRole("heading", { name: "Modules" })
+
+    // Subsection h3 headings from req titles
+    await screen.findByRole("heading", { name: "Core Modules" })
+    await screen.findByRole("heading", { name: "Advanced Modules" })
+
+    // Course titles should be shown within subsections
+    await screen.findByText(courses[0].title)
+    courses.slice(1).forEach((course) => {
+      expect(screen.getByText(course.title)).toBeInTheDocument()
+    })
+  })
+
+  test("Renders program bundle upsell when program belongs to a parent program (content tested in ProgramBundleUpsell.test)", async () => {
+    const parentProgram = factories.programs.baseProgram()
+    const parentProgramDetail = factories.programs.program({
+      id: parentProgram.id,
+      readable_id: parentProgram.readable_id,
+      products: [factories.courses.product({ price: "500" })],
+    })
+    const program = makeProgramAsCourse({ programs: [parentProgram] })
+    const page = makePage({ program_details: program })
+    setupApis({ program, page })
+    setMockResponse.get(
+      urls.programs.programsList({ id: [parentProgram.id] }),
+      { results: [parentProgramDetail] },
+    )
+    renderWithProviders(
+      <ProgramAsCoursePage readableId={program.readable_id} />,
+    )
+
+    expect(
+      await screen.findByTestId("program-bundle-upsell"),
+    ).toBeInTheDocument()
+  })
+
+  test("Renders Modules section with mixed courses and programs (single root)", async () => {
+    const reqTree = new RequirementTreeBuilder()
+    const op = reqTree.addOperator({ operator: "all_of" })
+    op.addCourse()
+    op.addProgram()
+    op.addCourse()
+
+    const program = makeProgramAsCourse({ req_tree: reqTree.serialize() })
+    const page = makePage({ program_details: program })
+    const { courses, childPrograms } = setupApis({ program, page })
+
+    renderWithProviders(
+      <ProgramAsCoursePage readableId={program.readable_id} />,
+    )
+
+    const modulesSection = await screen.findByRole("region", {
+      name: "Modules",
+    })
+    expect(
+      within(modulesSection).getByText("This course has 3 modules"),
+    ).toBeInTheDocument()
+
+    // Verify interleaved order: c1, p1, c2 (matches tree insertion order)
+    await within(modulesSection).findByText(courses[0].title)
+    const listItems = within(modulesSection).getAllByRole("listitem")
+    expect(listItems).toHaveLength(3)
+    expect(listItems[0]).toHaveTextContent(courses[0].title)
+    expect(listItems[1]).toHaveTextContent(childPrograms[0].title)
+    expect(listItems[2]).toHaveTextContent(courses[1].title)
+  })
+
+  describe("Stay Updated button", () => {
+    test("Shows button when the page has a hubspot form id", async () => {
+      const program = makeProgramAsCourse()
+      const page = withHubspotFormId(
+        makePage({ program_details: program }),
+        STAY_UPDATED_FORM_ID,
+      )
+      setupApis({ program, page })
+      renderWithProviders(
+        <ProgramAsCoursePage readableId={program.readable_id} />,
+      )
+
+      expect(
+        await screen.findByRole("button", { name: "Stay Updated" }),
+      ).toBeInTheDocument()
+    })
+
+    test.each([
+      { label: "the form id is blank", hubspotFormId: "" },
+      { label: "the form id is null", hubspotFormId: null },
+    ])("Hides button when $label", async ({ hubspotFormId }) => {
+      const program = makeProgramAsCourse()
+      const page = withHubspotFormId(
+        makePage({ program_details: program }),
+        hubspotFormId,
+      )
+      setupApis({ program, page })
+      renderWithProviders(
+        <ProgramAsCoursePage readableId={program.readable_id} />,
+      )
+
+      await screen.findByRole("heading", { name: page.title })
+      expect(
+        screen.queryByRole("button", { name: "Stay Updated" }),
+      ).not.toBeInTheDocument()
+    })
+  })
+
+  test("Renders without crashing when program_details.page is null", async () => {
+    const program = makeProgramAsCourse({ page: null })
+    const page = makePage({ program_details: program })
+    setupApis({ program, page })
+    renderWithProviders(
+      <ProgramAsCoursePage readableId={program.readable_id} />,
+    )
+
+    await screen.findByRole("heading", { name: page.title })
+  })
+
+  test("Enroll CTA posts program enrollment from ProgramAsCoursePage", async () => {
+    const program = makeProgramAsCourse({
+      enrollment_modes: [
+        factories.courses.enrollmentMode({ requires_payment: false }),
+      ],
+    })
+    const page = makePage({ program_details: program })
+    setupApis({ program, page })
+    setMockResponse.get(
+      learnUrls.userMe.get(),
+      learnFactories.user.user({ is_authenticated: true }),
+    )
+
+    const enrollUrl = urls.programEnrollments.enrollmentsListV3()
+    setMockResponse.post(enrollUrl, {})
+
+    renderWithProviders(
+      <ProgramAsCoursePage readableId={program.readable_id} />,
+    )
+
+    const [enrollButton] = await screen.findAllByRole(
+      "button",
+      { name: "Start Learning" },
+      { timeout: ENROLL_STATUS_TIMEOUT },
+    )
+    await user.click(enrollButton)
+
+    await waitFor(() => {
+      expect(makeRequest).toHaveBeenCalledWith(
+        expect.objectContaining({ method: "post", url: enrollUrl }),
+      )
+    })
+    expect(makeRequest).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "post",
+        url: urls.enrollment.enrollmentsListV1(),
+      }),
+    )
+  })
+
+  test("Renders certificate track pricing card", async () => {
+    const program = makeProgramAsCourse({
+      certificate_available: true,
+      enrollment_modes: [
+        factories.courses.enrollmentMode({ requires_payment: true }),
+      ],
+      products: [factories.courses.product({ price: "250" })],
+    })
+    const page = makePage({ program_details: program })
+    setupApis({ program, page })
+
+    renderWithProviders(
+      <ProgramAsCoursePage readableId={program.readable_id} />,
+    )
+
+    expect(
+      await screen.findByRole("heading", {
+        level: 3,
+        name: "Certificate Track",
+      }),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByText("Earn a verified certificate of completion"),
+    ).toBeInTheDocument()
+    expect(screen.getByText("$250")).toBeInTheDocument()
+  })
+
+  test("Hides certificate track pricing card for free-enrollment programs", async () => {
+    const program = makeProgramAsCourse({
+      enrollment_modes: [
+        factories.courses.enrollmentMode({ requires_payment: false }),
+      ],
+      products: [factories.courses.product({ price: "250" })],
+    })
+    const page = makePage({ program_details: program })
+    setupApis({ program, page })
+
+    renderWithProviders(
+      <ProgramAsCoursePage readableId={program.readable_id} />,
+    )
+
+    await screen.findByRole("heading", { name: page.title })
+    expect(screen.queryByText("Certificate Track")).not.toBeInTheDocument()
+    expect(
+      screen.queryByText("Earn a verified certificate of completion"),
+    ).not.toBeInTheDocument()
+    const enrollButtons = await screen.findAllByRole(
+      "button",
+      { name: "Start Learning" },
+      { timeout: ENROLL_STATUS_TIMEOUT },
+    )
+    expect(enrollButtons.length).toBeGreaterThanOrEqual(1)
+  })
+
+  test("Hides certificate track pricing card when products are empty", async () => {
+    const program = makeProgramAsCourse({
+      certificate_available: true,
+      enrollment_modes: [
+        factories.courses.enrollmentMode({ requires_payment: true }),
+      ],
+      products: [],
+    })
+    const page = makePage({ program_details: program })
+    setupApis({ program, page })
+
+    renderWithProviders(
+      <ProgramAsCoursePage readableId={program.readable_id} />,
+    )
+
+    await screen.findByRole("heading", { name: page.title })
+    expect(screen.queryByText("Certificate Track")).not.toBeInTheDocument()
+    expect(screen.queryByText("Price unavailable")).not.toBeInTheDocument()
+  })
+
+  test("Hides certificate track pricing card when product price is missing", async () => {
+    const program = makeProgramAsCourse({
+      certificate_available: true,
+      enrollment_modes: [
+        factories.courses.enrollmentMode({ requires_payment: true }),
+      ],
+      products: [factories.courses.product({ price: "" })],
+    })
+    const page = makePage({ program_details: program })
+    setupApis({ program, page })
+
+    renderWithProviders(
+      <ProgramAsCoursePage readableId={program.readable_id} />,
+    )
+
+    await screen.findByRole("heading", { name: page.title })
+    expect(screen.queryByText("Certificate Track")).not.toBeInTheDocument()
+    expect(screen.queryByText("Price unavailable")).not.toBeInTheDocument()
+  })
+})

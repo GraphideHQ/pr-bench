@@ -1,0 +1,269 @@
+import { DisplayModeEnum } from "@mitodl/mitxonline-api-axios/v2"
+import {
+  AccountAction,
+  accountAction,
+  auth,
+  coursePageView,
+  ocwLearnPageView,
+  programPageView,
+  podcastEpisodePath,
+  videoDetailPath,
+  podcastPath,
+  videoPlaylistPath,
+  canonicalResourceDrawerUrl,
+  carrySearchParams,
+  resourceDrawerSearch,
+} from "./urls"
+
+const MITOL_API_BASE_URL = process.env.NEXT_PUBLIC_MITOL_API_BASE_URL
+
+test.each([
+  {
+    loginNext: { pathname: "/", searchParams: null },
+    expected: [
+      "http://api.test.learn.odl.local:8065/login",
+      "?next=http%3A%2F%2Ftest.learn.odl.local%3A8062%2F",
+    ].join(""),
+  },
+  {
+    loginNext: {
+      pathname: "/courses/course-v1:edX+DemoX+Demo_Course",
+      searchParams: null,
+    },
+    expected: [
+      "http://api.test.learn.odl.local:8065/login",
+      "?next=http%3A%2F%2Ftest.learn.odl.local%3A8062%2Fcourses%2Fcourse-v1%3AedX%2BDemoX%2BDemo_Course",
+    ].join(""),
+  },
+  {
+    loginNext: {
+      pathname: "/courses/course-v1:edX+DemoX+Demo_Course",
+      searchParams: new URLSearchParams({ foo: "bar" }),
+    },
+    expected: [
+      `${MITOL_API_BASE_URL}/login`,
+      "?next=http%3A%2F%2Ftest.learn.odl.local%3A8062%2Fcourses%2Fcourse-v1%3AedX%2BDemoX%2BDemo_Course%3Ffoo%3Dbar",
+    ].join(""),
+  },
+  {
+    loginNext: {
+      pathname: "/courses/course-v1:edX+DemoX+Demo_Course",
+      searchParams: new URLSearchParams({ foo: "bar" }),
+    },
+    signupNext: {
+      pathname: "/somewhere/else",
+      searchParams: null,
+    },
+    expected: [
+      `${MITOL_API_BASE_URL}/login`,
+      "?next=http%3A%2F%2Ftest.learn.odl.local%3A8062%2Fcourses%2Fcourse-v1%3AedX%2BDemoX%2BDemo_Course%3Ffoo%3Dbar",
+      "&signup_next=http%3A%2F%2Ftest.learn.odl.local%3A8062%2Fsomewhere%2Felse",
+    ].join(""),
+  },
+])(
+  "login encodes the next parameter appropriately",
+  ({ loginNext, signupNext, expected }) => {
+    expect(auth({ next: loginNext, signupNext })).toBe(expected)
+  },
+)
+
+test.each([
+  {
+    action: AccountAction.UpdateEmail,
+    expected: [
+      `${MITOL_API_BASE_URL}/account/action/start/update-email/`,
+      "?next=http%3A%2F%2Ftest.learn.odl.local%3A8062%2Fdashboard%2Fsettings",
+    ].join(""),
+  },
+  {
+    action: AccountAction.UpdatePassword,
+    expected: [
+      `${MITOL_API_BASE_URL}/account/action/start/update-password/`,
+      "?next=http%3A%2F%2Ftest.learn.odl.local%3A8062%2Fdashboard%2Fsettings",
+    ].join(""),
+  },
+])(
+  "accountAction points at Django with an encoded next URL",
+  ({ action, expected }) => {
+    expect(
+      accountAction(action, {
+        pathname: "/dashboard/settings",
+        searchParams: null,
+      }),
+    ).toBe(expected)
+  },
+)
+
+test.each([
+  {
+    readableId: "course-v1:MITxT+10.50x",
+    expected: "/courses/course-v1:MITxT+10.50x",
+  },
+  {
+    readableId: "some-plain-slug",
+    expected: "/courses/some-plain-slug",
+  },
+])(
+  "coursePageView does not encode RFC 3986 pchar characters",
+  ({ readableId, expected }) => {
+    expect(coursePageView(readableId)).toBe(expected)
+  },
+)
+
+test.each([
+  { displayMode: null, label: "null" },
+  { displayMode: "", label: "empty string" },
+  { displayMode: undefined, label: "undefined" },
+] as const)(
+  "programPageView returns /programs/ path when display_mode is $label",
+  ({ displayMode }) => {
+    // Use a realistic readable_id with pchar characters (: and +) to verify
+    // they are not percent-encoded in the URL path.
+    expect(
+      programPageView({
+        readable_id: "program-v1:MITxT+10.50x",
+        display_mode: displayMode,
+      }),
+    ).toBe("/programs/program-v1:MITxT+10.50x")
+  },
+)
+
+test("programPageView returns /programs/ path when display_mode is omitted", () => {
+  expect(
+    programPageView(
+      // @ts-expect-error Force callers to pass display_mode explicitly
+      { readable_id: "some-plain-slug" },
+    ),
+  ).toBe("/programs/some-plain-slug")
+})
+
+test("programPageView returns /courses/p/ path when display_mode is course", () => {
+  expect(
+    programPageView({
+      readable_id: "program-v1:MITxT+18.01x",
+      display_mode: DisplayModeEnum.Course,
+    }),
+  ).toBe("/courses/p/program-v1:MITxT+18.01x")
+})
+
+test("programPageView falls back to /programs/ for unknown display_mode values", () => {
+  expect(
+    programPageView({
+      readable_id: "some-slug",
+      display_mode: "unknown-future-value" as never,
+    }),
+  ).toBe("/programs/some-slug")
+})
+
+test.each([
+  "https://example.com/courses/some-course",
+  "https://mit.edu/courses/some-course",
+])("ocwLearnPageView returns original URL for non-OCW hostnames", (url) => {
+  expect(ocwLearnPageView(url)).toBe(url)
+})
+
+test.each([
+  {
+    input: "https://ocw.mit.edu/courses/some-course",
+    expected: "/courses/o/some-course",
+  },
+  {
+    input: "https://ocw.mit.edu/courses/physics-101/",
+    expected: "/courses/o/physics-101/",
+  },
+  {
+    input: "https://ocw.mit.edu/search",
+    expected: "/search",
+  },
+])("ocwLearnPageView transforms OCW URLs correctly", ({ input, expected }) => {
+  expect(ocwLearnPageView(input)).toBe(expected)
+})
+
+describe("separate-param drawer builders", () => {
+  test("resourceDrawerSearch emits resource + optional resource_title (relative)", () => {
+    expect(resourceDrawerSearch(114927, "Beyond Biology")).toBe(
+      "/search?resource=114927&resource_title=beyond-biology",
+    )
+    expect(resourceDrawerSearch(114927, "2024")).toBe("/search?resource=114927") // blank → omit
+    expect(resourceDrawerSearch(114927, undefined)).toBe(
+      "/search?resource=114927",
+    )
+  })
+
+  test("canonicalResourceDrawerUrl is the absolute form", () => {
+    expect(canonicalResourceDrawerUrl(114927, "Beyond Biology")).toMatch(
+      /\/search\?resource=114927&resource_title=beyond-biology$/,
+    )
+    expect(canonicalResourceDrawerUrl(114927, "2024")).toMatch(
+      /\/search\?resource=114927$/,
+    )
+  })
+})
+
+describe("resource page paths", () => {
+  test("podcastEpisodePath places the episode under the given podcast", () => {
+    expect(podcastEpisodePath("55", "123", "episode-one")).toBe(
+      "/podcast/123/podcast_episode/55/episode-one",
+    )
+    // No slug → bare, which redirects to the canonical form.
+    expect(podcastEpisodePath("55", "123", undefined)).toBe(
+      "/podcast/123/podcast_episode/55",
+    )
+  })
+
+  test("videoDetailPath keeps ?playlist alongside the slug", () => {
+    expect(videoDetailPath(16765, 13798, "beyond-biology")).toBe(
+      "/video/16765/beyond-biology?playlist=13798",
+    )
+    expect(videoDetailPath(16765, undefined, "beyond-biology")).toBe(
+      "/video/16765/beyond-biology",
+    )
+    expect(videoDetailPath(16765, 13798, undefined)).toBe(
+      "/video/16765?playlist=13798",
+    )
+  })
+
+  test("videoPlaylistPath appends the slug when there is one", () => {
+    expect(videoPlaylistPath(13798, "xtalks")).toBe(
+      "/video-playlist/13798/xtalks",
+    )
+    // No slug → bare, which redirects to the canonical form.
+    expect(videoPlaylistPath(13798, undefined)).toBe("/video-playlist/13798")
+  })
+
+  test("podcastPath appends the slug when there is one", () => {
+    expect(podcastPath(123, "beyond-biology")).toBe(
+      "/podcast/123/beyond-biology",
+    )
+    expect(podcastPath(123, undefined)).toBe("/podcast/123")
+  })
+})
+
+describe("carrySearchParams", () => {
+  test("appends incoming params to the canonical", () => {
+    expect(
+      carrySearchParams("/podcast/1/slug", { utm_source: "newsletter" }),
+    ).toBe("/podcast/1/slug?utm_source=newsletter")
+    expect(carrySearchParams("/podcast/1/slug", {})).toBe("/podcast/1/slug")
+  })
+
+  test("canonical-owned params win", () => {
+    expect(
+      carrySearchParams(
+        "/video/1/slug?playlist=10",
+        { playlist: "999", utm_source: "x" },
+        ["playlist"],
+      ),
+    ).toBe("/video/1/slug?utm_source=x&playlist=10")
+  })
+
+  test("omit drops a rejected param the canonical doesn't own (loop safety)", () => {
+    // Without omit, the rejected playlist would be forwarded onto the bare
+    // canonical, differ from it on the next request, and redirect forever.
+    expect(
+      carrySearchParams("/video/1/slug", { playlist: "999", utm_source: "x" }, [
+        "playlist",
+      ]),
+    ).toBe("/video/1/slug?utm_source=x")
+  })
+})

@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.git/
+*.egg-info/
+dist/
+build/
+results/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+data/benchmarks/
+# Locally trained heads are untracked, so including them would make a local
+# `docker build` produce a different image than CI's build from a clean clone.
+data/*.npz

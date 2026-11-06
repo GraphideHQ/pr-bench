@@ -1,0 +1,220 @@
+"use client"
+
+import React, { useState } from "react"
+import {
+  Stack,
+  Typography,
+  HubspotForm,
+  Dialog,
+  DialogActions,
+  type HubspotFormInput,
+  type HubspotFormValue,
+} from "ol-components"
+import { Button, styled } from "@mitodl/smoot-design"
+import Image from "next/image"
+import NiceModal, { muiDialogV5 } from "@ebay/nice-modal-react"
+import IconCheck from "@/public/images/product/icon_check.svg"
+import { getRecaptchaSiteKey } from "@/common/config"
+import {
+  useHubspotFormDetail,
+  useHubspotFormSubmit,
+  type HubspotSubmitField,
+} from "api/hooks/hubspot"
+import { SILENCE_ERROR_TOAST } from "api/mutation-meta"
+import { analytics } from "@/common/analytics"
+
+const StayUpdatedDialogContainer = styled.div(({ theme }) => ({
+  minWidth: "516px",
+  padding: "24px",
+  display: "flex",
+  flexDirection: "column",
+  gap: "24px",
+  [theme.breakpoints.down("sm")]: {
+    minWidth: "100%",
+  },
+}))
+
+const DialogMessage = styled(Typography)(({ theme }) => ({
+  color: theme.custom.colors.darkGray2,
+}))
+
+const DialogSuccessCheck = styled(Image)({
+  alignSelf: "center",
+  marginBottom: "24px",
+})
+
+const PRODUCT_OF_INTEREST_FIELD_NAME = "product_of_interest"
+
+const DEFAULT_SUBMISSION_ERROR = "Failed to submit form. Please try again."
+
+// Friendly copy for known backend error codes. HubSpot's raw text (returned as
+// `detail` for logs/Sentry) is never rendered; unknown codes fall through to the
+// generic message below so internal text can't leak to users.
+const SUBMISSION_ERROR_MESSAGES_BY_CODE: Record<string, string> = {
+  FORM_HAS_RECAPTCHA_ENABLED:
+    "We couldn't submit your request right now. Please try again later or contact us if the problem continues.",
+}
+
+const getSubmissionErrorMessage = (error: unknown): string => {
+  const responseData =
+    error && typeof error === "object" && "response" in error
+      ? (error as { response?: { data?: unknown } }).response?.data
+      : undefined
+  if (responseData && typeof responseData === "object") {
+    const { code } = responseData as { code?: string }
+    if (code && SUBMISSION_ERROR_MESSAGES_BY_CODE[code]) {
+      return SUBMISSION_ERROR_MESSAGES_BY_CODE[code]
+    }
+  }
+  return DEFAULT_SUBMISSION_ERROR
+}
+
+type StayUpdatedDialogProps = {
+  productReadableId?: string
+  hubspotFormId?: string
+}
+
+const mapValuesToFields = (
+  values: Record<string, HubspotFormValue>,
+): HubspotSubmitField[] => {
+  return Object.entries(values)
+    .filter(
+      (entry): entry is [string, Exclude<HubspotFormValue, File>] =>
+        !(entry[1] instanceof File),
+    )
+    .map(([name, value]) => ({ name, value }))
+}
+
+const findProductOfInterestValue = (
+  hubspotForm: HubspotFormInput | undefined,
+  productReadableId: string | undefined,
+): string | undefined => {
+  const normalizedProductReadableId = productReadableId?.trim()
+  if (!normalizedProductReadableId) {
+    return undefined
+  }
+
+  const fieldGroups = hubspotForm?.fieldGroups ?? hubspotForm?.field_groups
+
+  const productOfInterestField = fieldGroups
+    ?.flatMap((fieldGroup) => fieldGroup.fields ?? [])
+    .find((field) => field.name === PRODUCT_OF_INTEREST_FIELD_NAME)
+
+  const matchingOption = productOfInterestField?.options?.find(
+    (option) => option.value?.trim() === normalizedProductReadableId,
+  )
+
+  return matchingOption?.value?.trim()
+}
+
+const StayUpdatedDialogInner: React.FC<StayUpdatedDialogProps> = ({
+  productReadableId,
+  hubspotFormId,
+}) => {
+  const modalState = NiceModal.useModal()
+  const modal = muiDialogV5(modalState)
+  const stayUpdatedFormId = hubspotFormId?.trim() ?? ""
+  const recaptchaSiteKey = getRecaptchaSiteKey()
+  const { data: hubspotForm, isLoading } = useHubspotFormDetail(
+    stayUpdatedFormId ? { form_id: stayUpdatedFormId } : undefined,
+  )
+  // The form renders its own inline submission error (errorText below), so
+  // suppress the global error toast.
+  const hubspotFormSubmit = useHubspotFormSubmit({ meta: SILENCE_ERROR_TOAST })
+  const [email, setEmail] = useState("")
+
+  const closeDialog = async () => {
+    await modalState.hide()
+    hubspotFormSubmit.reset()
+    setEmail("")
+  }
+
+  const submissionError = hubspotFormSubmit.isError
+    ? getSubmissionErrorMessage(hubspotFormSubmit.error)
+    : null
+  const doneButton = (
+    <DialogActions>
+      <Button variant="primary" onClick={closeDialog}>
+        Done
+      </Button>
+    </DialogActions>
+  )
+
+  return (
+    <Dialog
+      {...modal}
+      title={"Stay Updated"}
+      actions={hubspotFormSubmit.isSuccess ? doneButton : null}
+      contentCss={{ margin: 0 }}
+    >
+      {!hubspotFormSubmit.isSuccess && (
+        <StayUpdatedDialogContainer>
+          <DialogMessage variant="body1">
+            Not ready to enroll? Learn what to expect in this offering.
+          </DialogMessage>
+          <HubspotForm
+            form={hubspotForm}
+            recaptchaEnabled={Boolean(recaptchaSiteKey)}
+            recaptchaSiteKey={recaptchaSiteKey}
+            isLoading={isLoading}
+            isSubmitting={hubspotFormSubmit.isPending}
+            submitLabel="Stay Updated"
+            errorText={submissionError}
+            actions={
+              <Button variant="secondary" type="button" onClick={closeDialog}>
+                Cancel
+              </Button>
+            }
+            onSubmit={(values, _event, recaptchaToken) => {
+              const fields = mapValuesToFields(values).filter(
+                (field) => field.name !== PRODUCT_OF_INTEREST_FIELD_NAME,
+              )
+              const emailField = fields.find((field) => field.name === "email")
+              if (emailField && typeof emailField.value === "string") {
+                setEmail(emailField.value)
+              }
+
+              const productOfInterestValue = findProductOfInterestValue(
+                hubspotForm,
+                productReadableId,
+              )
+              if (productOfInterestValue) {
+                fields.push({
+                  name: PRODUCT_OF_INTEREST_FIELD_NAME,
+                  value: [productOfInterestValue],
+                })
+              }
+
+              hubspotFormSubmit.mutate(
+                {
+                  formId: stayUpdatedFormId,
+                  fields,
+                  recaptchaToken,
+                },
+                { onSuccess: () => analytics.signedUpForUpdates() },
+              )
+            }}
+          />
+        </StayUpdatedDialogContainer>
+      )}
+      {hubspotFormSubmit.isSuccess && (
+        <StayUpdatedDialogContainer>
+          <Stack alignItems="center">
+            <DialogSuccessCheck
+              src={IconCheck}
+              width="64"
+              height="64"
+              alt=""
+              aria-hidden
+            />
+            <Typography variant="body1" color="black" align="center">
+              Thanks! We&apos;ll keep you updated at <strong>{email}</strong>
+            </Typography>
+          </Stack>
+        </StayUpdatedDialogContainer>
+      )}
+    </Dialog>
+  )
+}
+
+export const StayUpdatedModal = NiceModal.create(StayUpdatedDialogInner)

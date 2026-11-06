@@ -1,0 +1,976 @@
+#!/usr/bin/env python3
+"""Fugal subnet TEE miner — runs benchmarks inside Intel TDX, publishes proofs.
+
+Usage:
+    python neurons/miner.py --netuid 1 --coldkey miner --hotkey default \\
+        --head-path data/my_head.npz --benchmark-pool data/pool.json
+
+Each epoch:
+  1. Wait for epoch boundary (new block hash)
+  2. Derive nonce from block hash
+  3. Run benchmark inside TEE (route questions via head, call models, grade)
+  4. Generate TDX attestation binding the proof
+  5. Serve proof via axon when validator queries
+
+The miner pays for model inference. The validator verifies the attested
+proof without calling any models.
+"""
+import base64
+import hashlib
+import json
+import logging
+import os
+import threading
+import time
+from typing import Tuple
+
+import click
+
+# isort: off
+import fugal_subnet.determinism  # noqa: F401, E402 — must precede numpy
+from fugal_subnet.config import MIN_VALIDATOR_STAKE  # noqa: E402
+# isort: on
+
+logger = logging.getLogger("fugal.miner")
+
+METAGRAPH_REFRESH_S = 300
+
+
+
+def caller_allowed(metagraph, caller, *, live: bool, min_stake: float | None = None):
+    """May `caller` query this axon? Returns (allowed, reason).
+
+    Live: a registered hotkey with stake at or above `min_stake` (default
+    MIN_VALIDATOR_STAKE) may query. A validator permit on its own does not:
+    subtensor grants a permit to any nonzero stake while fewer than
+    `max_allowed_validators` hotkeys are staked, so on a young subnet a
+    dust-staked hotkey holds one (review 2026-11-02). The axon answers with
+    the full head, so anyone else is a copier with a download link (diligence
+    2026-10, finding 5). The stake read is `metagraph.S`, the chain's
+    `total_stake` for the UID: alpha on this subnet plus root TAO at the
+    chain's root weight (0.18), after child/parent-key inheritance -- the
+    same quantity the chain uses for permits and weight influence. Mock: any
+    registered hotkey, for local testnets where nothing is staked. Factored
+    out of the axon closure so the rule can be tested without a chain.
+    """
+    if not caller:
+        return False, "no caller hotkey"
+    hotkeys = list(getattr(metagraph, "hotkeys", []) or [])
+    if caller not in hotkeys:
+        return False, f"unregistered hotkey {caller[:8]}..."
+    if not live:
+        return True, "ok (mock admits any registered hotkey)"
+    threshold = MIN_VALIDATOR_STAKE if min_stake is None else float(min_stake)
+    uid = hotkeys.index(caller)
+    stake = 0.0
+    try:
+        stake = float(metagraph.S[uid])
+    except (AttributeError, IndexError, TypeError):
+        pass
+    permit = False
+    try:
+        permit = bool(metagraph.validator_permit[uid])
+    except (AttributeError, IndexError, TypeError):
+        pass
+    if stake >= threshold:
+        return True, f"ok (stake {stake:.0f} >= {threshold:.0f}{', permit' if permit else ''})"
+    if permit:
+        return False, (
+            f"caller {caller[:8]}... has stake {stake:.0f} below {threshold:.0f}; "
+            "a validator permit alone does not admit"
+        )
+    return False, (
+        f"caller {caller[:8]}... has stake {stake:.0f} below {threshold:.0f} "
+        "and no validator permit"
+    )
+
+
+@click.command()
+@click.option("--network", default=lambda: os.getenv("FUGAL_NETWORK", "test"),
+              help="Network: finney, test, local")
+@click.option("--netuid", type=int,
+              default=lambda: int(os.getenv("FUGAL_NETUID", "1")),
+              help="Subnet netuid")
+@click.option("--coldkey", default=lambda: os.getenv("WALLET_NAME", "default"),
+              help="Wallet coldkey name")
+@click.option("--hotkey", default=lambda: os.getenv("HOTKEY_NAME", "default"),
+              help="Hotkey name")
+@click.option("--wallet-path", default=lambda: os.getenv("FUGAL_WALLET_PATH") or None,
+              type=click.Path(file_okay=False),
+              help="Bittensor wallet root")
+@click.option("--port", default=lambda: int(os.getenv("FUGAL_MINER_PORT", "8091")),
+              type=int, help="Axon port")
+@click.option("--await-provisioning", is_flag=True, default=False,
+              help="Wait for the operator to push the head and API key over an "
+                   "attested channel before serving. Under dstack this is how "
+                   "per-miner data arrives, because it cannot be in the measured "
+                   "compose. See fugal_subnet/tee/provision.py.")
+@click.option("--head-path", required=False, type=click.Path(exists=True),
+              help="Path to .npz head artifact")
+@click.option("--benchmark-pool", default=None, type=click.Path(exists=True),
+              help="Benchmark pool JSON (default: the same load_all() the "
+                   "validator uses — override only for offline or local runs)")
+@click.option("--mock/--live", default=True,
+              help="Mock mode (no real TDX attestation)")
+@click.option("--log-level",
+              type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
+              default=lambda: os.getenv("LOG_LEVEL", "INFO"),
+              help="Logging level")
+def main(network, netuid, coldkey, hotkey, wallet_path, port, head_path,
+         await_provisioning,
+         benchmark_pool, mock, log_level):
+    logging.basicConfig(
+        level=getattr(logging, log_level.upper()),
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+
+    import bittensor as bt
+
+    # After bittensor: importing it disables every logger that already exists,
+    # so without this the neuron's own output — including every error and
+    # traceback — is silently discarded. See fugal_subnet/logging_setup.
+    from fugal_subnet.logging_setup import configure_logging
+    configure_logging(log_level)
+    # Internet scanners probe any public port within seconds of it opening
+    # (measured on the first live TD: 114 requests for .env, wp-config.php,
+    # actuator, ... in the first minute). The SDK logs each as an ERROR-level
+    # UnknownSynapseError, which buries the miner's own lines. Drop that one
+    # message class; a real error from the axon still gets through.
+    class _DropSynapseScans(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            return "UnknownSynapseError" not in record.getMessage()
+    logging.getLogger("bittensor").addFilter(_DropSynapseScans())
+
+    from fugal_subnet.api import load_prices
+    from fugal_subnet.benchmarks.slicer import (
+        blocks_per_epoch as blocks_per_epoch_fn,
+    )
+    from fugal_subnet.benchmarks.slicer import (
+        epoch_index_for_block,
+    )
+    from fugal_subnet.commitments import ensure_commitment
+    from fugal_subnet.config import (
+        EPOCH_INTERVAL,
+        EXPLORE_FRACTION,
+        MIN_VALIDATOR_STAKE,
+        SLICE_SIZE,
+        TEE_MODEL_PRICES_PATH,
+        TEE_PROXY_PORT,
+    )
+    from fugal_subnet.protocol import FugalProofSynapse
+    from fugal_subnet.tee.runtime import TEERuntime
+
+    if await_provisioning:
+        # The wallet arrives over the same channel: the TD signs serve_axon and
+        # the head commitment itself, so the keyfile has to be inside it, and
+        # a pushed wallet is the only path that never touches storage the cloud
+        # can read. The returned path is a tmpfs directory laid out the way
+        # bt.Wallet expects, so everything below is unchanged.
+        head_data, wallet_path = _await_provisioning(
+            coldkey=coldkey, hotkey=hotkey, wallet_path=wallet_path,
+        )
+    elif head_path:
+        head_data = _load_head_file(head_path)
+    else:
+        raise click.ClickException(
+            "--head-path is required unless --await-provisioning is set"
+        )
+    from fugal_subnet.config import V2_ACTIVATION_BLOCK as _V2_BLOCK
+    from fugal_subnet.head_eval import load_head_from_npz
+    from fugal_subnet.routing_protocol import benchmark_costs_for
+    # Validate the head against the protocol this image serves: a v2 head checks
+    # against the v2 token manifest. v1's check refused every genuine v2 head at
+    # startup (found by the v2 flip rehearsal).
+    benchmark_costs_for(load_head_from_npz(head_data), 2 if _V2_BLOCK is not None else 1,
+                        require_reviewed=not mock)
+    weights_hash = hashlib.sha256(head_data).hexdigest()
+
+    # The pool is consensus state: the slice is drawn from it, so the miner and
+    # the validator must derive it identically or every proof fails on
+    # questions_hash for a reason that looks nothing like the cause. Default to
+    # the same loader the validator calls; --benchmark-pool is an explicit
+    # local override, and FUGAL_BENCHMARK_POOL overrides for both sides at once.
+    # ONE code path, always. --benchmark-pool used to json.load the file here,
+    # which meant the flag bypassed everything load_all() does — and when the
+    # loader learned to drop questions the harness cannot grade, the validator
+    # served 125 questions while the miner served 150 and every proof failed on
+    # a questions_hash that named neither side. Routing the flag through the
+    # same env var the validator honours makes a second path impossible rather
+    # than merely discouraged. tests/test_pool_single_source.py enforces it.
+    # Protocol v2 images set FUGAL_V2_ACTIVATION_BLOCK in their compose: the v2
+    # image serves v2 only (v1 TDs keep running the v1 image until the flip), so
+    # the miner needs no dual mode, only the hold below. Unset means v1.
+    from fugal_subnet.benchmarks.loader import load_pool, pool_hash
+    from fugal_subnet.config import V2_ACTIVATION_BLOCK
+    protocol = 2 if V2_ACTIVATION_BLOCK is not None else 1
+    if benchmark_pool:
+        os.environ["FUGAL_BENCHMARK_POOL_V2" if protocol == 2 else "FUGAL_BENCHMARK_POOL"] = \
+            os.path.abspath(benchmark_pool)
+    pool = load_pool(protocol)
+    if not pool:
+        raise click.ClickException("Benchmark pool is empty — nothing to benchmark")
+    logger.info("Benchmark pool: %d questions, pool_hash=%s",
+                len(pool), pool_hash(pool)[:16])
+
+    # The globally agreed model space. Exploration targets are drawn from this
+    # sorted list, never from the miner's own head, so the samples the reference
+    # frame is built from cannot be steered.
+    from fugal_subnet.routing_protocol import models_for_protocol, price_table
+    if protocol == 2:
+        prices = price_table(2)
+        pool_models = models_for_protocol(2)
+    else:
+        prices = load_prices(TEE_MODEL_PRICES_PATH or None)
+        pool_models = sorted(prices)
+    explore_size = max(1, int(round(SLICE_SIZE * EXPLORE_FRACTION)))
+    logger.info("Price table: %d models; exploration quota %d questions/epoch",
+                len(pool_models), explore_size)
+
+    logger.info("Head loaded: %s (%d bytes)", head_path or "(pushed over the attested channel)", len(head_data))
+    logger.info("Weights hash: %s", weights_hash[:16])
+
+    # Once, at startup — not per epoch. See _compute_hidden_states.
+    logger.info("Computing backbone embeddings for %d questions...", len(pool))
+    hidden_states = _compute_hidden_states(pool)
+    logger.info("Embeddings ready: %s (backbone released)", hidden_states.shape)
+
+    wallet = bt.Wallet(name=coldkey, hotkey=hotkey, path=wallet_path)
+    subtensor = bt.Subtensor(network=network)
+    # The miner keeps --mock as its default because --live spends real money
+    # on inference; what it must never do is run mock on mainnet.
+    from fugal_subnet.fingerprint import (
+        assert_consensus_overrides_allowed,
+        assert_mock_allowed,
+        chain_genesis_hash,
+    )
+    try:
+        genesis = chain_genesis_hash(subtensor)
+        assert_mock_allowed(genesis, mock)
+        # A consensus constant in the environment (the compose sets
+        # FUGAL_EXPLORE_FRACTION=0.5 for the testnet warm-up) is refused on
+        # finney and warned about elsewhere, as on the validator.
+        assert_consensus_overrides_allowed(genesis)
+    except RuntimeError as e:
+        raise click.ClickException(str(e)) from e
+    metagraph = subtensor.metagraph(netuid)
+
+    my_hotkey = wallet.hotkey.ss58_address
+    if my_hotkey not in metagraph.hotkeys:
+        logger.error("Hotkey %s not registered on netuid %d", my_hotkey, netuid)
+        return
+    my_uid = metagraph.hotkeys.index(my_hotkey)
+    logger.info("Miner UID %d on %s netuid %d", my_uid, network, netuid)
+
+    # NOTE: the on-chain commitment is deliberately NOT made here. Chains rate
+    # limit transactions per hotkey, so committing immediately before
+    # axon.serve() gets the serve extrinsic rejected and leaves the miner
+    # unreachable at 0.0.0.0 — earning nothing, with the commitment it did
+    # land being worthless because no validator can query it. Reachability
+    # first; the commitment is made after the axon is serving and retried each
+    # epoch until it sticks.
+    committed = False
+
+    tee_runtime = TEERuntime(mock=mock)
+
+    # Bind what this runtime IS into RTMR3, once, before any proof exists.
+    # Advisory today: on an unmeasured filesystem an attacker extends the value
+    # we expect. It is written anyway so that locking the image turns this into
+    # evidence rather than requiring a new mechanism. Says so out loud either
+    # way — a binding nobody can see is worse than none. See INVARIANTS.md I8.
+    if not mock:
+        from fugal_subnet.benchmarks.loader import pool_hash as _pool_hash
+        from fugal_subnet.graders import grader_hash
+        from fugal_subnet.tee.attestation import extend_rtmr3, runtime_identity
+        from fugal_subnet.tee.runtime import _OPENROUTER_BASE
+        identity = runtime_identity(
+            source_hash=_get_source_hash(),
+            pool_hash=_pool_hash(pool),
+            grader_hash=grader_hash(),
+            upstream=_OPENROUTER_BASE,
+        )
+        logger.info("Model upstream: %s", _OPENROUTER_BASE)
+        if extend_rtmr3(identity):
+            logger.info(
+                "Runtime identity %s extended into RTMR3 (ADVISORY: not "
+                "enforced until the image is locked)", identity[:16],
+            )
+        else:
+            logger.warning(
+                "Runtime identity %s could NOT be extended into RTMR3. Nothing "
+                "in this TD's measurement registers binds the code that will "
+                "produce its proofs.", identity[:16],
+            )
+    # A live axon serves the full head to whoever may query it, and the
+    # default admits only staked validators. Zero would admit any
+    # registered hotkey, which is a free download of this router (diligence
+    # 2026-10, finding 5), so it is refused rather than warned about.
+    if not mock and MIN_VALIDATOR_STAKE <= 0:
+        raise click.ClickException(
+            "--live with FUGAL_MIN_VALIDATOR_STAKE=0 would serve this miner's head "
+            "to any registered hotkey. Leave it at the default or set a positive "
+            "threshold; a validator permit alone does not admit a caller."
+        )
+
+    current_proof = {
+        "proof": None, "proof_json": "", "epoch_id": "", "lock": threading.Lock(),
+    }
+
+    mg_lock = threading.Lock()
+    mg_state = {"metagraph": metagraph}
+
+    def blacklist(synapse: FugalProofSynapse) -> Tuple[bool, str]:
+        caller = getattr(synapse.dendrite, "hotkey", None)
+        with mg_lock:
+            mg = mg_state["metagraph"]
+        allowed, reason = caller_allowed(mg, caller, live=not mock)
+        return (not allowed), reason
+
+    head_b64 = base64.b64encode(head_data).decode("ascii")
+
+    def forward(synapse: FugalProofSynapse) -> FugalProofSynapse:
+        with current_proof["lock"]:
+            proof = current_proof["proof"]
+            proof_json = current_proof["proof_json"]
+            proof_epoch = current_proof["epoch_id"]
+        if proof is None:
+            logger.warning("No proof available yet for epoch %s", synapse.epoch_id)
+            return synapse
+
+        # Serve only a proof for the epoch the validator actually asked about.
+        # The validator rejects a stale proof anyway (its nonce won't match), so
+        # returning one just burns bandwidth and buries the real reason in a
+        # generic "nonce mismatch" on the validator side.
+        if synapse.epoch_id and synapse.epoch_id != proof_epoch:
+            logger.warning(
+                "Epoch mismatch: validator asked for %s, we hold %s — not serving",
+                synapse.epoch_id, proof_epoch or "<none>",
+            )
+            return synapse
+
+        # The bundle rides back inline. See fugal_subnet/protocol.py for why
+        # there is no external store: the validator is asking us right now, so
+        # a second fetch from a third party adds a failure mode and buys nothing.
+        synapse.proof_json = proof_json
+        synapse.head_npz_b64 = head_b64
+        synapse.proof_hash = proof.content_hash()
+        synapse.weights_hash = weights_hash
+        logger.info(
+            "Epoch %s: serving bundle (hash=%s, %d KB proof + %d KB head)",
+            synapse.epoch_id, synapse.proof_hash[:16],
+            len(proof_json) // 1024, len(head_b64) // 1024,
+        )
+        return synapse
+
+    blocks_per_epoch = blocks_per_epoch_fn(EPOCH_INTERVAL)
+    committed = False
+    if protocol == 2:
+        # Hold until the flip. One hotkey holds ONE on-chain commitment, and the
+        # v1 TD serving this hotkey until the flip is scored against it: a v2
+        # commit during the notice window would make every v1 proof from this
+        # hotkey fail. So: embed (done above), commit in the epoch BEFORE the
+        # activation block so the commitment is on chain at the flip boundary,
+        # and register the axon only from the activation block.
+        from fugal_subnet.benchmarks.slicer import validate_activation_block
+        validate_activation_block(V2_ACTIVATION_BLOCK, blocks_per_epoch)
+        # Validators read commitments at each epoch's BOUNDARY block, so a commit
+        # that lands after the last v1 boundary is invisible to that v1 epoch
+        # (its proof is still checked against the old head) and visible at the
+        # flip boundary. COMMIT_AFTER_BOUNDARY_BLOCKS keeps it clear of the
+        # boundary block itself.
+        from fugal_subnet.config import (
+            COMMIT_AFTER_BOUNDARY_BLOCKS,
+            COMMIT_DEADLINE_BEFORE_FLIP_BLOCKS,
+        )
+        commit_at = V2_ACTIVATION_BLOCK - blocks_per_epoch + COMMIT_AFTER_BOUNDARY_BLOCKS
+        _wait_for_block(subtensor, commit_at, "commit the v2 head (after the last v1 boundary)")
+        committed = _commit_before_deadline(
+            subtensor, wallet, netuid, weights_hash,
+            deadline=V2_ACTIVATION_BLOCK - COMMIT_DEADLINE_BEFORE_FLIP_BLOCKS,
+        )
+        _wait_for_block(subtensor, V2_ACTIVATION_BLOCK, "serve the axon (the v2 flip)")
+
+    external_ip = os.getenv("FUGAL_AXON_IP")
+    if external_ip and _is_unroutable(external_ip):
+        # The chain rejects loopback and unspecified addresses for serve_axon
+        # at pool validation (Custom error 11), before the extrinsic executes.
+        # bt.Axon.serve() swallows that, so the only symptom is an axon that
+        # stays at 0.0.0.0 and a miner that silently earns nothing.
+        logger.error(
+            "FUGAL_AXON_IP=%s is not routable. The chain will reject serve_axon "
+            "and no validator will ever reach this miner. Set it to an address "
+            "validators can actually connect to.", external_ip,
+        )
+    # Fail before serving if something else already holds the port. bt.Axon
+    # runs its server in a thread and a bind failure there does not surface:
+    # the miner goes on to register the address on chain and log success while
+    # every validator query is answered by whatever process actually owns the
+    # port. Observed exactly that — a stray HTTP server returned 501 to every
+    # dendrite and the miner reported itself healthy throughout.
+    _assert_port_free(port)
+    axon = bt.Axon(wallet=wallet, port=port,
+                    external_ip=external_ip or None)
+    axon.attach(forward_fn=forward, blacklist_fn=blacklist)
+
+    for attempt in range(5):
+        try:
+            axon.serve(netuid=netuid, subtensor=subtensor)
+        except Exception as e:
+            logger.warning("axon.serve() attempt %d failed: %s", attempt + 1, e)
+        metagraph = subtensor.metagraph(netuid)
+        registered_ip = metagraph.axons[my_uid].ip
+        if registered_ip not in ("0.0.0.0", ""):
+            logger.info("Axon registered on chain: %s:%d", registered_ip, port)
+            break
+        if attempt < 4:
+            logger.warning("Axon IP not registered yet, retrying in 15s...")
+            time.sleep(15)
+        else:
+            logger.error(
+                "axon.serve() failed after 5 attempts — the axon is still "
+                "unregistered (0.0.0.0), so no validator can query this miner "
+                "and it will earn nothing. Common causes: the external IP is "
+                "loopback or otherwise unroutable (currently %s), the port is "
+                "unreachable from outside, or the chain is rate limiting this "
+                "hotkey's transactions.",
+                external_ip or "auto-detected",
+            )
+
+    axon.start()
+    logger.info("Miner axon serving on port %d (mock=%s)", port, mock)
+    _warn_if_unreachable(metagraph.axons[my_uid].ip, port)
+
+    # Now that the axon is serving, commit the head hash. Retried in the loop
+    # below if the chain rate-limits this one.
+    if not committed:
+        committed = ensure_commitment(subtensor, wallet, netuid, weights_hash)
+    if not committed:
+        logger.warning("Weights hash NOT committed on-chain yet — will retry.")
+
+    try:
+        last_refresh = time.time()
+        last_epoch_index = -1
+        consecutive_failures = 0
+        while True:
+            time.sleep(30)
+
+            if not committed:
+                committed = ensure_commitment(subtensor, wallet, netuid, weights_hash)
+
+            if time.time() - last_refresh >= METAGRAPH_REFRESH_S:
+                try:
+                    fresh = subtensor.metagraph(netuid)
+                    with mg_lock:
+                        mg_state["metagraph"] = fresh
+                except Exception as e:
+                    logger.warning("Metagraph refresh failed: %s", e)
+                last_refresh = time.time()
+
+            try:
+                current_block = subtensor.get_current_block()
+                epoch_index = epoch_index_for_block(current_block, blocks_per_epoch)
+                if epoch_index <= last_epoch_index:
+                    continue
+
+                boundary_block = epoch_index * blocks_per_epoch
+                block_hash = subtensor.get_block_hash(boundary_block)
+                if not block_hash:
+                    continue
+
+                # Don't start an epoch that can't finish: a proof that misses the
+                # collection block is a miss, and the calls are paid for anyway.
+                # Seen at a cutover: three runs started after their collection block.
+                from fugal_subnet.benchmarks.slicer import collect_block_for_epoch
+                from fugal_subnet.config import EPOCH_COLLECT_FRACTION, LATE_START_MARGIN_BLOCKS
+                deadline = collect_block_for_epoch(epoch_index, blocks_per_epoch, EPOCH_COLLECT_FRACTION)
+                if current_block > deadline - LATE_START_MARGIN_BLOCKS:
+                    logger.info("Skipping epoch %d: %d blocks to its collection block %d, fewer than %d",
+                                epoch_index, deadline - current_block, deadline, LATE_START_MARGIN_BLOCKS)
+                    last_epoch_index = epoch_index
+                    continue
+
+                last_epoch_index = epoch_index
+                _run_epoch(
+                    blocks_per_epoch=blocks_per_epoch,
+                    head_data=head_data,
+                    weights_hash=weights_hash,
+                    pool=pool,
+                    hidden_states=hidden_states,
+                    epoch_index=epoch_index,
+                    block_hash=block_hash,
+                    tee_runtime=tee_runtime,
+                    current_proof=current_proof,
+                    slice_size=SLICE_SIZE,
+                    proxy_port=TEE_PROXY_PORT,
+                    explore_models=pool_models,
+                    explore_size=explore_size,
+                    hotkey=my_hotkey,
+                    protocol_version=protocol,
+                    prices=prices if protocol == 2 else None,
+                )
+                consecutive_failures = 0
+            except Exception:
+                # A miner that silently swallows every epoch failure looks
+                # alive while producing nothing. Log the traceback and escalate
+                # so the operator sees it.
+                consecutive_failures += 1
+                logger.exception(
+                    "Epoch run failed (%d consecutive)", consecutive_failures,
+                )
+                if consecutive_failures >= 3:
+                    logger.error(
+                        "%d consecutive epoch failures — this miner is earning "
+                        "nothing. Fix the error above.", consecutive_failures,
+                    )
+
+    except KeyboardInterrupt:
+        logger.info("Miner stopped by user")
+    finally:
+        axon.stop()
+        tee_runtime.teardown()
+        logger.info("Miner shutdown complete")
+
+
+def _wait_for_block(subtensor, block: int, purpose: str, poll_s: float = 30.0) -> None:
+    """Block until the chain reaches `block`, logging what the miner is waiting to do."""
+    while True:
+        current = subtensor.get_current_block()
+        if current >= block:
+            return
+        logger.info("Holding for v2: %d blocks until block %d, then %s", block - current, block, purpose)
+        time.sleep(poll_s)
+
+
+def _commit_before_deadline(subtensor, wallet, netuid, weights_hash, deadline: int,
+                            retry_blocks: int | None = None, poll_s: float = 6.0) -> bool:
+    """Commit the head, retrying every `retry_blocks` blocks until block `deadline`.
+
+    Returns True once the chain holds the commitment. A False return means the
+    deadline passed: the post-flip fallback will still commit, but validators read
+    commitments at the flip boundary, so this miner's first v2 epoch(s) will be
+    rejected as committed late.
+    """
+    from fugal_subnet.commitments import ensure_commitment
+    from fugal_subnet.config import COMMIT_RETRY_BLOCKS
+    retry_blocks = COMMIT_RETRY_BLOCKS if retry_blocks is None else retry_blocks
+    def block_now():
+        while True:
+            try:
+                return subtensor.get_current_block()
+            except Exception as e:
+                logger.warning("Could not read the current block (%s); retrying", e)
+                time.sleep(poll_s)
+
+    attempt = 0
+    while True:
+        current = block_now()
+        if current >= deadline:
+            logger.error(
+                "v2 head NOT committed by block %d (now %d) after %d attempt(s). The commit "
+                "falls back to after the flip, and validators will reject this miner's first "
+                "v2 epoch(s) as committed late. Check the hotkey's chain access and balance.",
+                deadline, current, attempt,
+            )
+            return False
+        attempt += 1
+        if ensure_commitment(subtensor, wallet, netuid, weights_hash):
+            if attempt > 1:
+                logger.info("v2 head committed on attempt %d at block %d", attempt, current)
+            return True
+        retry_at = current + retry_blocks
+        logger.warning(
+            "v2 head commit attempt %d failed at block %d; retrying at block %d "
+            "(deadline %d, %d blocks left)", attempt, current, retry_at, deadline, deadline - current,
+        )
+        while block_now() < retry_at:
+            time.sleep(poll_s)
+
+
+def _run_epoch(
+    blocks_per_epoch,
+    head_data,
+    weights_hash,
+    pool,
+    hidden_states,
+    epoch_index,
+    block_hash,
+    tee_runtime,
+    current_proof,
+    slice_size,
+    proxy_port,
+    explore_models,
+    explore_size,
+    hotkey,
+    protocol_version=1,
+    prices=None,
+):
+    """Run a single benchmark epoch."""
+    from fugal_subnet.benchmarks.slicer import derive_nonce, epoch_id_for_block
+    from fugal_subnet.tee.harness import run_benchmark
+
+    # Must match the validator exactly — see slicer.epoch_id_for_block.
+    epoch_id = epoch_id_for_block(epoch_index)
+    nonce_bytes = derive_nonce(epoch_id, block_hash)
+    nonce = nonce_bytes.hex()
+
+    # State the deadline. Validators collect at a fixed block derived from the
+    # epoch, so "my miner earns nothing" is usually "my benchmark did not
+    # finish in time" — which is invisible unless the miner says what the time
+    # was. A miner that consistently overruns this should cut its slice cost,
+    # not wonder why its proofs are ignored.
+    from fugal_subnet.benchmarks.slicer import collect_block_for_epoch
+    from fugal_subnet.config import EPOCH_COLLECT_FRACTION
+    collect_block = collect_block_for_epoch(
+        epoch_index, blocks_per_epoch, EPOCH_COLLECT_FRACTION,
+    )
+    logger.info(
+        "Starting epoch %s (nonce=%s...); proof must be ready by block %d",
+        epoch_id, nonce[:16], collect_block,
+    )
+
+    proxy = tee_runtime.setup(proxy_port=proxy_port, prices=prices)
+    try:
+        proof = run_benchmark(
+            nonce=nonce,
+            head_bytes=head_data,
+            benchmark_pool=pool,
+            proxy=proxy,
+            hidden_states=hidden_states,
+            slice_size=slice_size,
+            epoch_id=epoch_id,
+            source_hash=_get_source_hash(),
+            explore_models=explore_models,
+            explore_size=explore_size,
+            # Binds the proof to THIS miner. Without it a proof is bound to an
+            # epoch, a slice, a head and a runtime, but to nobody — and can be
+            # read off this axon and presented by anyone.
+            hotkey=hotkey,
+            protocol_version=protocol_version,
+        )
+
+        content_hash_bytes = bytes.fromhex(proof.content_hash())
+        proof.attestation_quote = tee_runtime.generate_attestation(content_hash_bytes)
+
+        # Serialize once here, not per query: several validators may ask for
+        # the same epoch and the JSON is identical for all of them.
+        with current_proof["lock"]:
+            current_proof["proof"] = proof
+            current_proof["proof_json"] = json.dumps(
+                proof.to_dict(), separators=(",", ":"),
+            )
+            current_proof["epoch_id"] = epoch_id
+
+        logger.info(
+            "Epoch %s complete: %d/%d correct (%.1f%%), cost=$%.4f",
+            epoch_id, proof.n_correct, proof.n_total,
+            proof.accuracy * 100, proof.total_cost_usd,
+        )
+    finally:
+        proxy.stop()
+
+
+def _await_provisioning(coldkey: str = "default", hotkey: str = "default",
+                        wallet_path: "str | None" = None):
+    """Block until the operator pushes per-miner data; return (head, wallet_path).
+
+    THE AXON DOES NOT SERVE UNTIL THIS RETURNS, and that is the point. An
+    unprovisioned miner is not partially ready: it would answer a validator with
+    no proof, spend that validator's query budget to learn nothing, and read as
+    a dead miner rather than a starting one. Blocking here fails loudly in the
+    operator's own log — "waiting to be provisioned" is a sentence someone can
+    act on, and silent emptiness is the failure shape this project keeps
+    finding.
+
+    The API key is put into the environment rather than passed down because
+    MeteringProxy already reads it from there, and threading a secret through
+    six call frames creates six places it can be logged.
+
+    THE WALLET. If the push carries `hotkey_keyfile_b64` (and `coldkeypub_b64`,
+    which the SDK's serve_axon reads for the coldkey address), both are written
+    under a tmpfs wallet root laid out as bt.Wallet expects —
+    `<root>/<coldkey>/hotkeys/<hotkey>` and `<root>/<coldkey>/coldkeypub.txt`,
+    mode 0600 — and that root is returned as the wallet path. tmpfs, not the
+    data volume: a key that outlived the attestation which justified releasing
+    it would still be there for a later boot with a different measurement. The
+    default root is /dev/shm; FUGAL_PROVISIONED_WALLET_DIR overrides it. When
+    the push carries no keyfile the caller's own wallet_path is returned
+    unchanged, so a TD that already holds a wallet by some other means keeps
+    working.
+    """
+    import base64
+    import os
+    import time
+
+    from fugal_subnet.tee.provision import PROVISION_PORT, ProvisionStore, serve
+
+    store = ProvisionStore()
+    server = serve(store, port=PROVISION_PORT)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    logger.info(
+        "Waiting to be provisioned on port %d. The operator must verify this "
+        "TD's attestation and push the head and API key; nothing is served "
+        "until they do.", PROVISION_PORT,
+    )
+    waited = 0
+    while not store.ready:
+        time.sleep(1)
+        waited += 1
+        if waited % 30 == 0:
+            logger.info("still waiting to be provisioned (%ds)", waited)
+
+    head_b64 = store.get("head_b64")
+    if not head_b64:
+        raise click.ClickException(
+            "provisioned without a head — the miner has nothing to benchmark"
+        )
+    key = store.get("openrouter_api_key")
+    if key:
+        os.environ["OPENROUTER_API_KEY"] = key
+        logger.info("API key received over the attested channel")
+
+    keyfile_b64 = store.get("hotkey_keyfile_b64")
+    if keyfile_b64:
+        root = os.getenv("FUGAL_PROVISIONED_WALLET_DIR", "/dev/shm/fugal-wallet")
+        wallet_dir = os.path.join(root, coldkey)
+        hotkeys_dir = os.path.join(wallet_dir, "hotkeys")
+        os.makedirs(hotkeys_dir, mode=0o700, exist_ok=True)
+        os.chmod(root, 0o700)
+        os.chmod(wallet_dir, 0o700)
+        _write_private(os.path.join(hotkeys_dir, hotkey), base64.b64decode(keyfile_b64))
+        coldkeypub_b64 = store.get("coldkeypub_b64")
+        if coldkeypub_b64:
+            _write_private(os.path.join(wallet_dir, "coldkeypub.txt"),
+                           base64.b64decode(coldkeypub_b64))
+        else:
+            logger.warning(
+                "hotkey keyfile received without coldkeypub — the SDK reads the "
+                "coldkey address to serve an axon, so serving will fail unless "
+                "the wallet dir already holds coldkeypub.txt",
+            )
+        wallet_path = root
+        # Names only. The keyfile is a secret; the path says where, not what.
+        logger.info("Wallet received over the attested channel: %s/%s at %s",
+                    coldkey, hotkey, root)
+    logger.info("Provisioned after %ds; the axon may now serve", waited)
+    return base64.b64decode(head_b64), wallet_path
+
+
+def _write_private(path: str, data: bytes) -> None:
+    """Write a keyfile so it is never world-readable, even for an instant."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    os.chmod(path, 0o600)
+
+
+def _assert_port_free(port: int) -> None:
+    """Refuse to start if another process is listening on the axon port."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            # 0.0.0.0 is REQUIRED here and narrowing it to 127.0.0.1 would
+            # silently break this check. The axon binds 0.0.0.0 — it must, or no
+            # validator can reach it — so the only question worth asking is
+            # whether THAT bind will succeed. A process holding a single
+            # external interface (192.168.1.5:8091, say) does not conflict with
+            # a loopback bind, so a loopback probe would report the port free
+            # and the axon would then fail to bind the port it actually needs.
+            # This socket never listens or accepts; it binds and closes, so it
+            # exposes nothing. CodeQL flags the literal, not the behaviour.
+            probe.bind(("0.0.0.0", port))
+        except OSError as e:
+            raise click.ClickException(
+                f"Port {port} is already in use ({e}). Another process would "
+                f"answer every validator query while this miner reported "
+                f"itself healthy. Free the port, or pass a different --port."
+            ) from e
+
+
+def _warn_if_unreachable(published_ip: str, port: int) -> None:
+    """Try to connect to the address this miner just told the chain to use.
+
+    Serving an axon and being reachable are different things, and only the
+    first one is reported anywhere. A miner on a cloud VM whose provider
+    firewall does not allow the port publishes a perfectly valid address,
+    logs "Axon registered on chain", and is never once contacted — it earns
+    nothing for as long as it runs, with no error on either side. That is not
+    hypothetical: netuid 552's miner advertised a public address for months
+    behind a closed security-list rule.
+
+    This is a warning and never fatal. Many hosts do not route their own public
+    address back to themselves (no NAT hairpinning), so a failure here does not
+    prove the miner is unreachable — but a success does prove it is reachable,
+    and a failure is worth a line the operator can act on.
+    """
+    import socket
+    import time as _time
+
+    if not published_ip or published_ip in ("0.0.0.0", ""):
+        return
+    # axon.start() returns before its server thread is listening, so a single
+    # immediate probe reports "connection refused" on a perfectly healthy
+    # miner. Retry briefly: a false alarm here trains an operator to ignore
+    # the one warning that means their miner earns nothing.
+    deadline = _time.monotonic() + 20
+    e: OSError | None = None
+    while _time.monotonic() < deadline:
+        try:
+            with socket.create_connection((published_ip, port), timeout=5):
+                # Something accepted. That is all a TCP connect can tell us —
+                # it does not prove the responder is this axon, which is why
+                # the port is claimed before serving rather than inferred after.
+                logger.info("Axon accepts connections at %s:%d", published_ip, port)
+                return
+        except OSError as err:
+            e = err
+            _time.sleep(1)
+    if e is not None:
+        logger.warning(
+            "Could not connect to this miner's own published address %s:%d (%s). "
+            "If this host does not route its public IP back to itself this is "
+            "harmless, but if the port is genuinely closed no validator will "
+            "ever reach this miner and it will earn nothing while appearing "
+            "healthy. Verify from another machine: nc -vz %s %d",
+            published_ip, port, e, published_ip, port,
+        )
+
+
+def _embedding_cache_path(pool) -> str:
+    """Where this pool's embeddings live on disk.
+
+    Keyed by everything the result depends on. Two of these are consensus
+    inputs and one is not: the pool and the batch size are pinned and shared,
+    while the backbone build is local — and x86_64 and aarch64 genuinely
+    disagree in the last bits of float32, so an architecture-blind key would
+    hand a miner another machine's numbers. Keying on the machine makes the
+    cache a pure memo of what this host would have computed anyway.
+    """
+    import platform
+
+    from fugal_subnet.benchmarks.loader import pool_hash
+    from fugal_subnet.config import BACKBONE_BATCH_SIZE, BACKBONE_MODEL
+
+    key = hashlib.sha256("|".join([
+        pool_hash(pool),
+        BACKBONE_MODEL,
+        __import__("fugal_subnet.vendor.success_contract", fromlist=["PROFILE_ID"]).PROFILE_ID,
+        str(BACKBONE_BATCH_SIZE),
+        platform.machine(),
+    ]).encode("utf-8")).hexdigest()[:32]
+    root = os.getenv("FUGAL_EMBEDDING_CACHE", os.path.join("data", "embeddings"))
+    return os.path.join(root, f"hidden-{key}.npz")
+
+
+def _compute_hidden_states(pool):
+    """Backbone hidden states for the benchmark pool, computed once and cached.
+
+    Called at startup, never per epoch. Embeddings are a pure function of the
+    pool, the frozen backbone and the pinned batch size — none of which change
+    between epochs — so recomputing them every epoch burned minutes of CPU on a
+    21K-question pool for an identical result.
+
+    They do not change between *restarts* either, which is why the result is
+    cached to disk. Measured on the real 21,717-question pool: 2h28m on an
+    x86_64 laptop and 7h20m on a 4-core aarch64 VM. Paying that on every
+    restart is not a startup cost, it is an availability failure — the miner is
+    unreachable for hours and earns nothing, and any crash-loop is permanent.
+
+    The cache is keyed by pool_hash so a pool change invalidates it, and it is
+    loaded with allow_pickle=False so a hostile file cannot execute anything.
+    A corrupt or unreadable file is recomputed.
+
+    WHAT IT DOES NOT DEFEND AGAINST, stated plainly. These embeddings are
+    computed here and passed into run_benchmark, which means they are an input
+    to the attested harness rather than a product of it. Anyone who can write
+    this file chooses the routing the head appears to produce — they could make
+    a head look like it routes well when it does not, which matters because the
+    head is the artifact other people are meant to reuse.
+
+    That is acceptable only because of where this is supposed to run. Under
+    --live the whole miner executes inside the TD, so the file lives in the
+    TD's own storage and is covered by the same protection as the code the
+    measurement attests. Running a --live miner with this cache on storage
+    outside the TD removes a binding the attestation is assumed to provide.
+    Point FUGAL_EMBEDDING_CACHE inside the enclave, or accept recomputing.
+
+    The backbone is released afterwards: it is ~2.4GB resident and is not
+    needed again once the embeddings exist.
+    """
+    from fugal_subnet.backbone import compute_hidden_states, release_backbone
+    from fugal_subnet.config import BACKBONE_BATCH_SIZE
+    from fugal_subnet.vendor import success_contract as contract
+
+    questions = [q["prompt"] for q in pool]
+    cache_path = _embedding_cache_path(pool)
+    if os.path.exists(cache_path):
+        hidden = contract.load_cache(cache_path, questions)
+        logger.info("Embeddings loaded from cache: %s", cache_path)
+        return hidden
+
+    # Use the configured memory bound for the 2048-token CPU profile. The shared
+    # implementation excludes padding from pooling and has batch/single checks.
+    try:
+        hidden = compute_hidden_states(questions, batch_size=BACKBONE_BATCH_SIZE)
+    finally:
+        release_backbone()
+
+    try:
+        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+        # Write-then-rename: a miner killed mid-write must not leave a
+        # truncated cache that the next start reads as complete.
+        # np.save appends ".npy" unless the name already ends in it, so the
+        # temp name carries the suffix or the rename below looks for a file
+        # that was never written.
+        tmp = f"{cache_path}.{os.getpid()}.tmp.npz"
+        contract.save_cache(tmp, questions, hidden)
+        os.replace(tmp, cache_path)
+        logger.info("Embeddings cached to %s", cache_path)
+    except Exception as e:  # noqa: BLE001 - caching is an optimisation
+        logger.warning("Could not cache embeddings to %s: %s", cache_path, e)
+    return hidden
+
+
+def _get_source_hash():
+    """Hash the actual source file contents for measurement verification."""
+    import fugal_subnet
+    src_dir = os.path.dirname(os.path.abspath(fugal_subnet.__file__))
+    h = hashlib.sha256()
+    for root, _dirs, files in sorted(os.walk(src_dir)):
+        for fname in sorted(files):
+            if not fname.endswith(".py"):
+                continue
+            fpath = os.path.join(root, fname)
+            h.update(fpath[len(src_dir):].encode())
+            h.update(open(fpath, "rb").read())
+    return h.hexdigest()
+
+
+def _is_unroutable(ip: str) -> bool:
+    """True for addresses the chain will not accept for serve_axon."""
+    import ipaddress
+
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return addr.is_loopback or addr.is_unspecified
+
+
+def _load_head_file(path):
+    """Load and validate the head .npz file."""
+    from fugal_subnet.head_eval import load_head_from_npz
+    with open(path, "rb") as f:
+        data = f.read()
+    try:
+        load_head_from_npz(data)
+    except ValueError as e:
+        raise click.ClickException(f"Head failed validation: {e}")
+    return data
+
+
+if __name__ == "__main__":
+    main()

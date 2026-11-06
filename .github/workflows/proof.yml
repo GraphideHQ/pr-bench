@@ -1,0 +1,113 @@
+# The proof for one case's fix: its repro fails on main (the commit before the fix) and passes
+# on the fix, and its suite passes on the fix (.bench/run.sh). Run it on main with the fix's
+# branch: gh workflow run proof.yml --ref main -f case=CASE -f fix_ref=BRANCH
+name: proof
+on:
+  workflow_dispatch:
+    inputs:
+      case:
+        description: the case folder under cases/
+        required: true
+        type: choice
+        options: [bquery-ui, mit-learn, fugal-subnet, aiohttp-mcp, contr]
+      fix_ref:
+        description: the branch or commit with the fix
+        required: true
+        type: string
+run-name: proof ${{ inputs.case }} at ${{ inputs.fix_ref }}
+permissions:
+  contents: read
+jobs:
+  bquery-ui:
+    if: inputs.case == 'bquery-ui'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {path: before, persist-credentials: false}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {path: after, ref: "${{ inputs.fix_ref }}", persist-credentials: false}
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2.0.2
+        with: {bun-version: "1.3.13"}
+      - run: bash before/.bench/run.sh bquery-ui before after
+  fugal-subnet:
+    if: inputs.case == 'fugal-subnet'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {path: before, persist-credentials: false}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {path: after, ref: "${{ inputs.fix_ref }}", persist-credentials: false}
+      - uses: actions/setup-python@v7
+        with: {python-version: "3.12"}
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - run: bash before/.bench/run.sh fugal-subnet before after
+  aiohttp-mcp:
+    if: inputs.case == 'aiohttp-mcp'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {path: before, persist-credentials: false}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {path: after, ref: "${{ inputs.fix_ref }}", persist-credentials: false}
+      - uses: actions/setup-python@v7
+        with: {python-version: "3.12"}
+      - run: bash before/.bench/run.sh aiohttp-mcp before after
+  contr:
+    if: inputs.case == 'contr'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {path: before, persist-credentials: false}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {path: after, ref: "${{ inputs.fix_ref }}", persist-credentials: false}
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: {go-version-file: before/cases/contr/go.mod, cache: false}
+      - run: bash before/.bench/run.sh contr before after
+  mit-learn:
+    if: inputs.case == 'mit-learn'
+    runs-on: ubuntu-24.04
+    services:
+      db:
+        image: postgres:15
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres # pragma: allowlist secret
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+      redis:
+        image: redis:8.10.0@sha256:344e3945a0b431c8ff1eecd58c5573538126bd756f02fc7e218ddf1fc2546366
+        ports: ["6379:6379"]
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres # pragma: allowlist secret
+      MITOL_SECURE_SSL_REDIRECT: "False"
+      MITOL_DB_DISABLE_SSL: "True"
+      MITOL_FEATURES_DEFAULT: "True"
+      OPENSEARCH_URL: localhost:9200
+      CELERY_TASK_ALWAYS_EAGER: "True"
+      REDIS_URL: redis://localhost:6379/4
+      CELERY_BROKER_URL: redis://localhost:6379/4
+      CELERY_RESULT_BACKEND: redis://localhost:6379/4
+      TIKA_CLIENT_ONLY: "True"
+      MITOL_APP_BASE_URL: http://localhost:8062/
+      MAILGUN_KEY: fake_mailgun_key
+      MAILGUN_SENDER_DOMAIN: other.fake.site
+      OPENSEARCH_INDEX: testindex
+      INDEXING_API_USERNAME: mitodl
+      STARROCKS_HOST: localhost
+      STARROCKS_PORT: "9030"
+      STARROCKS_USER: root
+      MITOL_COOKIE_DOMAIN: localhost
+      MITOL_COOKIE_NAME: cookie_monster
+      UNSUBSCRIBE_SECRET_KEY: fake_unsubscribe_secret
+      WEBHOOK_SECRET: fake_webhook_secret
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {path: before, persist-credentials: false}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {path: after, ref: "${{ inputs.fix_ref }}", persist-credentials: false}
+      - run: sudo apt-get update -y && sudo apt-get install -y pkg-config libffi-dev libpq-dev libxmlsec1-dev
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - run: uv python install 3.12
+      - run: bash before/.bench/run.sh mit-learn before after

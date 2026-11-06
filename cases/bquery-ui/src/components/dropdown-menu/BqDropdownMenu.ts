@@ -1,0 +1,508 @@
+/**
+ * Dropdown menu component — a trigger-activated overlay for actions or navigation.
+ * @element bq-dropdown-menu
+ * @prop {string}  label      - Accessible label for the dropdown menu
+ * @prop {string}  placement  - bottom-start | bottom-end | top-start | top-end
+ * @prop {boolean} open       - Whether the menu is open
+ * @prop {boolean} disabled
+ * @slot trigger  - Element that opens the menu (button, link, etc.)
+ * @slot          - Menu items (typically <button> or <a> elements)
+ * @fires bq-open
+ * @fires bq-close
+ * @fires bq-select - { value: string } — emitted when a menu item is activated
+ */
+import type { ComponentDefinition } from '@bquery/bquery/component';
+import { component, css, html } from '@bquery/bquery/component';
+import { escapeHtml } from '@bquery/bquery/security';
+import type { Disposer } from '../../utils/component.js';
+import { bind, host, release, store } from '../../utils/component.js';
+import { getAnimationTimeoutMs, uniqueId } from '../../utils/dom.js';
+import { autoPosition } from '../../utils/position.js';
+import { baseStyles, reset } from '../../utils/styles.js';
+
+type BqDropdownMenuProps = {
+  label: string;
+  placement: string;
+  open: boolean;
+  disabled: boolean;
+};
+type BqDropdownMenuState = { uid: string };
+const FAST_DURATION = '150ms';
+
+/** Per-instance handles that `updated()` needs after `connected()` set them up. */
+const menuStore = (owner: object) =>
+  store<{ syncOutsideListener?: () => void; syncPosition?: () => void }>(
+    owner,
+    () => ({})
+  );
+
+const definition: ComponentDefinition<
+  BqDropdownMenuProps,
+  BqDropdownMenuState
+> = {
+  props: {
+    label: { type: String, default: '' },
+    placement: { type: String, default: 'bottom-start' },
+    open: { type: Boolean, default: false },
+    disabled: { type: Boolean, default: false },
+  },
+  state: {
+    uid: '',
+  },
+  styles: css`
+    ${baseStyles}
+    ${reset}
+    :host { display: inline-block; position: relative; }
+    .trigger-wrap { display: inline-flex; }
+    .menu {
+      display: none; position: absolute; z-index: var(--bq-z-dropdown,100);
+      min-width: 10rem; max-height: 20rem; overflow-y: auto;
+      background: var(--bq-surface-overlay,#fff); border: 1px solid var(--bq-border-base,#e2e8f0);
+      border-radius: var(--bq-radius-xl,0.75rem); box-shadow: var(--bq-shadow-lg);
+      padding: var(--bq-space-1,0.25rem) 0; font-family: var(--bq-font-family-sans);
+      animation: menuFadeIn var(--bq-duration-fast,150ms) var(--bq-easing-decelerate);
+    }
+    :host([open]:not([data-closing])) .menu { display: block; }
+    :host([open][data-closing]) .menu { display: block; animation: menuFadeOut var(--bq-duration-fast,150ms) var(--bq-easing-accelerate) forwards; }
+    @keyframes menuFadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes menuFadeOut { to { opacity: 0; transform: translateY(-4px); } }
+    :host([placement="bottom-start"]) .menu { top: 100%; left: 0; margin-top: 0.25rem; }
+    :host([placement="bottom-end"]) .menu { top: 100%; right: 0; margin-top: 0.25rem; }
+    :host([placement="top-start"]) .menu { bottom: 100%; left: 0; margin-bottom: 0.25rem; }
+    :host([placement="top-end"]) .menu { bottom: 100%; right: 0; margin-bottom: 0.25rem; }
+    :host(:not([placement])) .menu { top: 100%; left: 0; margin-top: 0.25rem; }
+    ::slotted(button),
+    ::slotted(a) {
+      display: flex; align-items: center; gap: 0.5rem; width: 100%;
+      padding: 0.5rem 0.875rem; border: none; background: none;
+      color: var(--bq-text-base,#0f172a); font-size: var(--bq-font-size-sm,0.875rem);
+      font-family: var(--bq-font-family-sans); text-align: start; cursor: pointer;
+      text-decoration: none; white-space: nowrap;
+      transition: background var(--bq-duration-fast) var(--bq-easing-standard);
+    }
+    ::slotted(button:hover),
+    ::slotted(a:hover) { background: var(--bq-bg-subtle,#f8fafc); }
+    ::slotted(button:focus-visible),
+    ::slotted(a:focus-visible) { outline: none; background: var(--bq-bg-muted,#f1f5f9); box-shadow: inset 0 0 0 2px var(--bq-border-focus,#2563eb); }
+    ::slotted(button[disabled]),
+    ::slotted(a[disabled]),
+    ::slotted(a[aria-disabled="true"]) { opacity: 0.5; cursor: not-allowed; pointer-events: none; }
+    ::slotted(hr) { border: none; border-top: 1px solid var(--bq-border-base,#e2e8f0); margin: 0.25rem 0; }
+    @media (prefers-reduced-motion: reduce) {
+      .menu { animation: none !important; }
+      ::slotted(button),
+      ::slotted(a) { transition: none; }
+    }
+  `,
+  connected() {
+    const self = host<BqDropdownMenuState>(this);
+    const scope = bind(self);
+    if (!self.getState<string>('uid')) self.setState('uid', uniqueId('bq-dm'));
+
+    let cancelClose: Disposer | null = null;
+
+    const getTrigger = (): HTMLElement | null =>
+      self.querySelector('[slot="trigger"]') as HTMLElement | null;
+
+    const isDisabledItem = (el: HTMLElement): boolean =>
+      el.hasAttribute('disabled') ||
+      el.getAttribute('aria-disabled') === 'true';
+
+    const getItemLabel = (el: HTMLElement): string =>
+      (el.getAttribute('data-value') || el.textContent || '')
+        .trim()
+        .toLowerCase();
+
+    const getMenuRoots = (): HTMLElement[] => {
+      const slot = self.shadowRoot?.querySelector(
+        'slot:not([name])'
+      ) as HTMLSlotElement | null;
+      if (!slot) return [];
+      return slot
+        .assignedElements({ flatten: true })
+        .filter((el): el is HTMLElement => el instanceof HTMLElement);
+    };
+
+    const syncTriggerA11y = () => {
+      const trigger = getTrigger();
+      if (!trigger) return;
+      const uid = self.getState<string>('uid') || 'bq-dm';
+      const isDisabled = self.hasAttribute('disabled');
+      trigger.setAttribute('aria-haspopup', 'menu');
+      trigger.setAttribute(
+        'aria-expanded',
+        self.hasAttribute('open') ? 'true' : 'false'
+      );
+      trigger.setAttribute('aria-controls', `${uid}-menu`);
+      trigger.setAttribute('aria-disabled', isDisabled ? 'true' : 'false');
+      if (trigger.tagName === 'BUTTON') {
+        (trigger as HTMLButtonElement).disabled = isDisabled;
+      }
+    };
+
+    const syncMenuItemRoles = () => {
+      getMenuRoots().forEach((el) => {
+        if (el.tagName === 'HR') {
+          el.setAttribute('role', 'separator');
+          return;
+        }
+        if (el.tagName === 'BUTTON' || el.tagName === 'A') {
+          if (!el.hasAttribute('role')) el.setAttribute('role', 'menuitem');
+          if (el.tagName === 'BUTTON' && !el.hasAttribute('type')) {
+            el.setAttribute('type', 'button');
+          }
+          if (isDisabledItem(el)) {
+            if (el.tagName === 'A') el.setAttribute('aria-disabled', 'true');
+            el.setAttribute('tabindex', '-1');
+            return;
+          }
+          if (!el.hasAttribute('tabindex')) el.setAttribute('tabindex', '-1');
+        }
+      });
+    };
+
+    const open = () => {
+      if (self.hasAttribute('disabled') || self.hasAttribute('open')) return;
+      self.setAttribute('open', '');
+      syncTriggerA11y();
+      self.dispatchEvent(
+        new CustomEvent('bq-open', { bubbles: true, composed: true })
+      );
+      // Focus first item once the open render has landed. Scope-owned so a
+      // menu closed or disconnected within the same frame cannot pull focus
+      // afterwards.
+      scope.frame(() => {
+        if (!self.hasAttribute('open') || self.hasAttribute('data-closing'))
+          return;
+        const items = getMenuItems();
+        if (items.length > 0) items[0]!.focus();
+      });
+    };
+    const close = ({
+      restoreFocus = false,
+    }: { restoreFocus?: boolean } = {}) => {
+      if (!self.hasAttribute('open') || self.hasAttribute('data-closing'))
+        return;
+      clearTypeaheadBuffer();
+      const reducedMotion = self.ownerDocument.defaultView?.matchMedia?.(
+        '(prefers-reduced-motion: reduce)'
+      )?.matches;
+      const finalize = () => {
+        cancelClose?.();
+        cancelClose = null;
+        self.removeAttribute('data-closing');
+        self.removeAttribute('open');
+        syncTriggerA11y();
+        self.dispatchEvent(
+          new CustomEvent('bq-close', { bubbles: true, composed: true })
+        );
+        if (restoreFocus) getTrigger()?.focus();
+      };
+      if (reducedMotion) {
+        finalize();
+      } else {
+        self.setAttribute('data-closing', '');
+        const menu = self.shadowRoot?.querySelector('.menu');
+        const timeoutMs = menu ? getAnimationTimeoutMs(menu, FAST_DURATION) : 0;
+        if (timeoutMs <= 0) {
+          finalize();
+        } else {
+          cancelClose = scope.timeout(finalize, Math.ceil(timeoutMs) + 20);
+        }
+      }
+    };
+    const toggle = () => {
+      if (self.hasAttribute('open')) close();
+      else open();
+    };
+
+    let typeaheadBuffer = '';
+    let cancelTypeahead: Disposer | null = null;
+
+    const clearTypeaheadBuffer = () => {
+      typeaheadBuffer = '';
+      cancelTypeahead?.();
+      cancelTypeahead = null;
+    };
+    scope.add(clearTypeaheadBuffer);
+
+    const focusTypeaheadMatch = (search: string, currentIndex: number) => {
+      const items = getMenuItems();
+      if (items.length === 0) return;
+
+      const orderedItems =
+        currentIndex >= 0
+          ? [
+              ...items.slice(currentIndex + 1),
+              ...items.slice(0, currentIndex + 1),
+            ]
+          : items;
+
+      const match = orderedItems.find((item) =>
+        getItemLabel(item).startsWith(search)
+      );
+      match?.focus();
+    };
+
+    const getMenuItems = (): HTMLElement[] => {
+      return getMenuRoots().filter(
+        (el): el is HTMLElement =>
+          (el.tagName === 'BUTTON' || el.tagName === 'A') && !isDisabledItem(el)
+      );
+    };
+
+    // Trigger click
+    const triggerHandler = (e: Event) => {
+      const triggerSlot = self.shadowRoot?.querySelector(
+        'slot[name="trigger"]'
+      ) as HTMLSlotElement | null;
+      if (!triggerSlot) return;
+      const assigned = triggerSlot.assignedElements({ flatten: true });
+      const clickedTrigger = assigned.some(
+        (el) => el === e.target || el.contains(e.target as Node)
+      );
+      if (clickedTrigger) {
+        e.preventDefault();
+        toggle();
+      }
+    };
+
+    // Menu item click
+    const menuClickHandler = (e: Event) => {
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+
+      const trigger = getTrigger();
+      if (trigger && (target === trigger || trigger.contains(target))) return;
+
+      const item = target.closest('button, a') as HTMLElement | null;
+      if (!item) return;
+
+      if (isDisabledItem(item)) {
+        e.preventDefault();
+        return;
+      }
+
+      const isInMenu = getMenuRoots().some(
+        (el) => el === item || el.contains(item)
+      );
+      if (!isInMenu) return;
+
+      const value =
+        item.getAttribute('data-value') || item.textContent?.trim() || '';
+      self.dispatchEvent(
+        new CustomEvent('bq-select', {
+          detail: { value },
+          bubbles: true,
+          composed: true,
+        })
+      );
+      close({ restoreFocus: true });
+    };
+
+    // Keyboard navigation
+    const keyHandler = (e: Event) => {
+      const ke = e as KeyboardEvent;
+      if (self.hasAttribute('disabled')) return;
+
+      // On trigger: open on ArrowDown/Enter/Space
+      const triggerSlot = self.shadowRoot?.querySelector(
+        'slot[name="trigger"]'
+      ) as HTMLSlotElement | null;
+      const triggerEls = triggerSlot?.assignedElements({ flatten: true }) ?? [];
+      const isOnTrigger = triggerEls.some(
+        (el) => el === ke.target || el.contains(ke.target as Node)
+      );
+
+      if (isOnTrigger) {
+        if (ke.key === 'ArrowDown' || ke.key === 'Enter' || ke.key === ' ') {
+          ke.preventDefault();
+          open();
+          return;
+        }
+        if (ke.key === 'Escape') {
+          close({ restoreFocus: true });
+          return;
+        }
+      }
+
+      // Inside menu
+      if (!self.hasAttribute('open')) return;
+      const items = getMenuItems();
+      const currentItem = (ke.target as HTMLElement | null)?.closest(
+        'button, a'
+      ) as HTMLElement | null;
+      const currentIndex = currentItem ? items.indexOf(currentItem) : -1;
+
+      switch (ke.key) {
+        case 'ArrowDown': {
+          ke.preventDefault();
+          const next = currentIndex < items.length - 1 ? currentIndex + 1 : 0;
+          items[next]?.focus();
+          break;
+        }
+        case 'ArrowUp': {
+          ke.preventDefault();
+          const prev = currentIndex > 0 ? currentIndex - 1 : items.length - 1;
+          items[prev]?.focus();
+          break;
+        }
+        case 'Home': {
+          ke.preventDefault();
+          items[0]?.focus();
+          break;
+        }
+        case 'End': {
+          ke.preventDefault();
+          items[items.length - 1]?.focus();
+          break;
+        }
+        case 'Enter':
+        case ' ': {
+          if (currentIndex === -1) break;
+          ke.preventDefault();
+          currentItem?.click();
+          break;
+        }
+        case 'Escape':
+          close({ restoreFocus: true });
+          break;
+        case 'Tab': {
+          close();
+          break;
+        }
+        default: {
+          // Skip typeahead while an IME composition is active — the keys
+          // are part of the candidate selection, not menu navigation.
+          // Also ignore the synthetic key fired on composition end (229).
+          if (ke.isComposing || ke.keyCode === 229) break;
+          if (ke.key.length === 1 && !ke.altKey && !ke.ctrlKey && !ke.metaKey) {
+            typeaheadBuffer = `${typeaheadBuffer}${ke.key.toLowerCase()}`;
+            cancelTypeahead?.();
+            cancelTypeahead = scope.timeout(() => {
+              typeaheadBuffer = '';
+              cancelTypeahead = null;
+            }, 500);
+            focusTypeaheadMatch(typeaheadBuffer, currentIndex);
+          }
+        }
+      }
+    };
+
+    // Click outside
+    const outsideHandler = (e: Event) => {
+      if (!self.hasAttribute('open')) return;
+      if (!self.contains(e.target as Node)) close({ restoreFocus: true });
+    };
+    // The document listener only exists while the menu is open, but the scope
+    // owns its removal so a disconnect while open cannot strand it.
+    let stopListeningOutside: Disposer | null = null;
+    const syncOutsideListener = () => {
+      if (self.hasAttribute('open')) {
+        stopListeningOutside ??= scope.on(document, 'click', outsideHandler);
+        return;
+      }
+      stopListeningOutside?.();
+      stopListeningOutside = null;
+    };
+
+    const slotChangeHandler = () => {
+      syncTriggerA11y();
+      syncMenuItemRoles();
+    };
+
+    // A menu opened near the bottom of the viewport used to render past the
+    // fold; the engine flips it above the trigger instead. Tracking only runs
+    // while the menu is open and is rebuilt after each render.
+    let stopPosition: Disposer | null = null;
+    const syncPosition = () => {
+      stopPosition?.();
+      stopPosition = null;
+      // `data-closing` still shows the menu, but repositioning mid-exit only
+      // makes the animation jump.
+      if (!self.hasAttribute('open') || self.hasAttribute('data-closing'))
+        return;
+      const menu = self.shadowRoot?.querySelector(
+        '.menu'
+      ) as HTMLElement | null;
+      if (!menu) return;
+      stopPosition = scope.add(
+        autoPosition(self, menu, {
+          placement: self.getAttribute('placement') ?? 'bottom-start',
+          offset: 4,
+        })
+      );
+    };
+
+    // `updated()` has to re-evaluate the outside listener after every render.
+    menuStore(self).syncOutsideListener = syncOutsideListener;
+    menuStore(self).syncPosition = syncPosition;
+
+    // An interrupted close animation must not strand the menu half-closed.
+    scope.add(() => {
+      if (!cancelClose) return;
+      cancelClose = null;
+      self.removeAttribute('data-closing');
+      self.removeAttribute('open');
+    });
+
+    scope.on(self, 'click', triggerHandler);
+    scope.on(self, 'click', menuClickHandler);
+    scope.on(self, 'keydown', keyHandler);
+    scope.on(
+      self.shadowRoot?.querySelector('slot[name="trigger"]'),
+      'slotchange',
+      slotChangeHandler
+    );
+    scope.on(
+      self.shadowRoot?.querySelector('slot:not([name])'),
+      'slotchange',
+      slotChangeHandler
+    );
+
+    scope.frame(() => {
+      syncTriggerA11y();
+      syncMenuItemRoles();
+      syncOutsideListener();
+      syncPosition();
+    });
+  },
+  disconnected() {
+    release(this);
+  },
+  updated() {
+    menuStore(this).syncOutsideListener?.();
+    menuStore(this).syncPosition?.();
+    const trigger = this.querySelector(
+      '[slot="trigger"]'
+    ) as HTMLElement | null;
+    if (trigger)
+      trigger.setAttribute(
+        'aria-expanded',
+        this.hasAttribute('open') ? 'true' : 'false'
+      );
+  },
+  render({ props, state }) {
+    const uid = state.uid || 'bq-dm';
+    const menuId = `${uid}-menu`;
+    return html`
+      <div class="trigger-wrap" part="trigger">
+        <slot name="trigger"></slot>
+      </div>
+      <div
+        class="menu"
+        id="${menuId}"
+        part="menu"
+        role="menu"
+        ${props.label ? `aria-label="${escapeHtml(props.label)}"` : ''}
+      >
+        <slot></slot>
+      </div>
+    `;
+  },
+};
+
+component<BqDropdownMenuProps, BqDropdownMenuState>(
+  'bq-dropdown-menu',
+  definition
+);

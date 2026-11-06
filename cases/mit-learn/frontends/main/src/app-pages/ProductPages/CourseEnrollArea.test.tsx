@@ -1,0 +1,697 @@
+import React from "react"
+import {
+  renderWithProviders,
+  screen,
+  within,
+  waitFor,
+  setMockResponse,
+  act,
+  setupLocationMock,
+} from "@/test-utils"
+import { factories, urls } from "api/test-utils"
+import {
+  factories as mitxFactories,
+  urls as mitxUrls,
+  mockEnrollmentEligible,
+} from "api/mitxonline-test-utils"
+import { makeCourse, setupRunPricing } from "./test-utils/userPricing"
+import {
+  DiscountTypeEnum,
+  PaymentTypeEnum,
+} from "@mitodl/mitxonline-api-axios/v0"
+import { mitxonlineLegacyUrl } from "@/common/mitxonline"
+import CourseEnrollArea from "./CourseEnrollArea"
+import { getSelectedRun } from "./courseRun"
+
+// The paid path checks enrollment eligibility before the cart.
+beforeEach(() => {
+  mockEnrollmentEligible()
+})
+
+jest.mock("next-nprogress-bar", () => ({
+  useRouter: () => ({ push: jest.fn() }),
+}))
+
+jest.mock("posthog-js/react", () => ({
+  ...jest.requireActual("posthog-js/react"),
+  usePostHog: jest.fn(() => ({ capture: jest.fn() })),
+}))
+
+jest.mock("@/common/analytics/gtm", () => ({
+  trackCourseEnrolled: jest.fn(),
+  trackStartEnrollment: jest.fn(),
+  trackBeginCheckout: jest.fn(),
+}))
+
+const makeRun = mitxFactories.courses.courseRun
+const makeMode = mitxFactories.courses.enrollmentMode
+const makeProduct = mitxFactories.courses.product
+const makeUserPricing = mitxFactories.products.userPricing
+const makeDiscount = mitxFactories.products.discount
+const makeUser = factories.user.user
+
+function setupAuth() {
+  setMockResponse.get(urls.userMe.get(), makeUser({ is_authenticated: true }))
+  setMockResponse.get(mitxUrls.enrollment.enrollmentsListV3(), [])
+  // Clicking enroll consults the MITx Online profile through the compliance
+  // gate; the factory default has nothing missing, so it passes straight through.
+  setMockResponse.get(mitxUrls.userMe.get(), mitxFactories.user.user())
+}
+
+describe("CourseEnrollArea — both scenario", () => {
+  test("shows Choose Your Path heading; paid button inside Certificate Track card; free button inside Learn for Free card; both medium", async () => {
+    setupAuth()
+    const run = makeRun({
+      is_enrollable: true,
+      is_upgradable: true,
+      is_archived: false,
+      enrollment_modes: [
+        makeMode({ requires_payment: false }),
+        makeMode({ requires_payment: true }),
+      ],
+      products: [makeProduct()],
+    })
+    const course = makeCourse({ next_run_id: run.id, courseruns: [run] })
+
+    renderWithProviders(
+      <CourseEnrollArea course={course} selectedRun={getSelectedRun(course)} />,
+    )
+
+    expect(await screen.findByText("Choose Your Path")).toBeInTheDocument()
+
+    // Wait for loading to settle (buttons get their labels once isStatusLoading=false)
+    const earnBtn = await screen.findByRole("button", {
+      name: "Earn Certificate",
+    })
+    const startBtn = await screen.findByRole("button", {
+      name: "Start Learning",
+    })
+    expect(earnBtn).toBeInTheDocument()
+    expect(startBtn).toBeInTheDocument()
+
+    // Paid button INSIDE the Certificate Track card (h3 is deep in card; go up to CardShell)
+    const certHeading = screen.getByRole("heading", {
+      name: "Certificate Track",
+      level: 3,
+    })
+    // CardShell is two div-levels above: h3 > LeftCol > TopRow > CardBody > CardShell
+    const certCard = certHeading.closest("[data-card='cert']") as HTMLElement
+    within(certCard).getByRole("button", { name: "Earn Certificate" })
+
+    // Free button INSIDE the Learn for Free card
+    const freeHeading = screen.getByRole("heading", {
+      name: "Learn for Free",
+      level: 3,
+    })
+    const freeCard = freeHeading.closest("[data-card='free']") as HTMLElement
+    within(freeCard).getByRole("button", { name: "Start Learning" })
+
+    // Both buttons are medium size
+    expect(earnBtn.closest("[data-size]")).toHaveAttribute(
+      "data-size",
+      "medium",
+    )
+    expect(startBtn.closest("[data-size]")).toHaveAttribute(
+      "data-size",
+      "medium",
+    )
+  })
+})
+
+describe("CourseEnrollArea — paidOnly scenario", () => {
+  test("shows Certificate Track card; Enroll button BELOW (not inside) the card; large; no Choose Your Path", async () => {
+    setupAuth()
+    const run = makeRun({
+      is_enrollable: true,
+      is_upgradable: true,
+      is_archived: false,
+      enrollment_modes: [makeMode({ requires_payment: true })],
+      products: [makeProduct()],
+    })
+    const course = makeCourse({ next_run_id: run.id, courseruns: [run] })
+
+    renderWithProviders(
+      <CourseEnrollArea course={course} selectedRun={getSelectedRun(course)} />,
+    )
+
+    const enrollBtn = await screen.findByRole("button", { name: "Enroll" })
+    expect(enrollBtn).toBeInTheDocument()
+
+    // No Choose Your Path
+    expect(screen.queryByText("Choose Your Path")).toBeNull()
+
+    // Button and card share the [data-card='cert'] wrapper cell
+    const certCell = document.querySelector("[data-card='cert']") as HTMLElement
+    expect(certCell).not.toBeNull()
+    within(certCell).getByRole("heading", {
+      name: "Certificate Track",
+      level: 3,
+    })
+    within(certCell).getByRole("button", { name: "Enroll" })
+
+    // Button is large
+    expect(enrollBtn.closest("[data-size]")).toHaveAttribute(
+      "data-size",
+      "large",
+    )
+  })
+})
+
+describe("CourseEnrollArea — applied savings", () => {
+  const aidRun = () =>
+    makeRun({
+      is_enrollable: true,
+      is_upgradable: true,
+      is_archived: false,
+      enrollment_modes: [makeMode({ requires_payment: true })],
+      products: [makeProduct({ price: "899" })],
+    })
+
+  test("an aid quote replaces the Certificate Track card, priced as a course", async () => {
+    setupAuth()
+    const run = aidRun()
+    const course = makeCourse({ next_run_id: run.id, courseruns: [run] })
+    setupRunPricing(run, {
+      user_price: "399",
+      discount: mitxFactories.products.userPricingDiscount({
+        amount_off: "500",
+        // The factory defaults to paid-amount-off, which reads as a credit —
+        // a course product can never be quoted one.
+        discount_type: DiscountTypeEnum.DollarsOff,
+        payment_type: PaymentTypeEnum.FinancialAssistance,
+        // Only a credit names a source; the factory defaults one alongside
+        // paid-amount-off.
+        source: null,
+      }),
+    })
+
+    renderWithProviders(
+      <CourseEnrollArea course={course} selectedRun={getSelectedRun(course)} />,
+    )
+
+    // The action keeps the offering's own wording: only a credit upgrades you
+    // to a full program, and a course has none.
+    await screen.findByRole("button", { name: "Enroll" })
+    const certCell = document.querySelector("[data-card='cert']") as HTMLElement
+    within(certCell).getByText("Course price")
+    within(certCell).getByText("$899")
+    within(certCell).getByText("$399")
+    within(certCell).getByText("Financial aid")
+    expect(
+      screen.queryByRole("heading", { name: "Certificate Track" }),
+    ).toBeNull()
+    expect(screen.queryByText("Program price")).toBeNull()
+  })
+
+  test("a quote that takes nothing off leaves the ordinary card alone", async () => {
+    setupAuth()
+    const run = aidRun()
+    const course = makeCourse({ next_run_id: run.id, courseruns: [run] })
+    // The backend reports a discount only when it beats list price, so this
+    // shape should not reach us; if it does, a "− $0" breakdown is the wrong
+    // answer. The guard is shared, so this pins it for the program page too.
+    setupRunPricing(run, {
+      user_price: "899",
+      discount: mitxFactories.products.userPricingDiscount({
+        amount_off: "0",
+        discount_type: DiscountTypeEnum.DollarsOff,
+        source: null,
+      }),
+    })
+
+    renderWithProviders(
+      <CourseEnrollArea course={course} selectedRun={getSelectedRun(course)} />,
+    )
+
+    await screen.findByRole("button", { name: "Enroll" })
+    screen.getByRole("heading", { name: "Certificate Track" })
+    expect(screen.queryByText("Course price")).toBeNull()
+  })
+})
+
+describe("CourseEnrollArea — freeOnly scenario", () => {
+  test("shows Learn for Free card; Start Learning button below; large", async () => {
+    setupAuth()
+    const run = makeRun({
+      is_enrollable: true,
+      is_upgradable: false,
+      is_archived: false,
+      enrollment_modes: [makeMode({ requires_payment: false })],
+      products: [],
+    })
+    const course = makeCourse({ next_run_id: run.id, courseruns: [run] })
+
+    renderWithProviders(
+      <CourseEnrollArea course={course} selectedRun={getSelectedRun(course)} />,
+    )
+
+    const startBtn = await screen.findByRole("button", {
+      name: "Start Learning",
+    })
+    expect(startBtn).toBeInTheDocument()
+
+    // Button and card share the [data-card='free'] wrapper cell
+    const freeCell = document.querySelector("[data-card='free']") as HTMLElement
+    expect(freeCell).not.toBeNull()
+    within(freeCell).getByRole("heading", { name: "Learn for Free", level: 3 })
+    within(freeCell).getByRole("button", { name: "Start Learning" })
+
+    // Large
+    expect(startBtn.closest("[data-size]")).toHaveAttribute(
+      "data-size",
+      "large",
+    )
+  })
+})
+
+describe("CourseEnrollArea — deadlinePassed scenario", () => {
+  test("shows Learn for Free card with Access Course Materials below and the in-card 'Certificate deadline passed' note", async () => {
+    setupAuth()
+    const run = makeRun({
+      is_enrollable: true,
+      is_upgradable: false,
+      is_archived: false,
+      enrollment_modes: [
+        makeMode({ requires_payment: false }),
+        makeMode({ requires_payment: true }),
+      ],
+      products: [makeProduct()],
+    })
+    const course = makeCourse({ next_run_id: run.id, courseruns: [run] })
+
+    renderWithProviders(
+      <CourseEnrollArea course={course} selectedRun={getSelectedRun(course)} />,
+    )
+
+    expect(
+      await screen.findByRole("button", { name: "Access Course Materials" }),
+    ).toBeInTheDocument()
+    // The cert deadline has passed for a run that offered one, so the in-card
+    // note shows — matching the archived scenario and Figma. (The metadata
+    // "Certificate deadline has passed." alert in CourseSummary is separate.)
+    expect(screen.getByText("Certificate deadline passed")).toBeInTheDocument()
+  })
+})
+
+describe("CourseEnrollArea — archived scenario", () => {
+  test("shows Learn for Free card; Access Course Materials button below; deadline note when the run offered a certificate", async () => {
+    setupAuth()
+    const run = makeRun({
+      is_enrollable: true,
+      is_archived: true,
+      // offered a paid certificate, so the "deadline passed" note applies
+      enrollment_modes: [
+        makeMode({ requires_payment: false }),
+        makeMode({ requires_payment: true }),
+      ],
+    })
+    const course = makeCourse({ next_run_id: run.id, courseruns: [run] })
+
+    renderWithProviders(
+      <CourseEnrollArea course={course} selectedRun={getSelectedRun(course)} />,
+    )
+
+    const accessBtn = await screen.findByRole("button", {
+      name: "Access Course Materials",
+    })
+    expect(accessBtn).toBeInTheDocument()
+    expect(accessBtn.closest("[data-size]")).toHaveAttribute(
+      "data-size",
+      "large",
+    )
+    // Archived runs are past their certificate window too, so a run that
+    // offered a certificate carries the deadline note.
+    expect(screen.getByText("Certificate deadline passed")).toBeInTheDocument()
+  })
+
+  test("audit-only archived run shows no 'Certificate deadline passed' note (it never offered one)", async () => {
+    setupAuth()
+    const run = makeRun({
+      is_enrollable: true,
+      is_archived: true,
+      enrollment_modes: [makeMode({ requires_payment: false })],
+    })
+    const course = makeCourse({ next_run_id: run.id, courseruns: [run] })
+
+    renderWithProviders(
+      <CourseEnrollArea course={course} selectedRun={getSelectedRun(course)} />,
+    )
+
+    await screen.findByRole("button", { name: "Access Course Materials" })
+    expect(screen.queryByText("Certificate deadline passed")).toBeNull()
+  })
+})
+
+describe("CourseEnrollArea — none scenario", () => {
+  test("renders nothing when there are no enrollable runs", async () => {
+    setupAuth()
+    const course = makeCourse({ courseruns: [] })
+
+    renderWithProviders(
+      <CourseEnrollArea course={course} selectedRun={undefined} />,
+    )
+
+    // Wait for auth to settle
+    await waitFor(() => expect(screen.queryByRole("button")).toBeNull())
+    expect(screen.queryByRole("heading")).toBeNull()
+  })
+})
+
+describe("CourseEnrollArea — enrolled scenario", () => {
+  test("shows single Enrolled link; no cards; no Choose Your Path", async () => {
+    const run = makeRun({
+      is_enrollable: true,
+      is_archived: false,
+      enrollment_modes: [makeMode({ requires_payment: false })],
+    })
+    const course = makeCourse({ next_run_id: run.id, courseruns: [run] })
+    const enrollment = mitxFactories.enrollment.courseEnrollment({
+      run: { id: run.id },
+    })
+
+    setMockResponse.get(urls.userMe.get(), makeUser({ is_authenticated: true }))
+    setMockResponse.get(mitxUrls.enrollment.enrollmentsListV3(), [enrollment])
+
+    renderWithProviders(<CourseEnrollArea course={course} selectedRun={run} />)
+
+    const enrolledLink = await screen.findByRole("link", { name: /Enrolled/ })
+    expect(enrolledLink).toBeInTheDocument()
+    expect(enrolledLink).toHaveAttribute("href", "/dashboard")
+
+    expect(screen.queryByText("Choose Your Path")).toBeNull()
+    expect(
+      screen.queryByRole("heading", { name: "Certificate Track" }),
+    ).toBeNull()
+    expect(screen.queryByRole("heading", { name: "Learn for Free" })).toBeNull()
+  })
+})
+
+describe("CourseEnrollArea — loading state", () => {
+  test("card renders immediately while enrollment-status button is aria-busy and disabled (cards never spin)", async () => {
+    const run = makeRun({
+      is_enrollable: true,
+      is_upgradable: true,
+      is_archived: false,
+      enrollment_modes: [makeMode({ requires_payment: false })],
+      products: [],
+    })
+    const course = makeCourse({ next_run_id: run.id, courseruns: [run] })
+
+    // Hold the auth response so we can observe the loading state
+    const { promise: mePromise, resolve: resolveMe } = (() => {
+      let resolve!: (v: unknown) => void
+      const promise = new Promise((r) => {
+        resolve = r
+      })
+      return { promise, resolve }
+    })()
+
+    setMockResponse.get(urls.userMe.get(), mePromise)
+
+    renderWithProviders(
+      <CourseEnrollArea course={course} selectedRun={getSelectedRun(course)} />,
+    )
+
+    // Card heading is present immediately (cards never spin)
+    const btns = await screen.findAllByRole("button", { hidden: false })
+    const busyBtns = btns.filter((b) => b.getAttribute("aria-busy") === "true")
+    expect(busyBtns.length).toBeGreaterThan(0)
+    busyBtns.forEach((btn) => expect(btn).toBeDisabled())
+    // The busy button's label is hidden behind the spinner, so it must still be
+    // reachable by an accessible name ("Loading") rather than nameless (WCAG
+    // 4.1.2). A regression dropping that aria-label would fail here.
+    expect(screen.getByRole("button", { name: "Loading" })).toBeInTheDocument()
+    expect(
+      screen.getByRole("heading", { name: "Learn for Free", level: 3 }),
+    ).toBeInTheDocument()
+
+    // After auth resolves, button gets its label
+    await act(async () => {
+      resolveMe(makeUser({ is_authenticated: true }))
+    })
+    setMockResponse.get(mitxUrls.enrollment.enrollmentsListV3(), [])
+    await screen.findByRole("button", { name: "Start Learning" })
+  })
+})
+
+describe("CourseEnrollArea — click smoke tests", () => {
+  setupLocationMock()
+
+  test("paid click redirects to cart", async () => {
+    setupAuth()
+    const product = makeProduct()
+    const run = makeRun({
+      is_enrollable: true,
+      is_upgradable: true,
+      is_archived: false,
+      enrollment_modes: [makeMode({ requires_payment: true })],
+      products: [product],
+    })
+    const course = makeCourse({ next_run_id: run.id, courseruns: [run] })
+
+    setMockResponse.delete(mitxUrls.baskets.clear(), undefined)
+    setMockResponse.post(mitxUrls.baskets.createFromProduct(product.id), {
+      id: 1,
+      items: [],
+    })
+
+    renderWithProviders(<CourseEnrollArea course={course} selectedRun={run} />)
+
+    const enrollBtn = await screen.findByRole("button", { name: "Enroll" })
+    await act(async () => {
+      enrollBtn.click()
+    })
+
+    await waitFor(() => {
+      expect(window.location.assign).toHaveBeenCalledWith(
+        mitxonlineLegacyUrl("/cart/"),
+      )
+    })
+  })
+
+  test("paid click surfaces the basket's 400 detail in the InfoBox alert", async () => {
+    setupAuth()
+    const product = makeProduct()
+    const run = makeRun({
+      is_enrollable: true,
+      is_upgradable: true,
+      is_archived: false,
+      enrollment_modes: [makeMode({ requires_payment: true })],
+      products: [product],
+    })
+    const course = makeCourse({ next_run_id: run.id, courseruns: [run] })
+
+    // Clear succeeds, add fails: proves the add error is the one surfaced.
+    setMockResponse.delete(mitxUrls.baskets.clear(), undefined)
+    setMockResponse.post(
+      mitxUrls.baskets.createFromProduct(product.id),
+      { detail: "That product is no longer available." },
+      { code: 400 },
+    )
+
+    renderWithProviders(<CourseEnrollArea course={course} selectedRun={run} />)
+
+    const enrollBtn = await screen.findByRole("button", { name: "Enroll" })
+    await act(async () => {
+      enrollBtn.click()
+    })
+
+    expect(
+      await screen.findByText("That product is no longer available."),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole("link", { name: "Contact Support" }),
+    ).toBeInTheDocument()
+    expect(window.location.assign).not.toHaveBeenCalled()
+  })
+  // Free-click behavior (audit POST + dashboard redirect) is fully covered by
+  // useCourseEnrollment.test.tsx "free action -> audit POST + redirect" test.
+})
+
+describe("CourseEnrollArea — financial assistance link", () => {
+  // Both finaid states link to the same form URL; only the label differs by
+  // whether the user already has an approved flexible price.
+  test.each([
+    {
+      name: "available, when aid not yet applied",
+      userPricing: () => makeUserPricing(),
+      linkText: "Apply for financial aid",
+    },
+    {
+      name: "approved, when aid is approved and discounts the price",
+      // An approved learner is one with any product_flexible_price
+      // (useCertificatePricing: !!product_flexible_price). The quote must also
+      // take something off: an approval worth nothing says nothing, which the
+      // 0%-tier test below pins.
+      userPricing: () =>
+        makeUserPricing({
+          product_flexible_price: makeDiscount(),
+          user_price: "50",
+          discount: mitxFactories.products.userPricingDiscount({
+            discount_type: DiscountTypeEnum.PercentOff,
+            payment_type: PaymentTypeEnum.FinancialAssistance,
+            amount_off: "50",
+            source: null,
+          }),
+        }),
+      linkText: "Financial aid approved",
+    },
+  ])(
+    "paidOnly course with financial_assistance_form_url shows link — $name",
+    async ({ userPricing, linkText }) => {
+      setupAuth()
+      const product = makeProduct()
+      const run = makeRun({
+        is_enrollable: true,
+        is_upgradable: true,
+        is_archived: false,
+        enrollment_modes: [makeMode({ requires_payment: true })],
+        products: [product],
+      })
+      const course = makeCourse({
+        next_run_id: run.id,
+        courseruns: [run],
+        page: { financial_assistance_form_url: "/financial-aid/" },
+      })
+
+      setMockResponse.get(
+        mitxUrls.products.userPricingDetail(product.id),
+        userPricing(),
+      )
+
+      renderWithProviders(
+        <CourseEnrollArea
+          course={course}
+          selectedRun={getSelectedRun(course)}
+        />,
+      )
+
+      const link = await screen.findByRole("link", { name: linkText })
+      expect(link).toBeInTheDocument()
+      expect(link).toHaveAttribute(
+        "href",
+        mitxonlineLegacyUrl("/financial-aid/"),
+      )
+    },
+  )
+
+  test("an approval that discounts nothing says nothing, and never subtracts the tier's stored amount", async () => {
+    // mitxonline's APPROVED means it accepted the declared income, not that the
+    // income earned anything: the top tier is 0% off and the aid form tells that
+    // learner they did not qualify. So neither label is true here — "approved"
+    // claims a success they did not get, "apply" is wrong because they already
+    // did — and the row renders nothing at all.
+    //
+    // The stored amount is also never subtracted: if the course path (wrongly)
+    // applied it, the display would read $75 instead of the full $100. Only the
+    // amount and type are under test; the factory fills the rest.
+    setupAuth()
+    const product = makeProduct({ price: "100" })
+    const userPricing = makeUserPricing({
+      product_flexible_price: makeDiscount({
+        discount_type: "dollars-off",
+        amount: "25.00",
+      }),
+    })
+    const run = makeRun({
+      is_enrollable: true,
+      is_upgradable: true,
+      is_archived: false,
+      enrollment_modes: [makeMode({ requires_payment: true })],
+      products: [product],
+    })
+    const course = makeCourse({
+      next_run_id: run.id,
+      courseruns: [run],
+      page: { financial_assistance_form_url: "/financial-aid/" },
+    })
+
+    setMockResponse.get(
+      mitxUrls.products.userPricingDetail(product.id),
+      userPricing,
+    )
+
+    renderWithProviders(
+      <CourseEnrollArea course={course} selectedRun={getSelectedRun(course)} />,
+    )
+
+    // Neither wording is true for this learner, so the row settles to nothing.
+    // "Apply" is what shows before the quote lands, so waiting for it to go is
+    // also what synchronises on the quote: the price alone cannot, since it
+    // reads $100 either side of the request.
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("link", { name: "Apply for financial aid" }),
+      ).toBeNull()
+    })
+    expect(
+      screen.queryByRole("link", { name: "Financial aid approved" }),
+    ).toBeNull()
+    // Full price shows; the flexible-price discount is not applied to the display
+    expect(screen.getByText("$100")).toBeInTheDocument()
+    expect(screen.queryByText("$75")).not.toBeInTheDocument()
+  })
+})
+
+describe("CourseEnrollArea — advertised price range", () => {
+  const makePaidRun = (product: ReturnType<typeof makeProduct>) =>
+    makeRun({
+      is_enrollable: true,
+      is_upgradable: true,
+      is_archived: false,
+      enrollment_modes: [makeMode({ requires_payment: true })],
+      products: [product],
+    })
+
+  test("a course advertising a range shows it in place of the run's price", () => {
+    setupAuth()
+    const run = makePaidRun(makeProduct({ price: "600" }))
+    const course = makeCourse({
+      next_run_id: run.id,
+      courseruns: [run],
+      min_price: 250,
+      max_price: 1000,
+    })
+
+    renderWithProviders(
+      <CourseEnrollArea course={course} selectedRun={getSelectedRun(course)} />,
+    )
+
+    expect(screen.getByText("$250 – $1,000")).toBeInTheDocument()
+  })
+
+  test("an approved flexible price collapses the range to the run's price", async () => {
+    // The range advertises the aid floor. A learner already quoted against it
+    // has nothing left to be advertised, so they see the single price, as on a
+    // program page.
+    setupAuth()
+    const product = makeProduct({ price: "1000" })
+    const run = makePaidRun(product)
+    const course = makeCourse({
+      next_run_id: run.id,
+      courseruns: [run],
+      min_price: 250,
+      max_price: 1000,
+      page: { financial_assistance_form_url: "/financial-aid/" },
+    })
+    setMockResponse.get(
+      mitxUrls.products.userPricingDetail(product.id),
+      makeUserPricing({
+        product_flexible_price: makeDiscount({
+          discount_type: "dollars-off",
+          amount: "750.00",
+        }),
+      }),
+    )
+
+    renderWithProviders(
+      <CourseEnrollArea course={course} selectedRun={getSelectedRun(course)} />,
+    )
+
+    // The collapse is the quote landing, so wait on the single price itself:
+    // this learner's approval discounts nothing, so there is no aid row to
+    // synchronise on.
+    expect(await screen.findByText("$1,000")).toBeInTheDocument()
+    expect(screen.queryByText("$250 – $1,000")).toBeNull()
+  })
+})

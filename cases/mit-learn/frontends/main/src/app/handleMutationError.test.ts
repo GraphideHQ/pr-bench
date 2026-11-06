@@ -1,0 +1,123 @@
+import { handleMutationError, GENERIC_ERROR_MESSAGE } from "./getQueryClient"
+import { showErrorToast } from "@/page-components/Toaster/toastStore"
+import type { Mutation } from "@tanstack/react-query"
+import type { MutationErrorMeta } from "api/mutation-meta"
+
+jest.mock("@/page-components/Toaster/toastStore", () => ({
+  showErrorToast: jest.fn(),
+}))
+const mockShowErrorToast = showErrorToast as jest.Mock
+
+/** The handler only reads `mutation.meta`; fake the rest. */
+const fakeMutation = (meta: MutationErrorMeta | undefined) =>
+  ({ meta }) as unknown as Mutation<unknown, unknown, unknown, unknown>
+
+/** Invoke the handler with just the `meta` that the real code reads. */
+const fireError = (
+  meta: MutationErrorMeta | undefined,
+  error: unknown = new Error("boom"),
+  variables: unknown = { id: 1 },
+) => handleMutationError(error, variables, undefined, fakeMutation(meta))
+
+beforeEach(() => {
+  mockShowErrorToast.mockClear()
+})
+
+// The no-meta default and the showErrorToast opt-out are covered end-to-end in
+// mutationErrorToast.test.tsx; this file pins the copy-resolution edge cases.
+
+test("uses meta.errorMessage when provided", () => {
+  fireError({ errorMessage: "Could not save your changes." })
+  expect(mockShowErrorToast).toHaveBeenCalledWith(
+    "Could not save your changes.",
+    { contactSupport: false },
+  )
+})
+
+test("meta.getErrorMessage wins over errorMessage and receives error + variables", () => {
+  const getErrorMessage = jest.fn().mockReturnValue("Derived message")
+  const error = new Error("nope")
+  const variables = { id: 7 }
+
+  handleMutationError(
+    error,
+    variables,
+    undefined,
+    fakeMutation({ errorMessage: "static", getErrorMessage }),
+  )
+
+  expect(getErrorMessage).toHaveBeenCalledWith(error, variables)
+  expect(mockShowErrorToast).toHaveBeenCalledWith("Derived message", {
+    contactSupport: false,
+  })
+})
+
+test("falls back to errorMessage when getErrorMessage throws", () => {
+  fireError({
+    getErrorMessage: () => {
+      throw new Error("bad derivation")
+    },
+    errorMessage: "Static fallback.",
+  })
+  // The throw must not escape onError (which would leave the failure silent).
+  expect(mockShowErrorToast).toHaveBeenCalledWith("Static fallback.", {
+    contactSupport: false,
+  })
+})
+
+test("falls back to errorMessage when getErrorMessage returns blank", () => {
+  fireError({ getErrorMessage: () => "", errorMessage: "Static fallback." })
+  expect(mockShowErrorToast).toHaveBeenCalledWith("Static fallback.", {
+    contactSupport: false,
+  })
+})
+
+test("falls back to generic copy when getErrorMessage throws and there is no errorMessage", () => {
+  fireError({
+    getErrorMessage: () => {
+      throw new Error("bad derivation")
+    },
+  })
+  expect(mockShowErrorToast).toHaveBeenCalledWith(GENERIC_ERROR_MESSAGE, {
+    contactSupport: false,
+  })
+})
+
+test("falls back to generic copy when the resolved message is empty", () => {
+  fireError({ errorMessage: "   " })
+  expect(mockShowErrorToast).toHaveBeenCalledWith(GENERIC_ERROR_MESSAGE, {
+    contactSupport: false,
+  })
+})
+
+test("passes meta.contactSupport through to the toast", () => {
+  fireError({ errorMessage: "Enrollment failed.", contactSupport: true })
+  expect(mockShowErrorToast).toHaveBeenCalledWith("Enrollment failed.", {
+    contactSupport: true,
+  })
+})
+
+describe("compliance rejections", () => {
+  const rejection = (missingFields: string[]) => ({
+    response: {
+      status: 400,
+      data: {
+        detail: "Unable to complete enrollment. Error code: CS_701.",
+        reason_code: "CS_701",
+        missing_fields: missingFields,
+      },
+    },
+  })
+
+  test("are left to the compliance dialog when it can fix them", () => {
+    fireError({ contactSupport: true }, rejection(["last_name"]))
+    expect(mockShowErrorToast).not.toHaveBeenCalled()
+  })
+
+  test("still toast when they name only fields the dialog can't fix", () => {
+    fireError({ contactSupport: true }, rejection(["email"]))
+    expect(mockShowErrorToast).toHaveBeenCalledWith(GENERIC_ERROR_MESSAGE, {
+      contactSupport: true,
+    })
+  })
+})

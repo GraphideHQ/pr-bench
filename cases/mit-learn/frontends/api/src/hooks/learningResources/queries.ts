@@ -1,0 +1,328 @@
+import {
+  learningResourcesApi,
+  learningResourcesSearchApi,
+  topicsApi,
+  offerorsApi,
+  platformsApi,
+  schoolsApi,
+  featuredApi,
+  videoPlaylistsApi,
+  podcastEpisodesApi,
+  vectorLearningResourcesSearchApi,
+} from "../../clients"
+
+import type {
+  LearningResourcesApiLearningResourcesListRequest as LearningResourcesListRequest,
+  TopicsApiTopicsListRequest as TopicsListRequest,
+  LearningResourcesSearchApiLearningResourcesSearchRetrieveRequest as LearningResourcesSearchRetrieveRequest,
+  OfferorsApiOfferorsListRequest,
+  PlatformsApiPlatformsListRequest,
+  FeaturedApiFeaturedListRequest as FeaturedListParams,
+  LearningResourcesApiLearningResourcesItemsListRequest as ItemsListRequest,
+  LearningResourcesApiLearningResourcesSummaryListRequest as LearningResourcesSummaryListRequest,
+  PaginatedLearningResourceRelationshipList,
+  VideoPlaylistResource,
+  PodcastEpisodeTranscript,
+  LearningResourcesApiLearningResourcesVectorSimilarListRequest,
+} from "../../generated/v1"
+import type { VectorLearningResourcesSearchApiVectorLearningResourcesSearchRetrieveRequest as VectorLearningResourcesSearchRetrieveRequest } from "../../generated/v0"
+import { infiniteQueryOptions, queryOptions } from "@tanstack/react-query"
+import axiosInstance from "../../axios"
+import { toRelativeApiUrl } from "../../runtime/urls"
+import { hasPosition, randomizeGroups } from "./util"
+
+const timedPromise = async <T>(
+  promise: Promise<T>,
+): Promise<{ result: T; time: number }> => {
+  const start = performance.now()
+  const result = await promise
+  const end = performance.now()
+  return { result, time: end - start }
+}
+
+const learningResourceKeys = {
+  root: ["learning_resources"],
+  // list
+  listsRoot: () => [...learningResourceKeys.root, "listsAll"],
+  list: (params: LearningResourcesListRequest) => [
+    ...learningResourceKeys.listsRoot(),
+    params,
+  ],
+  summaryListRoot: () => [...learningResourceKeys.root, "summaryList"],
+  summaryList: (params: LearningResourcesSummaryListRequest) => [
+    ...learningResourceKeys.summaryListRoot(),
+    params,
+  ],
+  // detail
+  detailsRoot: () => [...learningResourceKeys.root, "detail"],
+  detail: (id: number) => [...learningResourceKeys.detailsRoot(), id],
+  similar: (id: number) => [...learningResourceKeys.detail(id), "similar"],
+  vectorSimilar: (
+    params: LearningResourcesApiLearningResourcesVectorSimilarListRequest,
+  ) => [...learningResourceKeys.detail(params.id), "vector_similar", params],
+  itemsRoot: (id: number) => [...learningResourceKeys.detail(id), "items"],
+  items: (id: number, params: ItemsListRequest) => [
+    ...learningResourceKeys.itemsRoot(id),
+    params,
+  ],
+  infiniteItemsRoot: (id: number) => [
+    ...learningResourceKeys.detail(id),
+    "infiniteItems",
+  ],
+  infiniteItems: (id: number, params: ItemsListRequest) => [
+    ...learningResourceKeys.infiniteItemsRoot(id),
+    params,
+  ],
+  // featured
+  featuredRoot: () => [...learningResourceKeys.root, "featureds"],
+  featured: (params: FeaturedListParams) => [
+    ...learningResourceKeys.featuredRoot(),
+    params,
+  ],
+  // searching
+  searchRoot: () => [...learningResourceKeys.root, "search"],
+  search: (params: LearningResourcesSearchRetrieveRequest) => [
+    ...learningResourceKeys.searchRoot(),
+    params,
+  ],
+  vectorSearchRoot: () => [...learningResourceKeys.root, "vectorSearch"],
+  vectorSearch: (params: VectorLearningResourcesSearchRetrieveRequest) => [
+    ...learningResourceKeys.vectorSearchRoot(),
+    params,
+  ],
+}
+
+const topicsKeys = {
+  root: ["topics"],
+  listRoot: () => [...topicsKeys.root, "list"],
+  list: (params: TopicsListRequest) => [...topicsKeys.listRoot(), params],
+  detailRoot: () => [...topicsKeys.root, "detail"],
+  detail: (id: number) => [...topicsKeys.detailRoot(), id],
+}
+
+const platformsKeys = {
+  root: ["platforms"],
+  listRoot: () => [...platformsKeys.root, "list"],
+  list: (params: PlatformsApiPlatformsListRequest) => [
+    ...platformsKeys.listRoot(),
+    params,
+  ],
+}
+
+const schoolKeys = {
+  root: ["schools"],
+  listRoot: () => [...schoolKeys.root, "list"],
+  list: () => [...schoolKeys.listRoot()],
+}
+
+const offerorsKeys = {
+  root: ["offerors"],
+  listRoot: () => [...offerorsKeys.root, "list"],
+  list: (params: OfferorsApiOfferorsListRequest) => [
+    ...offerorsKeys.listRoot(),
+    params,
+  ],
+}
+
+const learningResourceQueries = {
+  detail: (id: number) =>
+    queryOptions({
+      queryKey: learningResourceKeys.detail(id),
+      queryFn: () =>
+        learningResourcesApi
+          .learningResourcesRetrieve({ id })
+          .then((res) => res.data),
+    }),
+  items: (id: number, params: ItemsListRequest) =>
+    queryOptions({
+      queryKey: learningResourceKeys.items(id, params),
+      queryFn: () => {
+        return learningResourcesApi
+          .learningResourcesItemsList(params)
+          .then((res) => res.data.results.map((rel) => rel.resource))
+      },
+    }),
+  infiniteItems: (id: number, params: Omit<ItemsListRequest, "offset">) =>
+    infiniteQueryOptions({
+      queryKey: learningResourceKeys.infiniteItems(
+        id,
+        params as ItemsListRequest,
+      ),
+      queryFn: async ({ pageParam }) => {
+        const request = pageParam
+          ? axiosInstance.request<PaginatedLearningResourceRelationshipList>({
+              method: "get",
+              url: toRelativeApiUrl(pageParam),
+            })
+          : learningResourcesApi.learningResourcesItemsList(params)
+        const { data } = await request
+        return data
+      },
+      initialPageParam: null as string | null,
+      getNextPageParam: (lastPage) => lastPage.next ?? undefined,
+    }),
+  similar: (id: number) =>
+    queryOptions({
+      queryKey: learningResourceKeys.similar(id),
+      queryFn: () =>
+        learningResourcesApi
+          .learningResourcesSimilarList({ id })
+          .then((res) => res.data),
+    }),
+  vectorSimilar: (
+    params: LearningResourcesApiLearningResourcesVectorSimilarListRequest,
+  ) =>
+    queryOptions({
+      queryKey: learningResourceKeys.vectorSimilar(params),
+      queryFn: () =>
+        learningResourcesApi
+          .learningResourcesVectorSimilarList(params)
+          .then((res) => res.data),
+    }),
+  list: (params: LearningResourcesListRequest) =>
+    queryOptions({
+      queryKey: learningResourceKeys.list(params),
+      queryFn: () =>
+        learningResourcesApi
+          .learningResourcesList(params)
+          .then((res) => res.data),
+    }),
+  summaryList: (params: LearningResourcesSummaryListRequest) =>
+    queryOptions({
+      queryKey: learningResourceKeys.summaryList(params),
+      queryFn: () =>
+        learningResourcesApi
+          .learningResourcesSummaryList(params)
+          .then((res) => res.data),
+    }),
+  featured: (params: FeaturedListParams = {}) =>
+    queryOptions({
+      queryKey: learningResourceKeys.featured(params),
+      queryFn: () =>
+        featuredApi.featuredList(params).then((res) => {
+          const results = res.data.results
+          const withPosition = results.filter(hasPosition)
+          if (withPosition.length !== results.length) {
+            // Should not happen. The featured API always sets position.
+            console.warn(
+              "Some featured results are missing position information.",
+            )
+          }
+          return {
+            ...res.data,
+            results: randomizeGroups(withPosition),
+          }
+        }),
+    }),
+  search: (params: LearningResourcesSearchRetrieveRequest) =>
+    queryOptions({
+      queryKey: learningResourceKeys.search(params),
+      queryFn: () =>
+        timedPromise(
+          learningResourcesSearchApi
+            .learningResourcesSearchRetrieve(params)
+            .then((res) => res.data),
+        ),
+      select: (data) => data.result,
+    }),
+  vectorSearch: (params: VectorLearningResourcesSearchRetrieveRequest) =>
+    queryOptions({
+      queryKey: learningResourceKeys.vectorSearch(params),
+      queryFn: () =>
+        timedPromise(
+          vectorLearningResourcesSearchApi
+            .vectorLearningResourcesSearchRetrieve(params)
+            .then((res) => res.data),
+        ),
+      select: (data) => data.result,
+    }),
+}
+
+const topicQueries = {
+  list: (params: TopicsListRequest) =>
+    queryOptions({
+      queryKey: topicsKeys.list(params),
+      queryFn: () => topicsApi.topicsList(params).then((res) => res.data),
+    }),
+  detail: (id: number) =>
+    queryOptions({
+      queryKey: topicsKeys.detail(id),
+      queryFn: () => topicsApi.topicsRetrieve({ id }).then((res) => res.data),
+    }),
+}
+
+const platformsQueries = {
+  list: (params: PlatformsApiPlatformsListRequest) => ({
+    queryKey: platformsKeys.list(params),
+    queryFn: () => platformsApi.platformsList(params).then((res) => res.data),
+  }),
+}
+
+const schoolQueries = {
+  list: () =>
+    queryOptions({
+      queryKey: schoolKeys.list(),
+      queryFn: () => schoolsApi.schoolsList().then((res) => res.data),
+    }),
+}
+
+const offerorQueries = {
+  list: (params: OfferorsApiOfferorsListRequest) =>
+    queryOptions({
+      queryKey: offerorsKeys.list(params),
+      queryFn: () => offerorsApi.offerorsList(params).then((res) => res.data),
+    }),
+}
+
+const videoPlaylistKeys = {
+  root: ["video_playlists"],
+  detailRoot: () => [...videoPlaylistKeys.root, "detail"],
+  detail: (id: number) => [...videoPlaylistKeys.detailRoot(), id],
+}
+
+const videoPlaylistQueries = {
+  detail: (id: number) =>
+    queryOptions<VideoPlaylistResource>({
+      queryKey: videoPlaylistKeys.detail(id),
+      queryFn: () =>
+        videoPlaylistsApi
+          .videoPlaylistsRetrieve({ id })
+          .then((res) => res.data as VideoPlaylistResource),
+    }),
+}
+
+const podcastEpisodeKeys = {
+  root: ["podcast_episodes"],
+  detailRoot: () => [...podcastEpisodeKeys.root, "detail"],
+  detail: (id: number) => [...podcastEpisodeKeys.detailRoot(), id],
+  transcript: (id: number) => [...podcastEpisodeKeys.detail(id), "transcript"],
+}
+
+const podcastEpisodeQueries = {
+  /**
+   * An episode's transcript, served separately from the episode payload
+   * because the text runs tens of kilobytes. Gate this on
+   * `podcast_episode.has_transcript` so the ~95% of episodes with no
+   * transcript never issue the request.
+   */
+  transcript: (id: number) =>
+    queryOptions<PodcastEpisodeTranscript>({
+      queryKey: podcastEpisodeKeys.transcript(id),
+      queryFn: () =>
+        podcastEpisodesApi
+          .podcastEpisodesTranscriptRetrieve({ id })
+          .then((res) => res.data),
+    }),
+}
+
+export {
+  learningResourceKeys,
+  learningResourceQueries,
+  topicQueries,
+  platformsQueries,
+  schoolQueries,
+  offerorQueries,
+  videoPlaylistQueries,
+  podcastEpisodeKeys,
+  podcastEpisodeQueries,
+}

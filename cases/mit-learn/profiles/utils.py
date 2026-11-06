@@ -1,0 +1,486 @@
+"""Utils for profiles"""
+
+import hashlib
+import logging
+import re
+import uuid
+from contextlib import contextmanager
+from io import BytesIO
+from urllib.parse import quote, urljoin
+from xml.sax.saxutils import escape as xml_escape
+
+import requests
+from anymail.message import AnymailMessage
+from bs4 import BeautifulSoup
+from django.conf import settings
+from django.core import mail
+from django.core.exceptions import ObjectDoesNotExist
+from django.core.files.temp import NamedTemporaryFile
+from django.template.loader import render_to_string
+from PIL import Image
+
+from main.utils import generate_filepath
+from users.utils import generate_unsubscribe_frontend_url, generate_unsubscribe_url
+
+log = logging.getLogger(__name__)
+
+# Max dimension of either height or width for small and medium images
+IMAGE_SMALL_MAX_DIMENSION = 64
+IMAGE_MEDIUM_MAX_DIMENSION = 128
+
+IMAGE_STANDARD = "image"
+IMAGE_SMALL = "image_small"
+IMAGE_MEDIUM = "image_medium"
+
+MAX_IMAGE_FIELD_LENGTH = 1024
+
+IMAGE_FIELDS = {
+    IMAGE_STANDARD: "",
+    IMAGE_SMALL: IMAGE_SMALL_MAX_DIMENSION,
+    IMAGE_MEDIUM: IMAGE_MEDIUM_MAX_DIMENSION,
+}
+
+# This is the Django ImageField max path size
+IMAGE_PATH_MAX_LENGTH = 100
+GRAVATAR_IMAGE_URL = "https://www.gravatar.com/avatar/{}.jpg"
+
+DEFAULT_FONTS = [
+    "HelveticaNeue-Light",
+    "Helvetica Neue Light",
+    "Helvetica Neue",
+    "Helvetica",
+    "Arial",
+    "Lucida Grande",
+    "sans-serif",
+]
+
+SVG_TEMPLATE = """
+<svg xmlns="http://www.w3.org/2000/svg" pointer-events="none"
+     width="{size}" height="{size}">
+  <circle cx="{cx}" cy="{cy}" r="{radius}" style="{style}"></circle>
+  <text text-anchor="middle" y="50%" x="50%" dy="0.35em"
+        pointer-events="auto" font-family="{font-family}"
+        font-weight="400" fill="#{color}" style="{text-style}">{text}</text>
+</svg>
+""".strip()
+SVG_TEMPLATE = re.sub(r"(\s+|\n)", " ", SVG_TEMPLATE)
+
+DEFAULT_PROFILE_IMAGE = urljoin(settings.STATIC_URL, "images/avatar_default.png")
+
+
+# NOTE: this is probably a bit broken at the moment
+#       because of the API/frontend separation which
+#       means APP_BASE_URL has changed
+def generate_gravatar_image(user, image_field=None):
+    """
+    Query gravatar for an image and return those image properties
+
+    Args:
+        user (User): the user to compute gravatar image urls for
+        image_field (str):
+
+    Returns:
+        str: The URL to the image.
+    """
+    gravatar_hash = hashlib.md5(  # noqa: S324
+        user.email.lower().encode("utf-8")
+    ).hexdigest()
+    gravatar_image_url = GRAVATAR_IMAGE_URL.format(gravatar_hash)
+    max_dimension = IMAGE_FIELDS[image_field]
+    size_param = f"&s={max_dimension}" if max_dimension else ""
+    if user.profile.name:
+        d_param = urljoin(
+            settings.APP_BASE_URL,
+            f"/profile/{user.username}/{max_dimension}/fff/579cf9.png",
+        )
+    else:
+        d_param = urljoin(settings.APP_BASE_URL, DEFAULT_PROFILE_IMAGE)
+
+    return f"{gravatar_image_url}?d={quote(d_param)}{size_param}"
+
+
+def image_uri(profile, image_field=IMAGE_SMALL):
+    """Return the correctly formatted profile image URI for a user"""
+    if profile:
+        image_file = getattr(profile, f"{image_field}_file")
+        if not image_file.name:
+            image_file = getattr(profile, image_field)
+            if not image_file:
+                return generate_gravatar_image(profile.user, image_field)
+            return image_file
+        return image_file.url
+    return DEFAULT_PROFILE_IMAGE
+
+
+# These functions are referenced in migrations so be careful refactoring
+def profile_image_upload_uri(instance, filename):
+    """
+    upload_to handler for Profile.image
+    """
+    return generate_filepath(filename, instance.user.username, "", "profile")
+
+
+def article_image_upload_uri(_, filename):
+    """
+    upload_to handler for ArticleImageUpload.image_file
+
+    Deprecated: use website_content.utils.website_content_image_upload_uri instead.
+    Kept here so existing migrations that reference this dotted path remain replayable.
+    """
+    return generate_filepath(filename, "", "", "article")
+
+
+def profile_image_upload_uri_small(instance, filename):
+    """
+    upload_to handler for Profile.image_small
+    """
+    return generate_filepath(filename, instance.user.username, "_small", "profile")
+
+
+def profile_image_upload_uri_medium(instance, filename):
+    """
+    upload_to handler for Profile.image_medium
+    """
+    return generate_filepath(filename, instance.user.username, "_medium", "profile")
+
+
+def avatar_uri(instance, filename):
+    """
+    upload_to handler for Channel.avatar
+    """
+    return generate_filepath(filename, instance.name, "_avatar", "channel")
+
+
+def avatar_uri_medium(instance, filename):
+    """
+    upload_to handler for Channel.avatar_medium
+    """
+    return generate_filepath(filename, instance.name, "_avatar_medium", "channel")
+
+
+def avatar_uri_small(instance, filename):
+    """
+    upload_to handler for Channel.avatar_small
+    """
+    return generate_filepath(filename, instance.name, "_avatar_small", "channel")
+
+
+def banner_uri(instance, filename):
+    """
+    upload_to handler for Channel.banner
+    """
+    return generate_filepath(filename, instance.name, "_banner", "channel")
+
+
+def article_image_uri(instance, filename):
+    """
+    upload_to handler for Article.cover_image
+    """
+    return generate_filepath(filename, instance.post.post_id, "_article", "article")
+
+
+@contextmanager
+def make_temp_image_file(*, width=500, height=500):
+    """
+    Create a temporary PNG image to test image uploads
+    """
+    with NamedTemporaryFile(suffix=".png") as image_file:
+        image = Image.new("RGBA", size=(width, height), color=(256, 0, 0))
+        image.save(image_file, "png")
+        image_file.seek(0)
+        yield image_file
+
+
+def shrink_dimensions(width, height, max_dimension):
+    """
+    Resize dimensions so max dimension is max_dimension. If dimensions are too small no resizing is done
+    Args:
+        width (int): The width
+        height (int): The height
+        max_dimension (int): The maximum size of a dimension
+    Returns:
+        tuple of (small_width, small_height): A resized set of dimensions, as integers
+    """  # noqa: E501
+    max_width_height = max(width, height)
+    if max_width_height < max_dimension:
+        return width, height
+    ratio = max_width_height / max_dimension
+
+    return int(width / ratio), int(height / ratio)
+
+
+def make_thumbnail(full_size_image, max_dimension):
+    """
+    Make a thumbnail of the image
+
+    Args:
+        full_size_image (file):
+            A file-like object containing an image. This file will seek back to the beginning after being read.
+        max_dimension (int):
+            The max size of a dimension for the thumbnail
+    Returns:
+        BytesIO:
+            A jpeg image which is a thumbnail of full_size_image
+    """  # noqa: E501
+    pil_image = Image.open(full_size_image)
+    pil_image.thumbnail(
+        shrink_dimensions(pil_image.width, pil_image.height, max_dimension),
+        Image.LANCZOS,
+    )
+    buffer = BytesIO()
+    pil_image.convert("RGB").save(buffer, "JPEG", quality=90)
+    buffer.seek(0)
+    return buffer
+
+
+def make_cropped_thumbnail(full_size_image, max_width, max_height):
+    """
+    Make a cropped thumbnail of the image
+
+    Args:
+        full_size_image (file):
+            A file-like object containing an image. This file will seek back to the beginning after being read.
+        max_width (int):
+            The max width for the thumbnail
+        max_height (int):
+            The max height for the thumbnail
+    Returns:
+        BytesIO:
+            A jpeg image which is a thumbnail of full_size_image
+    """  # noqa: E501
+    pil_image = Image.open(full_size_image)
+    aspect_ratio = max_height / max_width
+    if pil_image.height / pil_image.width < aspect_ratio:
+        # crop width
+        adjust = int((pil_image.width - (pil_image.height / aspect_ratio)) / 2)
+        pil_image = pil_image.crop(
+            box=(adjust, 0, pil_image.width - adjust, pil_image.height)
+        )
+    elif pil_image.height / pil_image.width > aspect_ratio:
+        # crop height
+        adjust = int((pil_image.height - (pil_image.width * aspect_ratio)) / 2)
+        pil_image = pil_image.crop(
+            box=(0, adjust, pil_image.width, pil_image.height - adjust)
+        )
+    pil_image.thumbnail(
+        shrink_dimensions(pil_image.width, pil_image.height, max_width), Image.LANCZOS
+    )
+    buffer = BytesIO()
+    pil_image.convert("RGB").save(buffer, "JPEG", quality=90)
+    buffer.seek(0)
+    return buffer
+
+
+def update_full_name(user, name):
+    """
+    Update the first and last names of a user.
+
+    Args:
+        user(User): The user to modify.
+        name(str): The full name of the user.
+    """
+    name_parts = name.split(" ")
+    user.first_name = name_parts[0][:30]
+    if len(name_parts) > 1:
+        user.last_name = " ".join(name_parts[1:])[:30]
+    user.save()
+
+
+def dict_to_style(style_dict):
+    """
+    Transform a dict into a string formatted as an HTML style
+
+    Args:
+        style_dict(dict): A dictionary of style attributes/values
+
+    Returns:
+        str: An HTML style string
+    """
+
+    return "; ".join([f"{k}: {v}" for k, v in style_dict.items()])
+
+
+def generate_initials(text):
+    """
+    Extract initials from a string
+
+    Args:
+        text(str): The string to extract initials from
+
+    Returns:
+        str: The initials extracted from the string
+    """
+    if not text:
+        return None
+    text = text.strip()
+    if text:
+        split_text = text.split(" ")
+        if len(split_text) > 1:
+            return (split_text[0][0] + split_text[-1][0]).upper()
+        else:
+            return split_text[0][0].upper()
+    return None
+
+
+def generate_svg_avatar(name, size, color, bgcolor):
+    """
+    Generate an SVG avatar based on input text.  Adopted from https://github.com/CraveFood/avinit
+
+    Args:
+        name(str): The text to extract two initials from.
+        size(int): The width (and height) of the output SVG image
+        color(str): The font color code (minus the # prefix).
+        bgcolor(str): The image background color (minus the # prefix)
+
+    Returns:
+        str: an SVG image.
+    """
+
+    initials = generate_initials(name) or "A"
+
+    style = {
+        "fill": f"#{bgcolor}",
+        "border-radius": f"{size - 1}px",
+        "-moz-border-radius": f"{size - 1}px",
+    }
+
+    text_style = {
+        "font-weight": "400px",
+        "font-size": f"{int(size / 2)}px",
+        "color": f"#{color}",
+    }
+
+    return SVG_TEMPLATE.format(
+        **{
+            "height": size,
+            "size": size,
+            "cx": int(size / 2),
+            "cy": int(size / 2),
+            "radius": int((size - 1) / 2),
+            "style": dict_to_style(style),
+            "color": color,
+            "font-family": ",".join(DEFAULT_FONTS),
+            "text-style": dict_to_style(text_style),
+            "text": xml_escape(initials.upper()),
+        }
+    ).replace("\n", "")
+
+
+def validate_uuid(val):
+    """
+    Check the validity of uuid strings
+    """
+    try:
+        if uuid.UUID(str(val)):
+            return True
+    except ValueError:
+        return False
+
+
+def fetch_program_letter_template_data(letter):
+    """
+    Fetch program letter template snippets directly
+    from micromasters
+    """
+    if settings.MICROMASTERS_CMS_API_URL:
+        api_params = {
+            "type": "cms.ProgramPage",
+            "fields": "*",
+            "program_id": letter.certificate.micromasters_program_id,
+        }
+        api_url = urljoin(settings.MICROMASTERS_CMS_API_URL, "pages/")
+        response_json = requests.get(api_url, api_params, timeout=5).json()
+        if response_json and response_json.get("meta", {}).get("total_count", 0) > 0:
+            return response_json["items"][0]
+    return None
+
+
+def user_has_email_optin(user) -> bool:
+    """
+    Determine whether a non-transactional email may be sent to a user.
+
+    Returns False if the user has explicitly opted out, or has no Profile
+    at all (e.g. a user provisioned without a profile being created).
+    """
+    try:
+        profile = user.profile
+    except ObjectDoesNotExist:
+        return False
+    return profile.email_optin is not False
+
+
+def send_template_email(user, subject, template, context, *, is_transactional: bool):
+    """
+    Send an html email using a provided template
+    Args:
+        user: User instance to send to
+        subject(str): Subject line
+        template(str): Path to an html template
+        context(dict): context vars used in rendering the template
+        is_transactional(bool): If true the email bypasses the user's
+            email_optin setting and always sends, so no unsubscribe URL
+            is included. Otherwise an unsubscribe URL is included.
+    """
+    if not is_transactional and not user_has_email_optin(user):
+        log.debug("Not sending email to user %s: opted out of email", user.id)
+        return None
+
+    if not context:
+        context = {}
+    unsubscribe_url = None
+    if not is_transactional:
+        unsubscribe_url = generate_unsubscribe_url(user)
+        context["unsubscribe_url"] = generate_unsubscribe_frontend_url(user)
+    context["APP_BASE_URL"] = settings.APP_BASE_URL
+    context["ABSOLUTE_STATIC_URL"] = urljoin(settings.APP_BASE_URL, settings.STATIC_URL)
+    html_content = render_to_string(template, context)
+    return send_email(
+        user,
+        subject,
+        html_content,
+        text_only=False,
+        unsubscribe_url=unsubscribe_url,
+    )
+
+
+def send_email(
+    user,
+    subject,
+    content,
+    text_only,
+    unsubscribe_url: str | None = None,
+):
+    """
+    Send an email
+    Args:
+        user: User instance to send to
+        subject(str): Subject line
+        content(str): The html or plain text content of the email.
+        text_only(bool): If True html from the 'content' arg
+        will be stripped and sent as plain text
+        unsubscribe_url(str): URL to include in List-Unsubscribe headers
+    """
+
+    if text_only:
+        text_content = content
+    else:
+        soup = BeautifulSoup(content, "html5lib")
+        for link in soup.find_all("a"):
+            link.replace_with(link.attrs["href"])
+        text_content = soup.get_text().strip()
+    headers = {}
+    if unsubscribe_url:
+        headers["List-Unsubscribe"] = f"<{unsubscribe_url}>"
+        headers["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+    with mail.get_connection(settings.NOTIFICATION_EMAIL_BACKEND) as connection:
+        msg = AnymailMessage(
+            subject=subject,
+            body=text_content,
+            to=[user.email],
+            from_email=settings.MAILGUN_FROM_EMAIL,
+            connection=connection,
+            headers=headers or None,
+        )
+        if not text_only:
+            msg.attach_alternative(content, "text/html")
+    return msg.send()

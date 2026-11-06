@@ -1,0 +1,71 @@
+"use client"
+
+import React from "react"
+import { WebsiteContentContentTypeEnum, type WebsiteContent } from "api/v1"
+import {
+  useWebsiteContentCreate,
+  useWebsiteContentPartialUpdate,
+  useMediaUpload,
+} from "api/hooks/website_content"
+import { SILENCE_ERROR_TOAST } from "api/mutation-meta"
+import { WebsiteContentEditor } from "../../core/WebsiteContentEditor"
+import { createNewsExtensions, newNewsDocument } from "./newsExtensions"
+
+// News-specific: extract the author name from the byline node in the document
+const extractNewsExtraFields = (content: {
+  content?: Array<{ type?: string; attrs?: Record<string, unknown> }>
+}): Record<string, unknown> => {
+  const bylineNode = content.content?.find((node) => node.type === "byline")
+  return {
+    author_name: bylineNode?.attrs?.authorName || "",
+    content_type: "news",
+  }
+}
+
+interface NewsEditorProps {
+  onSave?: (savedContent: WebsiteContent) => void
+  /** See `WebsiteContentEditor`; only tests pass it. */
+  autosaveDelayMs?: number
+  readOnly?: boolean
+  newsItem?: WebsiteContent
+}
+
+/**
+ * Editor shell configured for the news content type (served under /news).
+ * Owns its own save mutations (websiteContent API) and passes them to
+ * WebsiteContentEditor — keeping the generic shell decoupled from any specific API.
+ */
+const NewsEditor = ({
+  onSave,
+  autosaveDelayMs,
+  readOnly,
+  newsItem,
+}: NewsEditorProps) => {
+  // News content type uses the websiteContent API.
+  // A different content type would call different hooks here.
+  // The editor renders its own inline error (WebsiteContentEditor `error`), so
+  // suppress the global error toast.
+  const createMutation = useWebsiteContentCreate({ meta: SILENCE_ERROR_TOAST })
+  const updateMutation = useWebsiteContentPartialUpdate({
+    meta: SILENCE_ERROR_TOAST,
+  })
+  const uploadImage = useMediaUpload({ meta: SILENCE_ERROR_TOAST })
+
+  return (
+    <WebsiteContentEditor
+      createExtensions={createNewsExtensions}
+      contentType={WebsiteContentContentTypeEnum.News}
+      initialDoc={newNewsDocument}
+      extractExtraFields={extractNewsExtraFields}
+      saveMutations={{ create: createMutation, update: updateMutation }}
+      uploadImage={uploadImage}
+      onSave={onSave}
+      autosaveDelayMs={autosaveDelayMs}
+      readOnly={readOnly}
+      contentItem={newsItem}
+    />
+  )
+}
+
+export { NewsEditor }
+export type { NewsEditorProps }

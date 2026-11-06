@@ -1,0 +1,298 @@
+/**
+ * Select / dropdown form field.
+ * @element bq-select
+ * @prop {string}  label
+ * @prop {string}  value
+ * @prop {string}  placeholder
+ * @prop {string}  name
+ * @prop {boolean} disabled
+ * @prop {boolean} required
+ * @prop {string}  error
+ * @prop {string}  hint
+ * @prop {string}  size    - sm | md | lg
+ * @slot - <option> elements
+ * @fires bq-change - { value: string }
+ */
+import type { ComponentDefinition } from '@bquery/bquery/component';
+import { bool, css, html } from '@bquery/bquery/component';
+import { escapeHtml } from '@bquery/bquery/security';
+import { uniqueId } from '../../utils/dom.js';
+import {
+  bindFormProxy,
+  syncFormProxy,
+  type FormProxyBinding,
+} from '../../utils/form.js';
+import { bind, host, release, store } from '../../utils/component.js';
+import { bindValidation } from '../../utils/validation.js';
+import { iconCss } from '../../utils/icons.js';
+import {
+  baseStyles,
+  fieldStyles,
+  focusRing,
+  reset,
+} from '../../utils/styles.js';
+import { registerFormControl } from '../../utils/model.js';
+
+type BqSelectProps = {
+  label: string;
+  value: string;
+  placeholder: string;
+  name: string;
+  disabled: boolean;
+  required: boolean;
+  error: string;
+  hint: string;
+  size: string;
+};
+type BqSelectState = { uid: string; optionsMarkup: string };
+
+const serializeOption = (
+  option: Element,
+  selectedValue: string,
+  hasExplicitValue: boolean
+): string => {
+  const optionValue =
+    option.getAttribute('value') ?? option.textContent?.trim() ?? '';
+  const attrs = [`value="${escapeHtml(optionValue)}"`];
+  if (option.hasAttribute('disabled')) attrs.push('disabled');
+  if (
+    hasExplicitValue
+      ? optionValue === selectedValue
+      : option.hasAttribute('selected')
+  ) {
+    attrs.push('selected');
+  }
+  return `<option ${attrs.join(' ')}>${escapeHtml(option.textContent?.trim() ?? '')}</option>`;
+};
+
+const serializeOptGroup = (
+  group: Element,
+  selectedValue: string,
+  hasExplicitValue: boolean
+): string => {
+  const optionsMarkup = Array.from(group.children)
+    .filter((child) => child.tagName.toLowerCase() === 'option')
+    .map((option) => serializeOption(option, selectedValue, hasExplicitValue))
+    .join('');
+  const disabled = group.hasAttribute('disabled') ? ' disabled' : '';
+  return `<optgroup label="${escapeHtml(group.getAttribute('label') ?? '')}"${disabled}>${optionsMarkup}</optgroup>`;
+};
+
+const buildOptionsMarkup = (host: HTMLElement, placeholder: string): string => {
+  const selectedValue = host.getAttribute('value') ?? '';
+  const hasExplicitValue = host.hasAttribute('value');
+  const placeholderMarkup = placeholder
+    ? `<option value="" ${!selectedValue ? 'selected' : ''} disabled>${escapeHtml(placeholder)}</option>`
+    : '';
+  const childrenMarkup = Array.from(host.children)
+    .map((child) => {
+      if (child.tagName.toLowerCase() === 'option') {
+        return serializeOption(child, selectedValue, hasExplicitValue);
+      }
+      if (child.tagName.toLowerCase() === 'optgroup') {
+        return serializeOptGroup(child, selectedValue, hasExplicitValue);
+      }
+      return '';
+    })
+    .join('');
+  return `${placeholderMarkup}${childrenMarkup}`;
+};
+
+const selectStore = (owner: object) =>
+  store<{ syncOptions?: () => void; proxy?: FormProxyBinding }>(
+    owner,
+    () => ({})
+  );
+
+const syncSelectValue = (host: HTMLElement): void => {
+  const select = host.shadowRoot?.querySelector(
+    'select'
+  ) as HTMLSelectElement | null;
+  if (!select) return;
+
+  const attrValue = host.getAttribute('value');
+  const options = Array.from(select.options);
+  const hasMatchingValue =
+    attrValue !== null && options.some((option) => option.value === attrValue);
+
+  if (hasMatchingValue) {
+    select.value = attrValue;
+  }
+
+  const normalizedValue = select.value;
+  if ((attrValue ?? '') !== normalizedValue) {
+    host.setAttribute('value', normalizedValue);
+  }
+
+  selectStore(host).proxy?.setValue(normalizedValue);
+};
+
+const definition: ComponentDefinition<BqSelectProps, BqSelectState> = {
+  props: {
+    label: { type: String, default: '' },
+    value: { type: String, default: '' },
+    placeholder: { type: String, default: '' },
+    name: { type: String, default: '' },
+    disabled: { type: Boolean, default: false },
+    required: { type: Boolean, default: false },
+    error: { type: String, default: '' },
+    hint: { type: String, default: '' },
+    size: { type: String, default: 'md' },
+  },
+  state: {
+    uid: '',
+    optionsMarkup: '',
+  },
+  styles: css`
+    ${baseStyles}
+    ${reset}
+    ${fieldStyles}
+    ${focusRing}
+    ${iconCss('chevron-down')}
+    :host { display: block; }
+    .select-wrap { position: relative; display: flex; }
+    select {
+      display: block; inline-size: 100%;
+      border: var(--bq-border-width-control,1.5px) solid var(--bq-border-emphasis,#cbd5e1);
+      border-radius: var(--bq-radius-lg,0.5rem); background: var(--bq-bg-base,#fff);
+      color: var(--bq-text-base,#0f172a); font-family: var(--bq-font-family-sans);
+      appearance: none; -webkit-appearance: none;
+      padding-inline-end: 2.25rem; outline: none; cursor: pointer;
+      transition: border-color var(--bq-duration-fast) var(--bq-easing-standard),
+                  background-color var(--bq-duration-fast) var(--bq-easing-standard),
+                  box-shadow var(--bq-duration-fast) var(--bq-easing-standard);
+    }
+    :host([size="sm"]) select { font-size: var(--bq-font-size-sm,0.875rem); padding-block: 0.375rem; padding-inline-start: var(--bq-control-padding-sm,0.75rem); min-block-size: var(--bq-control-height-sm,2rem); }
+    :host([size="md"]) select, :host(:not([size])) select { font-size: var(--bq-font-size-md,1rem); padding-block: 0.5rem; padding-inline-start: var(--bq-control-padding-md,0.875rem); min-block-size: var(--bq-control-height-md,2.5rem); }
+    :host([size="lg"]) select { font-size: var(--bq-font-size-lg,1.125rem); padding-block: 0.625rem; padding-inline-start: var(--bq-control-padding-lg,1rem); min-block-size: var(--bq-control-height-lg,3rem); }
+    select:hover:not(:disabled) { border-color: var(--bq-border-strong,#94a3b8); }
+    select:focus-visible { border-color: var(--bq-border-focus,#2563eb); box-shadow: var(--bq-focus-ring); }
+    /* Opening a native select fires no focus-visible in every browser, so the
+       ring is also drawn for plain :focus — a select is never focused by a
+       pointer without the list opening. */
+    select:focus { border-color: var(--bq-border-focus,#2563eb); box-shadow: var(--bq-focus-ring); }
+    :host([error]:not([error=""])) select { border-color: var(--bq-color-danger-500,#ef4444); }
+    :host([error]:not([error=""])) select:focus { box-shadow: var(--bq-focus-ring-danger); }
+    :host([disabled]) select { opacity: 0.55; cursor: not-allowed; background: var(--bq-bg-muted,#f1f5f9); }
+    .arrow {
+      position: absolute; inset-inline-end: 0.75rem; inset-block-start: 50%;
+      transform: translateY(-50%); pointer-events: none;
+      color: var(--bq-text-muted,#475569);
+      --bq-icon-size: 1.125rem;
+    }
+    :host([disabled]) .arrow { opacity: 0.55; }
+  `,
+  connected() {
+    const self = host<BqSelectState>(this);
+    const scope = bind(self);
+    const local = selectStore(self);
+    if (!self.getState<string>('uid'))
+      self.setState('uid', uniqueId('bq-select'));
+
+    const syncOptions = () => {
+      const markup = buildOptionsMarkup(
+        self,
+        self.getAttribute('placeholder') ?? ''
+      );
+      if (self.getState<string>('optionsMarkup') !== markup) {
+        self.setState('optionsMarkup', markup);
+      }
+      // The shadow `<select>` only exists after the render that markup
+      // triggers, so the value has to be reapplied a frame later.
+      scope.frame(() => syncSelectValue(self));
+    };
+    local.syncOptions = syncOptions;
+
+    const readValue = () => {
+      const select = self.shadowRoot?.querySelector(
+        'select'
+      ) as HTMLSelectElement | null;
+      return select ? select.value : (self.getAttribute('value') ?? '');
+    };
+
+    // Form proxy for native <form> participation
+    const proxy = bindFormProxy(self, scope, { value: readValue });
+    local.proxy = proxy;
+
+    // The hidden proxy input is barred from constraint validation, so a
+    // `required` select would otherwise submit with nothing chosen.
+    bindValidation(self, scope, { value: readValue });
+
+    scope.on(self.shadowRoot, 'change', (e) => {
+      const select = e.target as HTMLSelectElement | null;
+      if (select?.tagName === 'SELECT') {
+        self.setAttribute('value', select.value);
+        proxy.setValue(select.value);
+        self.dispatchEvent(
+          new CustomEvent('bq-change', {
+            detail: { value: select.value },
+            bubbles: true,
+            composed: true,
+          })
+        );
+      }
+    });
+
+    // Light-DOM <option>/<optgroup> children are the source of truth, so the
+    // shadow <select> is rebuilt whenever they change.
+    const observer = new MutationObserver(() => syncOptions());
+    observer.observe(self, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ['disabled', 'label', 'selected', 'value'],
+    });
+    scope.add(() => observer.disconnect());
+
+    syncOptions();
+  },
+  disconnected() {
+    release(this);
+  },
+  updated() {
+    syncFormProxy(this);
+    selectStore(this).syncOptions?.();
+  },
+  render({ props, state }) {
+    const hasError = Boolean(props.error);
+    const hasHint = Boolean(props.hint) && !hasError;
+    const uid = state.uid || 'bq-select';
+    const optionsMarkup = state.optionsMarkup || '';
+    const describedParts: string[] = [];
+    if (hasError) describedParts.push(`${uid}-err`);
+    if (hasHint) describedParts.push(`${uid}-hint`);
+    const describedBy = describedParts.join(' ');
+    return html`
+      <div class="field" part="field">
+        ${props.label
+          ? `<label class="label" for="${uid}" part="label">${escapeHtml(props.label)}${props.required ? '<span class="required-mark" aria-hidden="true"> *</span>' : ''}</label>`
+          : ''}
+        <div class="select-wrap">
+          <select
+            part="select"
+            id="${uid}"
+            name="${escapeHtml(props.name)}"
+            ${bool('disabled', props.disabled)}
+            ${bool('required', props.required)}
+            aria-invalid="${hasError ? 'true' : 'false'}"
+            ${props.required ? 'aria-required="true"' : ''}
+            ${describedBy ? `aria-describedby="${describedBy}"` : ''}
+            ${hasError ? `aria-errormessage="${uid}-err"` : ''}
+          >
+            ${optionsMarkup}
+          </select>
+          <span class="arrow icon" data-icon="chevron-down" part="arrow" aria-hidden="true"></span>
+        </div>
+        ${hasHint
+          ? `<span class="hint" id="${uid}-hint" part="hint">${escapeHtml(props.hint)}</span>`
+          : ''}
+        ${hasError
+          ? `<span class="error-msg" id="${uid}-err" role="alert" part="error">${escapeHtml(props.error)}</span>`
+          : ''}
+      </div>
+    `;
+  },
+};
+
+registerFormControl<BqSelectProps, BqSelectState>('bq-select', definition);

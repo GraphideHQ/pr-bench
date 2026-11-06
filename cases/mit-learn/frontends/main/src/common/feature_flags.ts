@@ -1,0 +1,38 @@
+// Feature flags for the app. These should correspond to the flag that's set up
+// in PostHog.
+
+export enum FeatureFlags {
+  LrDrawerChatbot = "lr-drawer-chatbot",
+  PrDrawerChatbot = "pr-drawer-chatbot",
+  RecommendationBot = "recommendation-bot",
+  HomePageRecommendationBot = "home-page-recommendation-bot",
+  SearchAiOverview = "search-ai-overview",
+  UniversalAI = "universal-ai",
+  UniversalAISearchBanner = "universal-ai-search-banner",
+  CourseOutlineSection = "course-outline-section",
+  OcwProductPages = "ocw-product-pages",
+  VideoPlaylistPage = "video-playlist-page",
+  B2BContractManagerDashboard = "b2b-contract-manager-dashboard",
+  B2BAnalyticsDashboard = "b2b-analytics-dashboard",
+  B2BLearnerAnalytics = "b2b-learner-analytics",
+  Arithmix = "arithmix",
+  Hacksnack = "hacksnack",
+  AccountManagement = "account-management",
+  SelfServiceRefunds = "self-service-refunds",
+  DisableHybridSearch = "disable-hybrid-search",
+  MultipleRunContextMenus = "multiple-run-context-menus",
+  ProgramLetters = "program-letters",
+  B2BDataConsent = "b2b-data-consent",
+  DepartmentPageRedesign = "department-page-redesign",
+  ContactUs = "contact-us",
+  ResourceCardRedesign = "resource-card-redesign",
+}
+
+/**
+ * A special flag that indicates feature flags are in their bootstrapped state,
+ * not yet loaded from PostHog server.
+ *
+ * DO NOT add this flag to PostHog!
+ */
+export const INTERNAL_BOOTSTRAPPING_FLAG =
+  "__flags_are_bootstrapped_do_not_add_this_to_posthog__"

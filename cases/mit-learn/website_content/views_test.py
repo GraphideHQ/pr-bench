@@ -1,0 +1,973 @@
+"""Test for website_content views"""
+
+import pytest
+from django.db import transaction
+from rest_framework.reverse import reverse
+from rest_framework.test import APIClient
+
+from learning_resources.factories import LearningResourceTopicFactory
+from main.factories import UserFactory
+from website_content.models import WebsiteContent
+
+pytestmark = [pytest.mark.django_db]
+
+
+@pytest.fixture(autouse=True)
+def _mock_cdn_purge(mocker):
+    """Auto-mock CDN purge tasks for all tests in this module"""
+    mocker.patch("website_content.tasks.fastly_purge_relative_url")
+    mocker.patch("website_content.tasks.fastly_purge_relative_url.delay")
+    mocker.patch("website_content.tasks.fastly_purge_website_content_list.delay")
+
+
+@pytest.fixture(autouse=True)
+def _mock_learning_resource_sync(mocker):
+    """
+    Auto-mock the learning resource sync for all tests in this module.
+
+    Publishing fires the website_content plugins, and the search indexing one
+    end of that reaches OpenSearch -- which the autouse `opensearch` fixture
+    only mocks for reads. None of the tests here are about search; the sync
+    itself is covered in `learning_resources`.
+    """
+    mocker.patch(
+        "learning_resources.tasks.sync_website_content_learning_resource.delay"
+    )
+    # The unpublish direction runs in the request rather than in the task, so
+    # the function is what has to be stubbed here; the task remains the
+    # fallback for a transient database error.
+    mocker.patch("learning_resources.api.unpublish_website_content_learning_resource")
+    mocker.patch(
+        "learning_resources.tasks.unpublish_website_content_learning_resource_task.delay"
+    )
+
+
+def test_website_content_creation(staff_client, user):
+    """Test website content creation."""
+    url = reverse("website_content:v1:website_content-list")
+    data = {
+        "content": {},
+        "title": "Some title",
+        "content_type": "news",
+    }
+    resp = staff_client.post(url, data)
+    json = resp.json()
+    assert json["content"] == {}
+    assert json["title"] == "Some title"
+    assert json["content_type"] == "news"
+
+
+def test_website_content_creation_via_articles_alias(staff_client, user):
+    """Test that the backward-compatible /api/v1/articles/ endpoint still works."""
+    url = reverse("website_content:v1:articles-list")
+    data = {
+        "content": {},
+        "title": "Articles alias title",
+        "content_type": "news",
+    }
+    resp = staff_client.post(url, data)
+    json = resp.json()
+    assert resp.status_code == 201
+    assert json["title"] == "Articles alias title"
+
+
+def test_retrieve_content_by_id(client, user):
+    """Should retrieve published content by numeric ID"""
+    content = WebsiteContent.objects.create(
+        title="Test Article",
+        content={},
+        is_published=True,
+        user=user,
+        content_type="news",
+    )
+
+    url = reverse(
+        "website_content:v1:website_content-detail-by-id-or-slug",
+        kwargs={"identifier": str(content.id)},
+    )
+
+    resp = client.get(url)
+    data = resp.json()
+
+    assert resp.status_code == 200
+    assert data["id"] == content.id
+    assert data["title"] == "Test Article"
+
+
+def test_retrieve_content_by_slug(client, user):
+    """Should retrieve published content by slug"""
+    content = WebsiteContent.objects.create(
+        title="Slug Article",
+        content={},
+        is_published=True,
+        user=user,
+        content_type="news",
+    )
+
+    url = reverse(
+        "website_content:v1:website_content-detail-by-id-or-slug",
+        kwargs={"identifier": content.slug},
+    )
+
+    resp = client.get(url)
+    data = resp.json()
+
+    assert resp.status_code == 200
+    assert data["slug"] == content.slug
+    assert data["title"] == "Slug Article"
+
+
+def test_staff_can_access_unpublished_content(client):
+    """Staff should be able to see unpublished content items"""
+    staff_user = UserFactory.create(is_staff=True)
+    client.force_login(staff_user)
+
+    content = WebsiteContent.objects.create(
+        title="Draft Article",
+        content={},
+        is_published=False,
+        user=staff_user,
+        content_type="news",
+    )
+
+    url = reverse(
+        "website_content:v1:website_content-detail-by-id-or-slug",
+        kwargs={"identifier": str(content.id)},
+    )
+
+    resp = client.get(url)
+    data = resp.json()
+
+    assert resp.status_code == 200
+    assert data["id"] == content.id
+
+
+@pytest.fixture
+def enabled_view_cache(settings, request):
+    """
+    Give the view cache a real backend for one test.
+
+    The suite swaps the `redis` cache for a dummy one everywhere (the autouse
+    fixture in the root `conftest`), so by default a view that is cached and
+    one that is not behave identically here. Caching has to be on for a test
+    to tell them apart. Located per test so one does not read another's
+    entries.
+    """
+    settings.REDIS_VIEW_CACHE_DURATION = 60
+    settings.CACHES = {
+        **settings.CACHES,
+        "redis": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+            "LOCATION": request.node.nodeid,
+        },
+    }
+
+
+@pytest.mark.usefixtures("enabled_view_cache")
+def test_listing_is_what_the_caller_may_see(staff_client):
+    """
+    An editor's listing must not become everyone's listing.
+
+    The order here is the order that leaked: the listing was cached under a
+    key that did not vary by user, so whichever request missed the cache first
+    decided what the rest were served, and an editor's listing carries the
+    drafts.
+
+    Run with the view cache on, so that caching this listing again -- under
+    any key shared between callers -- fails here rather than in production.
+
+    The anonymous caller is a client of its own because `staff_client` is the
+    `client` fixture with a staff user logged into it -- asking for both hands
+    back one client, logged in, and the second request would be the editor's
+    as well.
+    """
+    published = WebsiteContent.objects.create(
+        title="Published Article", content={}, is_published=True, content_type="news"
+    )
+    draft = WebsiteContent.objects.create(
+        title="Draft Article", content={}, is_published=False, content_type="news"
+    )
+    url = reverse("website_content:v1:website_content-list")
+
+    editor_ids = {item["id"] for item in staff_client.get(url).json()["results"]}
+    assert editor_ids == {published.id, draft.id}
+
+    anonymous_ids = {item["id"] for item in APIClient().get(url).json()["results"]}
+    assert anonymous_ids == {published.id}
+
+
+@pytest.fixture
+def mock_clear_views_cache(mocker):
+    """Patch the cache-clear hook so tests can assert whether it fired."""
+    return mocker.patch("website_content.views.clear_views_cache")
+
+
+def _make_content(user, *, is_published, content_type="news"):
+    return WebsiteContent.objects.create(
+        title="t",
+        content={},
+        is_published=is_published,
+        user=user,
+        content_type=content_type,
+    )
+
+
+# A write clears the view cache when it changes what a reader can see, which
+# a draft saved as a draft does not -- see `perform_create`.
+@pytest.mark.parametrize("is_published", [True, False])
+def test_create_clears_views_cache_only_when_published(
+    staff_client,
+    mock_clear_views_cache,
+    django_capture_on_commit_callbacks,
+    is_published,
+):
+    """Creating a draft leaves the cache alone; publishing one clears it."""
+    url = reverse("website_content:v1:website_content-list")
+    data = {
+        "content": {},
+        "title": "Some title",
+        "content_type": "news",
+        "is_published": is_published,
+    }
+    with django_capture_on_commit_callbacks(execute=True):
+        resp = staff_client.post(url, data, format="json")
+
+    assert resp.status_code == 201
+    assert mock_clear_views_cache.called is is_published
+
+
+@pytest.mark.parametrize("now_published", [True, False])
+def test_update_of_a_draft_clears_views_cache_only_when_publishing(
+    staff_client,
+    user,
+    mock_clear_views_cache,
+    django_capture_on_commit_callbacks,
+    now_published,
+):
+    """
+    Saving a draft as a draft leaves the cache alone.
+
+    This is the autosave path -- the editor saves every couple of seconds, and
+    each clear takes every view cache rather than a prefix.
+    """
+    content = _make_content(user, is_published=False)
+    url = reverse(
+        "website_content:v1:website_content-detail", kwargs={"pk": content.id}
+    )
+    with django_capture_on_commit_callbacks(execute=True):
+        resp = staff_client.patch(url, {"is_published": now_published}, format="json")
+
+    assert resp.status_code == 200
+    assert mock_clear_views_cache.called is now_published
+
+
+@pytest.mark.parametrize("now_published", [True, False])
+def test_update_of_published_always_clears_views_cache(
+    staff_client,
+    user,
+    mock_clear_views_cache,
+    django_capture_on_commit_callbacks,
+    now_published,
+):
+    """
+    Editing something already published clears either way.
+
+    Published to published changes what a reader sees; published to draft
+    takes it away from them, which the cached responses have to stop showing.
+    """
+    content = _make_content(user, is_published=True)
+    url = reverse(
+        "website_content:v1:website_content-detail", kwargs={"pk": content.id}
+    )
+    with django_capture_on_commit_callbacks(execute=True):
+        resp = staff_client.patch(
+            url,
+            {"is_published": now_published, "title": "Retitled"},
+            format="json",
+        )
+
+    assert resp.status_code == 200
+    assert mock_clear_views_cache.called is True
+
+
+def test_destroy_draft_soft_deletes(
+    staff_client,
+    user,
+    mock_clear_views_cache,
+    django_capture_on_commit_callbacks,
+):
+    """Deleting a draft soft-deletes it and leaves the view cache alone."""
+    content = _make_content(user, is_published=False)
+    url = reverse(
+        "website_content:v1:website_content-detail", kwargs={"pk": content.id}
+    )
+    with django_capture_on_commit_callbacks(execute=True):
+        resp = staff_client.delete(url)
+
+    assert resp.status_code == 204
+    # Only a draft can be deleted, and a draft is in no cached response.
+    assert mock_clear_views_cache.called is False
+
+    # Row is kept in the DB but marked deleted.
+    content.refresh_from_db()
+    assert content.deleted is not None
+
+
+def test_soft_deleted_content_hidden_from_api(staff_client, user):
+    """Soft-deleted items are excluded from list and detail endpoints."""
+    content = _make_content(user, is_published=False)
+    staff_client.delete(
+        reverse("website_content:v1:website_content-detail", kwargs={"pk": content.id})
+    )
+
+    list_url = reverse("website_content:v1:website_content-list")
+    list_ids = [item["id"] for item in staff_client.get(list_url).json()["results"]]
+    assert content.id not in list_ids
+
+    detail_url = reverse(
+        "website_content:v1:website_content-detail-by-id-or-slug",
+        kwargs={"identifier": str(content.id)},
+    )
+    assert staff_client.get(detail_url).status_code == 404
+
+
+def test_destroy_published_rejected(staff_client, user):
+    """Published content cannot be deleted; the row is left untouched."""
+    content = _make_content(user, is_published=True)
+    url = reverse(
+        "website_content:v1:website_content-detail", kwargs={"pk": content.id}
+    )
+    resp = staff_client.delete(url)
+
+    assert resp.status_code == 400
+    content.refresh_from_db()
+    assert content.deleted is None
+
+
+def test_destroy_forbidden_for_non_editor(client, user):
+    """A non-staff, non-editor user cannot delete content."""
+    normal_user = UserFactory.create(is_staff=False)
+    client.force_login(normal_user)
+
+    content = _make_content(user, is_published=False)
+    url = reverse(
+        "website_content:v1:website_content-detail", kwargs={"pk": content.id}
+    )
+    resp = client.delete(url)
+
+    assert resp.status_code == 403
+    content.refresh_from_db()
+    assert content.deleted is None
+
+
+def test_content_type_filter(client, user):
+    """content_type query param should filter results"""
+    WebsiteContent.objects.create(
+        title="News piece",
+        content={},
+        is_published=True,
+        user=user,
+        content_type="news",
+    )
+    WebsiteContent.objects.create(
+        title="Article piece",
+        content={},
+        is_published=True,
+        user=user,
+        content_type="article",
+    )
+
+    url = reverse("website_content:v1:website_content-list") + "?content_type=news"
+    resp = client.get(url)
+    results = resp.json()["results"]
+
+    assert all(r["content_type"] == "news" for r in results)
+    assert len(results) == 1
+
+
+@pytest.mark.parametrize("limit", [2, 10])
+def test_list_query_count_is_constant(client, django_assert_num_queries, limit):
+    """Listing costs the same number of queries whatever the page size."""
+    for content_user in [*UserFactory.create_batch(5), None]:
+        WebsiteContent.objects.create(
+            title="t",
+            content={},
+            is_published=True,
+            user=content_user,
+            content_type="news",
+        )
+
+    url = reverse("website_content:v1:website_content-list")
+    # Count, page, and one more for the topics prefetch -- all independent of
+    # the page size, which is what this is guarding.
+    with django_assert_num_queries(3):
+        results = client.get(url, {"limit": limit}).json()["results"]
+
+    assert len(results) == min(limit, 6)
+    # The most recently published item has no user; a nullable FK still has to
+    # serialize, which a select_related() join preserves and an inner join wouldn't.
+    assert results[0]["user"] is None
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        # each case is was_published, then now_published, then whether the
+        # unpublish actions should fire
+        (True, False, True),  # the unpublish transition
+        (True, True, False),  # still published
+        (False, False, False),  # draft edit, never published
+        (False, True, False),  # publishing
+    ],
+)
+def test_update_triggers_unpublish_actions_only_on_the_transition(
+    staff_client,
+    user,
+    mocker,
+    django_capture_on_commit_callbacks,
+    case,
+):
+    """
+    Tearing down the news feed entry must key off the published->unpublished
+    transition, which the saved instance alone cannot reveal.
+    """
+    was_published, now_published, expect_unpublish_actions = case
+    mocker.patch("website_content.views.clear_views_cache")
+    mock_unpublish = mocker.patch("website_content.views.content_unpublished_actions")
+    # purge_content_on_save skips unpublished content, so the unpublish
+    # transition owns clearing the CDN for the page and its listing.
+    mock_purge = mocker.patch("website_content.views.purge_content_on_unpublish")
+    content = _make_content(user, is_published=was_published)
+    url = reverse(
+        "website_content:v1:website_content-detail", kwargs={"pk": content.id}
+    )
+
+    with django_capture_on_commit_callbacks(execute=True):
+        resp = staff_client.patch(url, {"is_published": now_published}, format="json")
+
+    assert resp.status_code == 200
+    assert mock_unpublish.called is expect_unpublish_actions
+    assert mock_purge.called is expect_unpublish_actions
+
+
+def test_unpublish_removes_the_news_feed_entry_inline(staff_client, user):
+    """
+    The feed entry is gone by the time the unpublish request answers.
+
+    The news listing refetches the moment it returns, so an entry left for a
+    worker to remove comes straight back to the editor who just unpublished it.
+    No worker runs here and no on_commit callback is executed: the removal has
+    to have happened during the request itself.
+    """
+    from news_events.etl.articles_news import (
+        sync_single_website_content_news_to_news,
+        website_content_feed_guid,
+    )
+    from news_events.models import FeedItem
+
+    content = _make_content(user, is_published=True)
+    sync_single_website_content_news_to_news(content)
+    guid = website_content_feed_guid(content.id)
+    assert FeedItem.objects.filter(guid=guid).exists()
+    url = reverse(
+        "website_content:v1:website_content-detail", kwargs={"pk": content.id}
+    )
+
+    resp = staff_client.patch(url, {"is_published": False}, format="json")
+
+    assert resp.status_code == 200
+    assert not FeedItem.objects.filter(guid=guid).exists()
+
+
+def test_unpublish_survives_a_failing_search_hand_off(
+    staff_client, user, mocker, django_capture_on_commit_callbacks
+):
+    """
+    An unpublish is not failed by the index work behind it.
+
+    The hooks run the search and vector plugins inline, which can fail in ways
+    a database error does not cover -- an unreachable broker, for one. Raising
+    would report a failure that did not happen: the rows are already committed
+    unpublished, and a retried request fires no hooks at all, because
+    `perform_update` keys them off the published->unpublished transition.
+    """
+    mocker.patch(
+        "learning_resources.api.unpublish_website_content_learning_resource",
+        side_effect=OSError("[Errno 111] Connection refused"),
+    )
+    mock_task = mocker.patch(
+        "learning_resources.tasks.unpublish_website_content_learning_resource_task.delay"
+    )
+    content = _make_content(user, is_published=True, content_type="article")
+    url = reverse(
+        "website_content:v1:website_content-detail", kwargs={"pk": content.id}
+    )
+
+    with django_capture_on_commit_callbacks(execute=True):
+        resp = staff_client.patch(url, {"is_published": False}, format="json")
+
+    assert resp.status_code == 200
+    content.refresh_from_db()
+    assert content.is_published is False
+    # Left with the task that retries, rather than dropped.
+    mock_task.assert_called_once_with(content.id)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_unpublish_hooks_run_outside_a_transaction(staff_client, user, mocker):
+    """
+    The unpublish hooks must not run inside a transaction.
+
+    They do two things that are only safe in autocommit: a synchronous call out
+    to Qdrant, which would otherwise hold a transaction open across network
+    I/O, and swallowing a `DatabaseError` to fall back to a queued task, which
+    inside an atomic block would poison the transaction instead -- the fallback
+    would never be queued, and the next query would raise
+    `TransactionManagementError`.
+
+    Nothing here asks for a transaction today, so this asserts the property
+    rather than trusting it: enabling `ATOMIC_REQUESTS` (or wrapping the view)
+    breaks the assumption, and this is what says so.
+    """
+    seen = {}
+
+    def record(*, content):
+        connection = transaction.get_connection()
+        seen["in_atomic_block"] = connection.in_atomic_block
+        seen["autocommit"] = connection.get_autocommit()
+
+    mocker.patch("website_content.views.content_unpublished_actions", record)
+    mocker.patch("website_content.views.clear_views_cache")
+    content = _make_content(user, is_published=True)
+    url = reverse(
+        "website_content:v1:website_content-detail", kwargs={"pk": content.id}
+    )
+
+    resp = staff_client.patch(url, {"is_published": False}, format="json")
+
+    assert resp.status_code == 200
+    assert seen == {"in_atomic_block": False, "autocommit": True}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_unpublish_clears_the_view_cache_after_removing_the_feed_entry(
+    staff_client, user, mocker
+):
+    """
+    The cached news listing is dropped only once the entry it contains is gone.
+
+    Cleared any earlier, a request landing in between re-caches the listing
+    that still holds the story, which then outlives the unpublish by the whole
+    cache duration. Needs a real commit: inside the usual test transaction
+    every on_commit callback is deferred to the end regardless of order.
+    """
+    from news_events.etl.articles_news import (
+        sync_single_website_content_news_to_news,
+        website_content_feed_guid,
+    )
+    from news_events.models import FeedItem
+
+    content = _make_content(user, is_published=True)
+    sync_single_website_content_news_to_news(content)
+    guid = website_content_feed_guid(content.id)
+    seen = {}
+
+    mocker.patch(
+        "website_content.views.clear_views_cache",
+        side_effect=lambda: seen.update(
+            feed_entry=FeedItem.objects.filter(guid=guid).exists()
+        ),
+    )
+    url = reverse(
+        "website_content:v1:website_content-detail", kwargs={"pk": content.id}
+    )
+
+    resp = staff_client.patch(url, {"is_published": False}, format="json")
+
+    assert resp.status_code == 200
+    assert seen == {"feed_entry": False}
+
+
+@pytest.mark.parametrize("content_type", ["article", "news"])
+def test_seo_fields_round_trip(staff_client, user, content_type):
+    """
+    Both content types carry SEO overrides, created and patched.
+
+    They are what search engines and link previews show in place of the title
+    and the opening of the content, so they are the editor's to set on either
+    type.
+    """
+    resp = staff_client.post(
+        reverse("website_content:v1:website_content-list"),
+        {
+            "content": {},
+            "title": "Optimised",
+            "content_type": content_type,
+            "seo_title_override": "A better title for search",
+            "seo_description_override": "What this is about, in one sentence.",
+        },
+        format="json",
+    )
+
+    assert resp.status_code == 201
+    # The override is echoed back, and is also what resolves.
+    assert resp.json()["seo_title_override"] == "A better title for search"
+    assert resp.json()["seo_title"] == "A better title for search"
+    assert resp.json()["seo_description"] == "What this is about, in one sentence."
+
+    detail = reverse(
+        "website_content:v1:website_content-detail", kwargs={"pk": resp.json()["id"]}
+    )
+    patched = staff_client.patch(
+        detail, {"seo_description_override": "Reworded."}, format="json"
+    )
+
+    assert patched.status_code == 200
+    assert patched.json()["seo_description"] == "Reworded."
+    # Untouched by a patch that did not mention it.
+    assert patched.json()["seo_title"] == "A better title for search"
+    content = WebsiteContent.objects.get(id=resp.json()["id"])
+    assert content.seo_title_override == "A better title for search"
+    assert content.seo_description_override == "Reworded."
+
+
+def test_seo_overrides_default_to_blank(staff_client):
+    """Unset is blank rather than null, and blank is what defers to inference."""
+    resp = staff_client.post(
+        reverse("website_content:v1:website_content-list"),
+        {"content": {}, "title": "Plain", "content_type": "news"},
+        format="json",
+    )
+
+    assert resp.status_code == 201
+    assert resp.json()["seo_title_override"] == ""
+    assert resp.json()["seo_description_override"] == ""
+
+
+def test_seo_title_is_inferred_from_the_title(staff_client):
+    """
+    Unset, the SEO title is the content's own -- and keeps following it.
+
+    This is the common case: nobody fills the field in, and renaming the
+    article renames what a search result shows. Storing the resolved value
+    instead of the override is what would break that, which is why the column
+    holds the override.
+    """
+    resp = staff_client.post(
+        reverse("website_content:v1:website_content-list"),
+        {"content": {}, "title": "First name", "content_type": "news"},
+        format="json",
+    )
+    assert resp.json()["seo_title"] == "First name"
+
+    detail = reverse(
+        "website_content:v1:website_content-detail", kwargs={"pk": resp.json()["id"]}
+    )
+    renamed = staff_client.patch(detail, {"title": "Second name"}, format="json")
+
+    assert renamed.json()["seo_title"] == "Second name"
+    assert renamed.json()["seo_title_override"] == ""
+
+
+def test_seo_description_is_inferred_from_the_subheading(staff_client):
+    """
+    Unset, the SEO description is the banner's subheading.
+
+    The line under the headline is the one part of the body written as a
+    summary, so it is what a search result gets when nobody has written
+    something specific for it.
+    """
+    resp = staff_client.post(
+        reverse("website_content:v1:website_content-list"),
+        {
+            "content": {
+                "type": "doc",
+                "content": [
+                    {
+                        "type": "banner",
+                        "content": [
+                            {
+                                "type": "heading",
+                                "content": [{"type": "text", "text": "A headline"}],
+                            },
+                            {
+                                "type": "paragraph",
+                                "content": [
+                                    {"type": "text", "text": "The line beneath it."}
+                                ],
+                            },
+                        ],
+                    }
+                ],
+            },
+            "title": "Has a subheading",
+            "content_type": "news",
+        },
+        format="json",
+    )
+
+    assert resp.json()["seo_description"] == "The line beneath it."
+    assert resp.json()["seo_description_override"] == ""
+
+
+def test_inferred_description_joins_a_formatted_subheading(staff_client):
+    """
+    A subheading split up by formatting resolves whole.
+
+    ProseMirror splits a line on every mark boundary, so "A **complex**
+    article" is three text nodes rather than one. Reading only the first
+    resolved a single word.
+    """
+    resp = staff_client.post(
+        reverse("website_content:v1:website_content-list"),
+        {
+            "content": {
+                "type": "doc",
+                "content": [
+                    {
+                        "type": "banner",
+                        "content": [
+                            {
+                                "type": "heading",
+                                "content": [
+                                    {"type": "text", "text": "Complex Article"}
+                                ],
+                            },
+                            {
+                                "type": "paragraph",
+                                "content": [
+                                    {"type": "text", "text": "A "},
+                                    {
+                                        "type": "text",
+                                        "marks": [{"type": "bold"}],
+                                        "text": "complex",
+                                    },
+                                    {"type": "text", "text": " article with "},
+                                    {
+                                        "type": "text",
+                                        "marks": [{"type": "italic"}],
+                                        "text": "various",
+                                    },
+                                    {"type": "text", "text": " elements."},
+                                ],
+                            },
+                        ],
+                    }
+                ],
+            },
+            "title": "Formatted subheading",
+            "content_type": "news",
+        },
+        format="json",
+    )
+
+    assert resp.json()["seo_description"] == "A complex article with various elements."
+
+
+def test_seo_override_wins_over_what_is_inferred(staff_client):
+    """An override is the point: it displaces the content's own words."""
+    resp = staff_client.post(
+        reverse("website_content:v1:website_content-list"),
+        {
+            "content": {},
+            "title": "The content title",
+            "content_type": "news",
+            "seo_title_override": "Something written for search",
+        },
+        format="json",
+    )
+
+    assert resp.json()["seo_title"] == "Something written for search"
+
+
+def test_clearing_an_seo_override_restores_inference(staff_client):
+    """
+    Blanking an override hands the field back, rather than emptying the tag.
+
+    An editor who decides their wording was not worth keeping gets the
+    content's own words again -- which is only possible because the column
+    holds the override and not the resolved value.
+    """
+    resp = staff_client.post(
+        reverse("website_content:v1:website_content-list"),
+        {
+            "content": {},
+            "title": "The content title",
+            "content_type": "news",
+            "seo_title_override": "Something written for search",
+        },
+        format="json",
+    )
+    detail = reverse(
+        "website_content:v1:website_content-detail", kwargs={"pk": resp.json()["id"]}
+    )
+
+    cleared = staff_client.patch(detail, {"seo_title_override": ""}, format="json")
+
+    assert cleared.json()["seo_title_override"] == ""
+    assert cleared.json()["seo_title"] == "The content title"
+
+
+def test_seo_fields_are_read_only(staff_client):
+    """
+    The resolved values cannot be written; only the overrides can.
+
+    Sent anyway, they are ignored rather than rejected -- DRF drops read-only
+    fields -- so what matters is that nothing was stored under them.
+    """
+    resp = staff_client.post(
+        reverse("website_content:v1:website_content-list"),
+        {
+            "content": {},
+            "title": "The content title",
+            "content_type": "news",
+            "seo_title": "Written to the wrong field",
+        },
+        format="json",
+    )
+
+    assert resp.status_code == 201
+    assert resp.json()["seo_title"] == "The content title"
+    assert resp.json()["seo_title_override"] == ""
+
+
+def test_create_with_topics(staff_client):
+    """Topics sent on create are persisted and echoed back."""
+    topics = LearningResourceTopicFactory.create_batch(2)
+    expected = sorted(topic.id for topic in topics)
+    url = reverse("website_content:v1:website_content-list")
+
+    resp = staff_client.post(
+        url,
+        {
+            "content": {},
+            "title": "Topical",
+            "content_type": "news",
+            "topics": expected,
+        },
+        format="json",
+    )
+
+    assert resp.status_code == 201
+    # `topics` is in the serializer's required_prefetches, and a write leaves
+    # nothing prefetched on its own -- a created instance has no prefetch cache
+    # at all. The response can serialize them because `perform_create` hands
+    # the serializer a freshly prefetched instance; without that this is a 500.
+    assert sorted(resp.json()["topics"]) == expected
+    content = WebsiteContent.objects.get(id=resp.json()["id"])
+    assert sorted(content.topics.values_list("id", flat=True)) == expected
+
+
+def test_patch_replaces_topics(staff_client, user):
+    """PATCHing topics replaces the selection rather than adding to it."""
+    old_topic, new_topic = LearningResourceTopicFactory.create_batch(2)
+    content = _make_content(user, is_published=False)
+    content.topics.set([old_topic])
+    url = reverse(
+        "website_content:v1:website_content-detail", kwargs={"pk": content.id}
+    )
+
+    resp = staff_client.patch(url, {"topics": [new_topic.id]}, format="json")
+
+    assert resp.status_code == 200
+    assert resp.json()["topics"] == [new_topic.id]
+    assert list(content.topics.values_list("id", flat=True)) == [new_topic.id]
+
+
+def test_patch_without_topics_leaves_them_alone(staff_client, user):
+    """
+    The field is optional, so an unrelated PATCH -- which is what the drawer
+    sends when the editor only renames -- must not wipe existing selections.
+    """
+    topic = LearningResourceTopicFactory.create()
+    content = _make_content(user, is_published=False)
+    content.topics.set([topic])
+    url = reverse(
+        "website_content:v1:website_content-detail", kwargs={"pk": content.id}
+    )
+
+    resp = staff_client.patch(url, {"title": "Renamed"}, format="json")
+
+    assert resp.status_code == 200
+    assert list(content.topics.values_list("id", flat=True)) == [topic.id]
+
+
+@pytest.mark.parametrize(
+    ("stored_type", "requested_type"), [("article", "news"), ("news", "article")]
+)
+def test_patch_cannot_change_content_type(
+    staff_client, user, stored_type, requested_type
+):
+    """An existing item keeps its type; a PATCH that changes it is rejected."""
+    content = _make_content(user, is_published=False, content_type=stored_type)
+    url = reverse(
+        "website_content:v1:website_content-detail", kwargs={"pk": content.id}
+    )
+
+    resp = staff_client.patch(
+        url, {"title": "Renamed", "content_type": requested_type}, format="json"
+    )
+
+    assert resp.status_code == 400
+    assert "content_type" in resp.json()
+    content.refresh_from_db()
+    assert content.content_type == stored_type
+    assert content.title == "t"
+
+
+@pytest.mark.parametrize("content_type", ["article", "news"])
+def test_patch_with_unchanged_content_type_succeeds(staff_client, user, content_type):
+    """The editors send their type on every save, so resending it must pass."""
+    content = _make_content(user, is_published=False, content_type=content_type)
+    url = reverse(
+        "website_content:v1:website_content-detail", kwargs={"pk": content.id}
+    )
+
+    resp = staff_client.patch(
+        url, {"title": "Renamed", "content_type": content_type}, format="json"
+    )
+
+    assert resp.status_code == 200
+    content.refresh_from_db()
+    assert content.content_type == content_type
+    assert content.title == "Renamed"
+
+
+@pytest.mark.parametrize("bad_topics", [[-1], ["not-a-number"], "news"])
+def test_create_with_invalid_topics_rejected(staff_client, bad_topics):
+    """
+    Resolving all the ids in one query must still reject the payloads the
+    per-id lookup would have: a missing topic, a non-numeric id, and a bare
+    string where a list belongs.
+    """
+    url = reverse("website_content:v1:website_content-list")
+
+    resp = staff_client.post(
+        url,
+        {
+            "content": {},
+            "title": "Topical",
+            "content_type": "news",
+            "topics": bad_topics,
+        },
+        format="json",
+    )
+
+    assert resp.status_code == 400
+    assert "topics" in resp.json()
+
+
+def test_retrieve_returns_topics(client, user):
+    """Topics are readable by anonymous users on published content."""
+    topic = LearningResourceTopicFactory.create()
+    content = _make_content(user, is_published=True)
+    content.topics.set([topic])
+
+    url = reverse(
+        "website_content:v1:website_content-detail-by-id-or-slug",
+        kwargs={"identifier": str(content.id)},
+    )
+    resp = client.get(url)
+
+    assert resp.status_code == 200
+    assert resp.json()["topics"] == [topic.id]

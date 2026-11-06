@@ -1,0 +1,218 @@
+"""Constants for learning_resources ETL processes"""
+
+from collections import namedtuple
+from dataclasses import dataclass, field
+from datetime import datetime
+from decimal import Decimal
+from enum import Enum
+
+from django.conf import settings
+from named_enum import ExtendedEnum
+
+from learning_resources.constants import LearningResourceDelivery
+from learning_resources.models import LearningResourcePrice
+
+# A custom UA so that operators of OpenEdx will know who is pinging their service
+COMMON_HEADERS = {
+    "User-Agent": f"CourseCatalogBot/{settings.VERSION} ({settings.APP_BASE_URL})"
+}
+
+# Several podcast hosts (buzzsprout among them) 403 the default python-requests
+# User-Agent, so the podcast feed and transcript fetches pose as a browser.
+BROWSER_UA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_1) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/39.0.2171.95 Safari/537.36"
+}
+
+READABLE_ID_FIELD = "readable_id"
+
+MIT_OWNER_KEYS = ["MITx", "MITx_PRO"]
+
+TIME_INTERVAL_MAPPING = {
+    "half-days": ["days"],
+    "half-day": ["day"],
+    "hours": [
+        "horas",
+    ],
+    "hour": [
+        "hora",
+    ],
+    "days": [
+        "días",
+        "jours",
+    ],
+    "day": [
+        "día",
+        "jour",
+    ],
+    "weeks": ["semanas", "semaines", "settimanes"],
+    "week": [
+        "semana",
+        "semaine",
+        "settimane",
+    ],
+    "months": ["meses", "mois", "mesi"],
+    "month": [
+        "mes",
+        "mois",
+    ],
+}
+
+
+OfferedByLoaderConfig = namedtuple(  # noqa: PYI024
+    "OfferedByLoaderConfig", ["additive"], defaults=[False]
+)
+LearningResourceRunLoaderConfig = namedtuple(  # noqa: PYI024
+    "RunLoaderConfig", ["offered_by"], defaults=[OfferedByLoaderConfig()]
+)
+
+# prune_empty lets prune run when nothing was loaded, unpublishing every resource
+# of the source. Off by default so an empty extraction can't wipe a source; only
+# a caller that knows the empty set is authoritative should turn it on.
+CourseLoaderConfig = namedtuple(  # noqa: PYI024
+    "CourseLoaderConfig",
+    ["prune", "offered_by", "runs", "fetch_only", "prune_empty"],
+    defaults=[
+        True,
+        OfferedByLoaderConfig(),
+        LearningResourceRunLoaderConfig(),
+        False,
+        False,
+    ],
+)
+
+ProgramLoaderConfig = namedtuple(  # noqa: PYI024
+    "ProgramLoaderConfig",
+    ["prune", "courses", "offered_by", "runs", "prune_empty"],
+    defaults=[
+        True,
+        CourseLoaderConfig(),
+        OfferedByLoaderConfig(),
+        LearningResourceRunLoaderConfig(),
+        False,
+    ],
+)
+
+
+class ETLSource(ExtendedEnum):
+    """Enum of ETL sources"""
+
+    # retired: nothing ingests it, but ol-data-platform still sends mit_edx
+    # content file webhooks, which this keeps a no-op instead of a 400. Remove
+    # once they stop.
+    mit_edx = "mit_edx"
+    mitpe = "mitpe"
+    mitxonline = "mitxonline"
+    oll = "oll"
+    ocw = "ocw"
+    podcast = "podcast"
+    mit_climate = "mit_climate"
+    see = "see"
+    xpro = "xpro"
+    youtube = "youtube"
+    canvas = "canvas"
+    ovs = "ovs"
+
+
+QDRANT_RETAINED_SOURCES = (
+    ETLSource.mitxonline.value,
+    ETLSource.xpro.value,
+    ETLSource.oll.value,
+    ETLSource.canvas.value,
+)
+
+# Sources whose course run_id is an edX course run key, which the source lets
+# belong to only one course at a time
+EDX_RUN_ID_SOURCES = (
+    ETLSource.mitxonline.value,
+    ETLSource.xpro.value,
+    ETLSource.oll.value,
+)
+
+
+class CourseNumberType(Enum):
+    """Enum of course number types"""
+
+    primary = "primary"
+    cross_listed = "cross-listed"
+
+
+RESOURCE_FILE_ETL_SOURCES = [
+    ETLSource.ocw.value,
+    ETLSource.mitxonline.value,
+    ETLSource.xpro.value,
+]
+
+# update_index and recreate_index index these sources' content files, matching
+# what content_files_loaded indexes on ingest. OLL is kept out of
+# RESOURCE_FILE_ETL_SOURCES, which also scopes cleanup_deleted_content_files.
+REINDEX_CONTENT_FILE_ETL_SOURCES = [*RESOURCE_FILE_ETL_SOURCES, ETLSource.oll.value]
+
+MARKETING_PAGE_FILE_TYPE = "marketing_page"
+
+RESOURCE_DELIVERY_MAPPING = {
+    None: LearningResourceDelivery.online.name,
+    "": LearningResourceDelivery.online.name,
+    "Blended": LearningResourceDelivery.hybrid.name,
+    "In Person": LearningResourceDelivery.in_person.name,
+    "Live Virtual": LearningResourceDelivery.online.name,
+    "Live Online": LearningResourceDelivery.online.name,
+    "On Campus": LearningResourceDelivery.in_person.name,
+    **{
+        value: LearningResourceDelivery(value).name
+        for value in LearningResourceDelivery.values()
+    },
+}
+
+
+class ContentTagCategory(ExtendedEnum):
+    """
+    Enum for content tag categories.
+    """
+
+    videos = "Videos"
+    notes = "Notes"
+    exams = "Exams"
+    problem_sets = "Problem Sets"
+
+
+CONTENT_TAG_CATEGORIES = {
+    "Lecture Videos": ContentTagCategory.videos.value,
+    "Lecture Notes": ContentTagCategory.notes.value,
+    "Exams with Solutions": ContentTagCategory.exams.value,
+    "Exams": ContentTagCategory.exams.value,
+    "Problem Sets with Solutions": ContentTagCategory.problem_sets.value,
+    "Problem Sets": ContentTagCategory.problem_sets.value,
+    "Assignments": ContentTagCategory.problem_sets.value,
+    # Can add more here if ever needed, in format tag_name:category
+}
+
+
+@dataclass
+class ResourceNextRunConfig:
+    next_start_date: datetime = None
+    prices: list[Decimal] = field(default_factory=list)
+    resource_prices: list[LearningResourcePrice] = field(default_factory=list)
+    availability: str = ""
+    location: str = ""
+    duration: str = ""
+    min_weeks: int = None
+    max_weeks: int = None
+    time_commitment: str = ""
+    min_weekly_hours: int = None
+    max_weekly_hours: int = None
+
+
+@dataclass
+class DurationConfig:
+    duration: str = ""
+    min_weeks: int = None
+    max_weeks: int = None
+
+
+@dataclass
+class CommitmentConfig:
+    commitment: str = ""
+    min_weekly_hours: int = None
+    max_weekly_hours: int = None

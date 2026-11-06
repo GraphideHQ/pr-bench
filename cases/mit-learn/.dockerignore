@@ -1,0 +1,9 @@
+.tox
+.cache
+htmlcov
+.coverage
+node_modules
+staticfiles/
+env/
+.venv/
+kompose/

@@ -1,0 +1,236 @@
+import {
+  calendarDaysUntil,
+  formatCalendarDays,
+  formatDate,
+  isInPast,
+} from "ol-utilities"
+import type { CourseRunEnrollmentV3 } from "@mitodl/mitxonline-api-axios/v3"
+
+export type RunTimeState = "upcoming" | "underway" | "ended"
+
+/**
+ * Where a run sits relative to now. Shared by the card's progress badge and the
+ * sibling-runs accordion so the two can never disagree about whether the
+ * displayed run is still going. Absent or unparseable dates fall back to
+ * "underway", which is how the cards behaved before dates were consulted.
+ */
+export const getRunTimeState = (
+  startDate?: string | null,
+  endDate?: string | null,
+): RunTimeState => {
+  if (startDate && isInPast(startDate) === false) return "upcoming"
+  if (endDate && isInPast(endDate) === true) return "ended"
+  return "underway"
+}
+
+/**
+ * mitxonline serves `has_course_staff_role` on an enrollment (mitodl/mitxonline#4074),
+ * but the generated client does not carry it yet - it lands with the next
+ * @mitodl/mitxonline-api-axios release. Declaring it here keeps the field typed
+ * in the meantime.
+ *
+ * Once the client has it, this type and `hasCourseStaffRole` both go, and the
+ * two call sites read `enrollment.has_course_staff_role` directly. The other
+ * spots to clean up then are the `has_course_staff_role` fixture spreads in
+ * EnrolledCourseCard.test.tsx and SiblingRunsAccordion.test.tsx.
+ */
+type EnrollmentWithCourseStaffRole = CourseRunEnrollmentV3 & {
+  has_course_staff_role?: boolean
+}
+
+/**
+ * Whether the user holds an Open edX course staff or instructor role on a run.
+ */
+export const hasCourseStaffRole = (
+  enrollment: EnrollmentWithCourseStaffRole,
+): boolean => Boolean(enrollment.has_course_staff_role)
+
+/**
+ * Whether this run's courseware can be opened yet; staff may preview early.
+ *
+ * "Staff" here is both kinds Open edX itself lets in before a run starts: a
+ * course staff or instructor role on that run, and mitxonline site staff. Open
+ * edX grants the former in `administrative_accesses_to_course_for_user`, so
+ * disabling the button for a course admin only sent them to paste the
+ * courseware URL by hand.
+ *
+ * Shared by the card button, the card title and the sibling-run rows, so the
+ * three ways into a run from one card cannot disagree about whether it opens.
+ *
+ * The upgrade and post-enrollment redirects in `useEnrollmentHandler` call this
+ * too, but pass only `isStaff`, so a course admin enrolling into a run that has
+ * not started is not redirected into it. That is deliberate: those redirects
+ * fire for someone who just enrolled as a learner, and sending them somewhere
+ * the run has not begun would be the wrong default. They reach the courseware
+ * from the dashboard card instead.
+ */
+export const canOpenCourseware = (
+  startDate?: string | null,
+  {
+    isStaff = false,
+    isCourseStaff = false,
+  }: { isStaff?: boolean; isCourseStaff?: boolean } = {},
+): boolean =>
+  isStaff || isCourseStaff || getRunTimeState(startDate) !== "upcoming"
+
+/**
+ * A run's date range. Returns "" when the run has neither date; prefer
+ * `formatRunIdentifier` for anything a learner reads, since that case is not
+ * rare enough to leave the run nameless.
+ */
+export const formatRunDateRange = (
+  startDate?: string | null,
+  endDate?: string | null,
+): string => {
+  const parts: string[] = []
+  if (startDate) parts.push(formatDate(startDate, "MMM D, YYYY"))
+  if (endDate) parts.push(formatDate(endDate, "MMM D, YYYY"))
+  return parts.join(" – ")
+}
+
+/**
+ * How a run is named to the learner, on the sibling-runs rows and in the
+ * unenroll / email settings dialogs. Shared so a dialog names the run the same
+ * way the row the learner opened it from does — the whole point of showing it
+ * is letting them spot the wrong run, which fails if the two spell it
+ * differently.
+ *
+ * The date range where there is one, otherwise the run tag. A run with neither
+ * date is a normal state here, not a defect: `getRunTimeState` counts one as
+ * underway and `pickBestEnrollmentFromGroup` will happily display it. Falling
+ * back to dates alone left those rows and dialogs with an empty name, so two
+ * undated runs of the same course were indistinguishable — visually and to a
+ * screen reader.
+ */
+export const formatRunIdentifier = (
+  run?: {
+    start_date?: string | null
+    end_date?: string | null
+    run_tag?: string | null
+  } | null,
+): string => {
+  const dateRange = formatRunDateRange(run?.start_date, run?.end_date)
+  if (dateRange) return dateRange
+  return run?.run_tag ? `Run ${run.run_tag}` : "Undated run"
+}
+
+export const getCourseDateText = (
+  startDate?: string | null,
+  endDate?: string | null,
+): string | null => {
+  if (!startDate && !endDate) return null
+  const hasStarted = startDate ? isInPast(startDate) : true
+  const daysUntilStart = startDate ? calendarDaysUntil(startDate) : null
+  const daysUntilEnd = endDate ? calendarDaysUntil(endDate) : null
+  const hasEnded = endDate ? isInPast(endDate) : false
+
+  if (!hasStarted) {
+    if (daysUntilStart === null || daysUntilStart < 0) return null
+    return `Starts ${formatCalendarDays(daysUntilStart)}`
+  }
+  if (!hasEnded) {
+    if (daysUntilEnd === null || daysUntilEnd < 0) return null
+    return `Ends ${formatCalendarDays(daysUntilEnd)}`
+  }
+  if (daysUntilEnd === null) return null
+  return `Ended ${formatCalendarDays(daysUntilEnd)}`
+}
+
+const MS_IN_DAY = 1000 * 60 * 60 * 24
+
+const formatDayCount = (days: number): string =>
+  `${days} day${days === 1 ? "" : "s"}`
+
+export interface RelativeDateContent {
+  anchorLabel: string
+  startVerb: "starts" | "started"
+  startSuffix: string
+  endVerb?: "ends" | "ended"
+  endSuffix?: string
+}
+
+export const getRelativeDateContent = (
+  startDateString?: string | null,
+  endDateString?: string | null,
+  startDateDisplay?: string | null,
+  endDateDisplay?: string | null,
+): RelativeDateContent | null => {
+  if (!startDateString) return null
+
+  const now = Date.now()
+  const startDate = new Date(startDateString)
+  if (Number.isNaN(startDate.getTime())) return null
+
+  const endDate = endDateString ? new Date(endDateString) : null
+  const hasValidEndDate = Boolean(endDate) && !Number.isNaN(endDate!.getTime())
+
+  if (!hasValidEndDate) {
+    if (now < startDate.getTime()) {
+      const daysUntilStart = Math.max(
+        0,
+        Math.ceil((startDate.getTime() - now) / MS_IN_DAY),
+      )
+      const dayCount = formatDayCount(daysUntilStart)
+      return {
+        anchorLabel: `${dayCount} until this course starts.`,
+        startVerb: "starts",
+        startSuffix: `in ${dayCount}${startDateDisplay ? ` on ${startDateDisplay}` : ""}.`,
+      }
+    }
+    const daysSinceStart = Math.max(
+      0,
+      Math.floor((now - startDate.getTime()) / MS_IN_DAY),
+    )
+    const dayCount = formatDayCount(daysSinceStart)
+    return {
+      anchorLabel: `this course started ${dayCount} ago.`,
+      startVerb: "started",
+      startSuffix: `${dayCount} ago${startDateDisplay ? ` on ${startDateDisplay}` : ""}.`,
+    }
+  }
+
+  const endTime = endDate!.getTime()
+
+  if (now < startDate.getTime()) {
+    const daysUntilStart = Math.max(
+      0,
+      Math.ceil((startDate.getTime() - now) / MS_IN_DAY),
+    )
+    const dayCount = formatDayCount(daysUntilStart)
+    return {
+      anchorLabel: `${dayCount} until this course starts.`,
+      startVerb: "starts",
+      startSuffix: `in ${dayCount}${startDateDisplay ? ` on ${startDateDisplay}` : ""}.`,
+      endVerb: endDateDisplay ? "ends" : undefined,
+      endSuffix: endDateDisplay ? `on ${endDateDisplay}.` : undefined,
+    }
+  }
+
+  if (now <= endTime) {
+    const daysUntilEnd = Math.max(0, Math.ceil((endTime - now) / MS_IN_DAY))
+    const daysUntilStart = Math.max(
+      0,
+      Math.floor((now - startDate.getTime()) / MS_IN_DAY),
+    )
+    return {
+      anchorLabel: `${formatDayCount(daysUntilEnd)} until this course ends.`,
+      startVerb: "started",
+      startSuffix: `${formatDayCount(daysUntilStart)} ago${startDateDisplay ? ` on ${startDateDisplay}` : ""}.`,
+      endVerb: "ends",
+      endSuffix: `in ${formatDayCount(daysUntilEnd)}${endDateDisplay ? ` on ${endDateDisplay}` : ""}.`,
+    }
+  }
+
+  const daysSinceEnd = Math.max(0, Math.floor((now - endTime) / MS_IN_DAY))
+  const daysSinceStart = Math.max(
+    0,
+    Math.floor((now - startDate.getTime()) / MS_IN_DAY),
+  )
+  return {
+    anchorLabel: `this course ended ${formatDayCount(daysSinceEnd)} ago.`,
+    startVerb: "started",
+    startSuffix: `${formatDayCount(daysSinceStart)} ago${startDateDisplay ? ` on ${startDateDisplay}` : ""}.`,
+    endVerb: "ended",
+    endSuffix: `${formatDayCount(daysSinceEnd)} ago${endDateDisplay ? ` on ${endDateDisplay}` : ""}.`,
+  }
+}

@@ -1,0 +1,227 @@
+from django.conf import settings
+from django.db import transaction
+from django.shortcuts import get_object_or_404
+from django_filters.rest_framework import DjangoFilterBackend
+from drf_spectacular.utils import (
+    OpenApiParameter,
+    OpenApiResponse,
+    extend_schema,
+    extend_schema_view,
+)
+from rest_framework import status, viewsets
+from rest_framework.decorators import action
+from rest_framework.exceptions import ValidationError
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from learning_resources.permissions import is_admin_user
+from main.constants import VALID_HTTP_METHODS
+from main.utils import clear_views_cache
+from website_content.api import (
+    content_published_actions,
+    content_unpublished_actions,
+    purge_content_on_save,
+    purge_content_on_unpublish,
+)
+from website_content.filters import WebsiteContentFilter
+from website_content.models import WebsiteContent
+from website_content.permissions import (
+    CanEditWebsiteContent,
+    CanViewWebsiteContent,
+    is_website_content_editor,
+)
+from website_content.serializers import (
+    WebsiteContentImageUploadSerializer,
+    WebsiteContentSerializer,
+)
+
+
+@extend_schema_view(
+    list=extend_schema(
+        summary="List",
+        description="Get a paginated list of website content items",
+    ),
+    retrieve=extend_schema(
+        summary="Retrieve", description="Retrieve a single content item"
+    ),
+    create=extend_schema(summary="Create", description="Create a new content item"),
+    destroy=extend_schema(summary="Destroy", description="Delete a content item"),
+    partial_update=extend_schema(summary="Update", description="Update a content item"),
+)
+class WebsiteContentViewSet(viewsets.ModelViewSet):
+    """
+    Viewset for WebsiteContent viewing and editing.
+
+    Registered under both `api/v1/website_content/` (primary) and
+    `api/v1/articles/` (backward-compatible alias).
+    """
+
+    serializer_class = WebsiteContentSerializer
+    queryset = WebsiteContent.objects.all()
+    permission_classes = [CanViewWebsiteContent, CanEditWebsiteContent]
+    http_method_names = VALID_HTTP_METHODS
+
+    filter_backends = [DjangoFilterBackend]
+    filterset_class = WebsiteContentFilter
+
+    def get_queryset(self):
+        # Soft-deleted items are hidden everywhere (list, retrieve,
+        # detail-by-id-or-slug all route through get_queryset) because the
+        # default manager excludes them.
+        qs = WebsiteContent.objects.all()
+        if not (is_admin_user(self.request) or is_website_content_editor(self.request)):
+            qs = qs.filter(is_published=True)
+
+        return (
+            qs.select_related("user")
+            .prefetch_related("topics")
+            .order_by("-publish_date", "-id")
+        )
+
+    # Not cached: the response depends on the caller (editors also get drafts).
+    # Django's cache_page can't vary this by user -- it stores the entry before
+    # SessionMiddleware adds `Vary: Cookie`, so every caller would share it.
+    # See https://github.com/mitodl/hq/issues/13846
+
+    def _reloaded_for_response(self, content):
+        """
+        Re-read `content` with the serializer's required prefetches populated.
+
+        The serializer requires `topics` to be prefetched, and no write leaves
+        it that way: a created instance has no prefetch cache at all, and
+        `UpdateModelMixin` clears the one the fetched instance had, since the
+        m2m may have just changed. Assigning the result to `serializer.instance`
+        is what makes the response honour the contract -- DRF clears the cache
+        on the instance *it* fetched, which is no longer the one serialized.
+
+        Writes are editor-only, so `get_queryset`'s published-only filter for
+        everyone else cannot hide the row from its own author.
+        """
+        return self.get_queryset().get(pk=content.pk)
+
+    # A write clears the view cache when it changes what a reader can see. A
+    # published article is mirrored into a `LearningResource`, and the
+    # resource, search, featured and channel endpoints serving it are cached,
+    # as are the news feeds; a draft is in none of them. So a draft saved as a
+    # draft clears nothing: the editor autosaves every couple of seconds, and
+    # each clear takes every view cache rather than a prefix.
+    # Deferred to on_commit so it runs after the write is durable.
+    def perform_create(self, serializer):
+        content = serializer.save(user=self.request.user)
+        if content.is_published:
+            transaction.on_commit(clear_views_cache)
+        purge_content_on_save(content)
+        content_published_actions(content=content)
+        serializer.instance = self._reloaded_for_response(content)
+
+    def perform_update(self, serializer):
+        # Read the stored flag before saving: the plugins need to know this was
+        # an unpublish, which the saved instance alone cannot tell us.
+        was_published = serializer.instance.is_published
+        content = serializer.save()
+        purge_content_on_save(content)
+        content_published_actions(content=content)
+        if was_published and not content.is_published:
+            # purge_content_on_save above skips unpublished content, so the
+            # now-private page and the listing still need clearing.
+            purge_content_on_unpublish(content)
+            content_unpublished_actions(content=content)
+        if was_published or content.is_published:
+            # Last here, unlike on create: the unpublish plugins take the news
+            # feed entry out synchronously, and clearing the cache before that
+            # ran would let any request in between re-cache a feed with it.
+            transaction.on_commit(clear_views_cache)
+        serializer.instance = self._reloaded_for_response(content)
+
+    def perform_destroy(self, instance):
+        # Only drafts may be deleted. Published content is out of scope and
+        # deleting it is rejected rather than hidden.
+        if instance.is_published:
+            msg = "Published content cannot be deleted."
+            raise ValidationError(msg)
+        # Soft delete: SOFT_DELETE policy stamps `deleted` and leaves the row
+        # in place for recovery/audit.
+        instance.delete()
+        # No clear: only a draft reaches here, and a draft is in none of the
+        # cached responses, so removing one changes nothing a reader sees.
+
+    @extend_schema(
+        summary="Retrieve by ID or slug",
+        description="Retrieve a content item by numeric ID or slug",
+        parameters=[
+            OpenApiParameter(
+                name="identifier",
+                type=str,
+                location=OpenApiParameter.PATH,
+                description="Numeric ID or slug of the content item",
+            )
+        ],
+    )
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="detail/(?P<identifier>[^/.]+)",
+        url_name="detail-by-id-or-slug",
+    )
+    def detail_by_id_or_slug(self, _request, identifier):
+        qs = self.get_queryset()
+
+        if identifier.isdigit():
+            content = get_object_or_404(qs, id=int(identifier))
+        else:
+            content = get_object_or_404(qs, slug=identifier)
+
+        serializer = self.get_serializer(content)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+@extend_schema_view(
+    post=extend_schema(
+        request={
+            "multipart/form-data": WebsiteContentImageUploadSerializer,
+        },
+        responses={
+            201: OpenApiResponse(
+                description="Successful Upload",
+                response=(
+                    {"type": "object", "properties": {"url": {"type": "string"}}}
+                ),
+            ),
+            400: OpenApiResponse(description="Bad request"),
+            401: OpenApiResponse(description="Authentication required"),
+        },
+        description="Upload an image (multipart/form-data) and return the storage URL.",
+        operation_id="media_upload",
+        tags=["media"],
+    )
+)
+class MediaUploadView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = WebsiteContentImageUploadSerializer(
+            data=request.data, context={"request": request}
+        )
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        instance = serializer.save()
+
+        file_url = None
+        if instance.image_file:
+            try:
+                file_url = instance.image_file.url
+            except (AttributeError, ValueError, OSError):
+                file_url = None
+
+        if not file_url:
+            return Response(
+                {"error": "Upload failed"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        if settings.DEBUG:
+            file_url = request.build_absolute_uri(file_url)
+
+        return Response({"url": file_url}, status=status.HTTP_201_CREATED)

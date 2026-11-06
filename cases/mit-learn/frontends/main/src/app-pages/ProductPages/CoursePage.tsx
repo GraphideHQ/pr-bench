@@ -1,0 +1,172 @@
+"use client"
+
+import React, { useEffect } from "react"
+import { Typography } from "ol-components"
+
+import { pagesQueries } from "api/mitxonline-hooks/pages"
+import { useQuery } from "@tanstack/react-query"
+import { styled } from "@mitodl/smoot-design"
+import { coursesQueries } from "api/mitxonline-hooks/courses"
+import { useFeatureFlagEnabled } from "posthog-js/react"
+import { FeatureFlags } from "@/common/feature_flags"
+import { notFound } from "next/navigation"
+import { getOutlineCoursewareId, HeadingIds } from "./util"
+import InstructorsSection from "./InstructorsSection"
+import FaqsSection from "./FaqsSection"
+import TestimonialsSection from "./TestimonialsSection"
+import RawHTML from "./RawHTML"
+import AboutSection from "./AboutSection"
+import ProductPageTemplate from "./ProductPageTemplate"
+import WhatYoullLearnSection from "./WhatYoullLearnSection"
+import HowYoullLearnSection from "./HowYoullLearnSection"
+import { DEFAULT_RESOURCE_IMG } from "ol-utilities"
+import CourseInfoBox from "./InfoBoxCourse"
+import CourseOutlineSection from "./CourseOutlineSection"
+import { analytics } from "@/common/analytics"
+import HeaderEnrollButton from "./HeaderEnrollButton"
+import { useCourseEnrollment } from "./useCourseEnrollment"
+import { getSelectedRun } from "./courseRun"
+import type {
+  CourseRunV2,
+  CourseWithCourseRunsSerializerV2,
+} from "@mitodl/mitxonline-api-axios/v2"
+
+type CoursePageProps = {
+  readableId: string
+}
+
+const PrerequisitesSection = styled.section({
+  display: "flex",
+  flexDirection: "column",
+  gap: "16px",
+})
+
+const CourseHeaderEnrollButton: React.FC<{
+  course: CourseWithCourseRunsSerializerV2
+  selectedRun: CourseRunV2 | undefined
+}> = ({ course, selectedRun }) => {
+  const [anchor, setAnchor] = React.useState<null | HTMLButtonElement>(null)
+
+  const { state, isStatusLoading, isPending, error } = useCourseEnrollment(
+    course,
+    selectedRun,
+    {
+      tracking: { placement: "header" },
+      onRequireSignup: setAnchor,
+    },
+  )
+
+  return (
+    <HeaderEnrollButton
+      state={state}
+      isStatusLoading={isStatusLoading}
+      isPending={isPending}
+      error={error}
+      anchor={anchor}
+      onAnchorClose={() => setAnchor(null)}
+    />
+  )
+}
+
+const CoursePage: React.FC<CoursePageProps> = ({ readableId }) => {
+  const pages = useQuery(pagesQueries.coursePages(readableId))
+  const courses = useQuery(
+    coursesQueries.coursesList({ readable_id: readableId, live: true }),
+  )
+  const page = pages.data?.items[0]
+  const course = courses.data?.results?.[0]
+  const effectiveOutlineCoursewareId = course
+    ? getOutlineCoursewareId(course)
+    : undefined
+  const outlineFlagEnabled = useFeatureFlagEnabled(
+    FeatureFlags.CourseOutlineSection,
+  )
+  const showCourseOutline = outlineFlagEnabled && page?.show_course_outline
+  const outline = useQuery({
+    ...coursesQueries.courseOutline(effectiveOutlineCoursewareId ?? ""),
+    enabled: Boolean(showCourseOutline && effectiveOutlineCoursewareId),
+  })
+  // Owned here so the header CTA and the InfoBox track the same session: when
+  // the user picks a run in the InfoBox's session select, the header follows.
+  const [selectedRunId, setSelectedRunId] = React.useState<number | null>(null)
+  useEffect(() => {
+    if (!course) return
+    analytics.coursePageViewed(course.title)
+    analytics.courseProgramViewed({
+      name: course.title,
+      id: course.readable_id,
+    })
+  }, [course])
+
+  const doneLoading = pages.isSuccess && courses.isSuccess
+
+  if (!page || !course) {
+    if (doneLoading) {
+      return notFound()
+    } else {
+      return null
+    }
+  }
+
+  const imageSrc =
+    page.course_details.page?.feature_image_src || DEFAULT_RESOURCE_IMG
+
+  const selectedRun = getSelectedRun(course, selectedRunId)
+
+  return (
+    <ProductPageTemplate
+      currentBreadcrumbLabel="Course"
+      title={page.title}
+      shortDescription={page.course_details.page?.description}
+      imageSrc={imageSrc}
+      videoUrl={page.video_url}
+      infoBox={
+        <CourseInfoBox
+          course={course}
+          selectedRunId={selectedRunId}
+          onSelectRun={setSelectedRunId}
+        />
+      }
+      enrollmentAction={
+        <CourseHeaderEnrollButton course={course} selectedRun={selectedRun} />
+      }
+      resource={{
+        readable_id: course.readable_id,
+        resource_type: "course",
+      }}
+      hubspotFormId={page.hubspot_form_id}
+    >
+      {page.about ? (
+        <AboutSection productNoun="Course" aboutHtml={page.about} />
+      ) : null}
+      {page.what_you_learn ? (
+        <WhatYoullLearnSection html={page.what_you_learn} />
+      ) : null}
+      {showCourseOutline ? (
+        <CourseOutlineSection modules={outline.data?.modules ?? []} />
+      ) : null}
+      <HowYoullLearnSection page={page} />
+      {page.prerequisites ? (
+        <PrerequisitesSection aria-labelledby={HeadingIds.Prereqs}>
+          <Typography variant="h4" component="h2" id={HeadingIds.Prereqs}>
+            Prerequisites
+          </Typography>
+          <RawHTML html={page.prerequisites} />
+        </PrerequisitesSection>
+      ) : null}
+      {page.faculty.length ? (
+        <InstructorsSection instructors={page.faculty} />
+      ) : null}
+      {page.faqs.length ? <FaqsSection faqs={page.faqs} /> : null}
+      {page.testimonials.length ? (
+        <TestimonialsSection
+          testimonials={page.testimonials}
+          itemReviewedName={page.title}
+          itemReviewedDescription={page.course_details.page?.description}
+        />
+      ) : null}
+    </ProductPageTemplate>
+  )
+}
+
+export default CoursePage

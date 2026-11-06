@@ -1,0 +1,453 @@
+from drf_spectacular.plumbing import build_choice_description_list
+from drf_spectacular.utils import extend_schema_field
+from rest_framework import serializers
+
+from learning_resources.constants import (
+    DEPARTMENTS,
+    RESOURCE_TYPE_GROUP_VALUES,
+    CertificationType,
+    LearningResourceDelivery,
+    LearningResourceType,
+    LevelType,
+    OfferedBy,
+    PlatformType,
+)
+from learning_resources.serializers import LearningResourceSerializer
+from learning_resources.utils import filter_valid_edx_module_ids
+from learning_resources_search.serializers import (
+    ArrayWrappedBoolean,
+    ContentFileSerializer,
+    SearchResponseMetadata,
+    SearchResponseSerializer,
+    with_derived_resource_fields,
+)
+from vector_search.constants import (
+    MAX_RESULT_WINDOW,
+    QDRANT_CONTENT_FILE_PARAM_MAP,
+    QDRANT_LEARNING_RESOURCE_SORTBY_FIELDS,
+    QDRANT_RESOURCE_PARAM_MAP,
+)
+
+
+def _validate_result_window(attrs):
+    offset = attrs.get("offset") or 0
+    limit = attrs.get("limit") or 0
+    if offset + limit > MAX_RESULT_WINDOW:
+        msg = (
+            f"offset + limit must not exceed {MAX_RESULT_WINDOW}. "
+            "Use more specific filters to narrow results."
+        )
+        raise serializers.ValidationError(msg)
+    return attrs
+
+
+class LearningResourcesSearchFiltersSerializer(serializers.Serializer):
+    """
+    Shared filter fields for Qdrant-backed learning resource queries.
+
+    Every field here must have a corresponding entry in
+    vector_search.constants.QDRANT_RESOURCE_PARAM_MAP so it can be translated
+    to a Qdrant filter by qdrant_query_conditions().
+    """
+
+    offered_by_choices = [(e.name.lower(), e.value) for e in OfferedBy]
+    offered_by = serializers.ListField(
+        required=False,
+        child=serializers.ChoiceField(choices=offered_by_choices),
+        help_text=(
+            f"The organization that offers the learning resource \
+            \n\n{build_choice_description_list(offered_by_choices)}"
+        ),
+    )
+    platform_choices = [(e.name.lower(), e.value) for e in PlatformType]
+    platform = serializers.ListField(
+        required=False,
+        child=serializers.ChoiceField(choices=platform_choices),
+        help_text=(
+            f"The platform on which the learning resource is offered \
+            \n\n{build_choice_description_list(platform_choices)}"
+        ),
+    )
+    topic = serializers.ListField(
+        required=False,
+        child=serializers.CharField(),
+        help_text="The topic name. To see a list of options go to api/v1/topics/",
+    )
+    ocw_topic = serializers.ListField(
+        required=False,
+        child=serializers.CharField(),
+        help_text="The ocw topic name.",
+    )
+
+    resource_choices = [(e.name, e.value.lower()) for e in LearningResourceType]
+    resource_type = serializers.ListField(
+        required=False,
+        child=serializers.ChoiceField(
+            choices=resource_choices,
+        ),
+        help_text=(
+            f"The type of learning resource \
+            \n\n{build_choice_description_list(resource_choices)}"
+        ),
+    )
+    resource_category = serializers.ListField(
+        required=False,
+        child=serializers.CharField(),
+        help_text="The resource category for the resource",
+    )
+    free = ArrayWrappedBoolean(
+        required=False,
+        allow_null=True,
+        default=None,
+    )
+    professional = ArrayWrappedBoolean(
+        required=False,
+        allow_null=True,
+        default=None,
+    )
+
+    certification = ArrayWrappedBoolean(
+        required=False,
+        allow_null=True,
+        default=None,
+        help_text="True if the learning resource offers a certificate",
+    )
+    certification_choices = CertificationType.as_tuple()
+    certification_type = serializers.ListField(
+        required=False,
+        child=serializers.ChoiceField(
+            choices=certification_choices,
+        ),
+        help_text=(
+            f"The type of certificate \
+            \n\n{build_choice_description_list(certification_choices)}"
+        ),
+    )
+    department_choices = list(DEPARTMENTS.items())
+    department = serializers.ListField(
+        required=False,
+        child=serializers.ChoiceField(choices=department_choices),
+        help_text=(
+            f"The department that offers the learning resource \
+            \n\n{build_choice_description_list(department_choices)}"
+        ),
+    )
+
+    level = serializers.ListField(
+        required=False, child=serializers.ChoiceField(choices=LevelType.as_list())
+    )
+
+    course_feature = serializers.ListField(
+        required=False,
+        child=serializers.CharField(),
+        help_text="The course feature. Possible options are at api/v1/course_features/",
+    )
+
+    delivery_choices = LearningResourceDelivery.as_list()
+    delivery = serializers.ListField(
+        required=False,
+        child=serializers.ChoiceField(choices=delivery_choices),
+        help_text=(
+            f"The delivery options in which the learning resource is offered \
+            \n\n{build_choice_description_list(delivery_choices)}"
+        ),
+    )
+    resource_type_group_choices = [
+        (value, value.replace("_", " ").title()) for value in RESOURCE_TYPE_GROUP_VALUES
+    ]
+    resource_type_group = serializers.ListField(
+        required=False,
+        child=serializers.ChoiceField(
+            choices=resource_type_group_choices,
+        ),
+        help_text=(
+            f"The category of learning resource \
+            \n\n{build_choice_description_list(resource_type_group_choices)}"
+        ),
+    )
+
+
+class LearningResourcesVectorSearchRequestSerializer(
+    LearningResourcesSearchFiltersSerializer
+):
+    """
+    Request serializer for vector based search
+    instead of id we use readable_id in case we upload qdrant snapshots
+    """
+
+    sortby = serializers.ChoiceField(
+        required=False,
+        choices=QDRANT_LEARNING_RESOURCE_SORTBY_FIELDS
+        + [f"-{param}" for param in QDRANT_LEARNING_RESOURCE_SORTBY_FIELDS],
+        help_text="if the parameter starts with '-' the sort is in descending order",
+    )
+    aggregation_choices = [
+        (key, key.replace("_", " ").title()) for key in QDRANT_RESOURCE_PARAM_MAP
+    ]
+    aggregations = serializers.ListField(
+        required=False,
+        child=serializers.ChoiceField(choices=aggregation_choices),
+        help_text=(
+            f"aggregations for facet counts \
+            \n\n{build_choice_description_list(aggregation_choices)}"
+        ),
+    )
+
+    readable_id = serializers.CharField(
+        required=False, help_text="The readable id of the resource"
+    )
+    url__isnull = serializers.BooleanField(
+        required=False,
+        default=None,
+        allow_null=True,
+        help_text="Filter to learning resources where url is null/not null",
+    )
+    title__isnull = serializers.BooleanField(
+        required=False,
+        default=None,
+        allow_null=True,
+        help_text="Filter to learning resources where title is null/not null",
+    )
+    q = serializers.CharField(required=False, help_text="The search text")
+    offset = serializers.IntegerField(
+        required=False,
+        help_text="The initial index from which to return the results",
+        min_value=0,
+        max_value=MAX_RESULT_WINDOW,
+    )
+    limit = serializers.IntegerField(
+        required=False,
+        help_text="Number of results to return per page",
+        min_value=1,
+        max_value=MAX_RESULT_WINDOW,
+    )
+    hybrid_search = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="Whether to use a hybrid search",
+    )
+    score_cutoff = serializers.FloatField(
+        required=False,
+        help_text=(
+            "The minimum absolute score a result must have to be returned. "
+            "Defaults to 0.0 when omitted, but the server clamps the effective "
+            "cutoff to the minimum allowed for the selected search mode (dense "
+            "or hybrid). This is only the backstop for a query that matched "
+            "nothing; score_cutoff_ratio is what shapes a result set."
+        ),
+        default=0.0,
+    )
+    score_cutoff_ratio = serializers.FloatField(
+        required=False,
+        allow_null=True,
+        default=None,
+        min_value=0,
+        max_value=1,
+        help_text=(
+            "Fraction of the query's own best score a result must reach to be "
+            "returned, applied after score_cutoff so the size of a result set "
+            "follows how fast relevance falls off within the query. 0 disables "
+            "the relative cutoff. Defaults to the server's configured ratio "
+            "for the selected search mode (dense or hybrid) when omitted."
+        ),
+    )
+    program_boost = serializers.FloatField(
+        required=False,
+        allow_null=True,
+        default=None,
+        min_value=0,
+        help_text=(
+            "Fraction of its own score a program gains before ranking, so 0.1 "
+            "multiplies it by 1.1 and a program can only overtake a result it "
+            "was already within that factor of. 0 disables the boost. Defaults "
+            "to the server's configured amount when omitted."
+        ),
+    )
+    staleness_penalty = serializers.FloatField(
+        required=False,
+        allow_null=True,
+        default=None,
+        min_value=0,
+        help_text=(
+            "Fraction of its own score a resource gives up once it is at or "
+            "beyond the staleness horizon, ramped linearly by age. Resources "
+            "with an upcoming run are exempt. 0 disables the penalty. Defaults "
+            "to the server's configured weight when omitted."
+        ),
+    )
+    staleness_horizon_years = serializers.FloatField(
+        required=False,
+        allow_null=True,
+        default=None,
+        min_value=0,
+        help_text=(
+            "Age in years at which a resource takes the full staleness "
+            "penalty, with the penalty ramping linearly up to it. 0 disables "
+            "the penalty. Defaults to the server's configured horizon when "
+            "omitted."
+        ),
+    )
+    completeness_penalty = serializers.FloatField(
+        required=False,
+        allow_null=True,
+        default=None,
+        min_value=0,
+        help_text=(
+            "Fraction of its own score a resource with completeness 0 gives "
+            "up, scaled linearly by incompleteness. 0 disables the penalty. "
+            "Defaults to the server's configured weight when omitted."
+        ),
+    )
+
+    def validate(self, attrs):
+        return _validate_result_window(attrs)
+
+
+class LearningResourcesVectorSearchResponseSerializer(SearchResponseSerializer):
+    """
+    Response serializer for vector based search
+    """
+
+    @extend_schema_field(LearningResourceSerializer(many=True))
+    def get_results(self, instance):
+        # With VECTOR_SEARCH_RESOURCES_FROM_PAYLOAD a hit is the stored Qdrant
+        # payload, so it can predate a field the schema requires. Hits hydrated
+        # from the database already carry every field, and the call is a no-op
+        # for those.
+        return [with_derived_resource_fields(hit) for hit in instance.get("hits", [])]
+
+    def get_count(self, instance) -> int:
+        return instance.get("total", {}).get("value", 0)
+
+    def get_metadata(self, instance) -> SearchResponseMetadata:
+        return {
+            "aggregations": instance.get("aggregations", {}),
+            "suggest": [],
+        }
+
+
+class ContentFileVectorSearchRequestSerializer(serializers.Serializer):
+    """
+    Request serializer for vector based content file search
+    """
+
+    q = serializers.CharField(required=False, help_text="The search text")
+    offset = serializers.IntegerField(
+        required=False,
+        help_text="The initial index from which to return the results",
+        min_value=0,
+        max_value=MAX_RESULT_WINDOW,
+    )
+    limit = serializers.IntegerField(
+        required=False,
+        help_text="Number of results to return per page",
+        min_value=1,
+        max_value=MAX_RESULT_WINDOW,
+    )
+    aggregation_choices = [
+        (key, key.replace("_", " ").title()) for key in QDRANT_CONTENT_FILE_PARAM_MAP
+    ]
+    aggregations = serializers.ListField(
+        required=False,
+        child=serializers.ChoiceField(choices=aggregation_choices),
+        help_text=(
+            f"aggregations for facet counts \
+            \n\n{build_choice_description_list(aggregation_choices)}"
+        ),
+    )
+
+    key = serializers.ListField(
+        required=False,
+        child=serializers.CharField(),
+        help_text="The filename of the content file",
+    )
+    edx_module_id = serializers.ListField(
+        required=False,
+        child=serializers.CharField(),
+        help_text="The edX module id of the content file",
+    )
+    offered_by = serializers.ListField(
+        required=False,
+        child=serializers.CharField(),
+        help_text="Offeror of the content file",
+    )
+    platform = serializers.ListField(
+        required=False,
+        child=serializers.CharField(),
+        help_text="platform(s) of the content file",
+    )
+
+    file_extension = serializers.ListField(
+        required=False,
+        child=serializers.CharField(),
+        help_text="The extension of the content file. ",
+    )
+    run_readable_id = serializers.ListField(
+        required=False,
+        child=serializers.CharField(),
+        help_text="The readable_id value of the run that the content file belongs to",
+    )
+    resource_readable_id = serializers.ListField(
+        required=False,
+        child=serializers.CharField(),
+        help_text=(
+            "The readable_id value of the parent learning resource for the content file"
+        ),
+    )
+    collection_name = serializers.CharField(
+        required=False,
+        help_text=("Manually specify the name of the Qdrant collection to query"),
+    )
+    group_by = serializers.CharField(
+        required=False,
+        help_text=("The attribute to group results by"),
+    )
+    group_size = serializers.IntegerField(
+        required=False,
+        help_text=(
+            "The number of chunks in each group. Only relevant when group_by is used"
+        ),
+    )
+    url__isnull = serializers.BooleanField(
+        required=False,
+        default=None,
+        allow_null=True,
+        help_text="Filter to content files where url is null/not null",
+    )
+    title__isnull = serializers.BooleanField(
+        required=False,
+        default=None,
+        allow_null=True,
+        help_text="Filter to content files where title is null/not null",
+    )
+    hybrid_search = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="Whether to use a hybrid search",
+    )
+
+    def validate_edx_module_id(self, value):
+        """Drop ids that cannot reference content-bearing courseware."""
+        return filter_valid_edx_module_ids(value)
+
+    def validate(self, attrs):
+        return _validate_result_window(attrs)
+
+
+class ContentFileVectorSearchResponseSerializer(SearchResponseSerializer):
+    """
+    SearchResponseSerializer with OpenAPI annotations for Content Files search
+    """
+
+    def get_count(self, instance) -> int:
+        return instance.get("total", {}).get("value", 0)
+
+    @extend_schema_field(ContentFileSerializer(many=True))
+    def get_results(self, instance):
+        return instance.get("hits", [])
+
+    def get_metadata(self, instance) -> SearchResponseMetadata:
+        return {
+            "aggregations": instance.get("aggregations", {}),
+            "suggest": [],
+        }

@@ -1,0 +1,692 @@
+import React from "react"
+import { urls, factories, makeRequest } from "api/test-utils"
+import { ChannelTypeEnum, type Channel } from "api/v0"
+import type { LearningResourcesSearchResponse } from "api"
+import {
+  screen,
+  setMockResponse,
+  waitFor,
+  renderWithProviders,
+  expectLastProps,
+} from "@/test-utils"
+import ChannelSearch from "./ChannelSearch"
+import { assertHeadings, getByImageSrc } from "ol-test-utilities"
+import invariant from "tiny-invariant"
+import ChannelPage from "./ChannelPage"
+import { useFeatureFlagEnabled } from "posthog-js/react"
+import { useFeatureFlagsLoaded } from "@/common/useFeatureFlagsLoaded"
+import { FeatureFlags } from "@/common/feature_flags"
+import { DEPARTMENTS_LABEL, TOPICS_LABEL } from "./ChannelPageTemplate"
+
+jest.mock("posthog-js/react", () => ({
+  ...jest.requireActual("posthog-js/react"),
+  useFeatureFlagEnabled: jest.fn(),
+}))
+jest.mock("@/common/useFeatureFlagsLoaded")
+
+/* Every flag off. The topic cases below are the redesigned page, which is no
+   longer behind one; the department cases turn theirs on for themselves. */
+beforeEach(() => {
+  jest.mocked(useFeatureFlagEnabled).mockImplementation(() => false)
+  /* The page holds a spinner until the flags are in rather than render on a
+     bootstrapped value, so without this every case here waits on one. Loaded
+     is the state these tests are about; the waiting is its own case below. */
+  jest.mocked(useFeatureFlagsLoaded).mockReturnValue(true)
+})
+
+jest.mock("./ChannelSearch", () => {
+  const actual = jest.requireActual("./ChannelSearch")
+  return {
+    __esModule: true,
+    default: jest.fn(actual.default),
+  }
+})
+const mockedChannelSearch = jest.mocked(ChannelSearch)
+
+const someAncestor = (el: HTMLElement, cb: (el: HTMLElement) => boolean) => {
+  let ancestor = el.parentElement
+  while (ancestor) {
+    if (cb(ancestor)) return true
+    ancestor = ancestor.parentElement
+  }
+  return false
+}
+
+const setupApis = (
+  channelPatch: Partial<Channel> = {},
+  search?: Partial<LearningResourcesSearchResponse>,
+  { isSubscribed = false, isAuthenticated = false } = {},
+) => {
+  const channel = factories.channels.channel(channelPatch)
+  setMockResponse.get(urls.userMe.get(), {
+    is_authenticated: isAuthenticated,
+  })
+  setMockResponse.get(
+    urls.channels.details(channel.channel_type, channel.name),
+    channel,
+  )
+  setMockResponse.get(
+    expect.stringContaining(urls.learningResources.featured()),
+    factories.learningResources.resources({ count: 10 }),
+  )
+
+  const urlParams = new URLSearchParams(channelPatch?.search_filter)
+  const subscribeParams: Record<string, string[] | string> = {}
+  for (const [key, value] of urlParams.entries()) {
+    if (
+      subscribeParams[key] !== undefined &&
+      Array.isArray(subscribeParams[key])
+    ) {
+      subscribeParams[key] = [...subscribeParams[key], value]
+    } else {
+      subscribeParams[key] = [value]
+    }
+  }
+  subscribeParams["source_type"] = "channel_subscription_type"
+  const subscribeResponse = isSubscribed
+    ? factories.percolateQueries.percolateQueryList({ count: 1 }).results
+    : factories.percolateQueries.percolateQueryList({ count: 0 }).results
+  if (channelPatch?.search_filter) {
+    setMockResponse.get(
+      `${urls.userSubscription.check(subscribeParams)}`,
+      subscribeResponse,
+    )
+  }
+
+  setMockResponse.get(
+    `${urls.userSubscription.check({
+      source_type: "channel_subscription_type",
+    })}`,
+    subscribeResponse,
+  )
+
+  setMockResponse.get(
+    urls.platforms.list(),
+    factories.learningResources.platforms({ count: 5 }),
+  )
+
+  setMockResponse.get(
+    urls.offerors.list(),
+    factories.learningResources.offerors({ count: 5 }),
+  )
+
+  setMockResponse.get(expect.stringContaining(urls.search.resources()), {
+    count: 0,
+    next: null,
+    previous: null,
+    results: [],
+    metadata: {
+      aggregations: {},
+      suggestions: [],
+    },
+    ...search,
+  })
+  setMockResponse.get(expect.stringContaining(urls.search.vectorResources()), {
+    count: 0,
+    next: null,
+    previous: null,
+    results: [],
+    metadata: {
+      aggregations: {},
+      suggestions: [],
+    },
+    ...search,
+  })
+
+  setMockResponse.get(expect.stringContaining(urls.testimonials.list({})), {
+    results: [],
+  })
+
+  return {
+    channel,
+  }
+}
+
+const setupTopicApis = (channel: Channel) => {
+  invariant(
+    channel.channel_type === ChannelTypeEnum.Topic,
+    "Topic channel must have a topic",
+  )
+  const topic = factories.learningResources.topic()
+  // The hero's Featured row reads the channel's own featured list.
+  setMockResponse.get(
+    `${urls.channels.featured(channel.channel_type, channel.name)}?limit=12`,
+    { count: 0, next: null, previous: null, results: [] },
+  )
+  channel.channel_url = `/c/${channel.channel_type}/${channel.name.replace(/\s/g, "-")}`
+  topic.channel_url = channel.channel_url
+  topic.id = channel.topic_detail.topic ?? 0
+  const subTopics = factories.learningResources.topics({ count: 5 })
+  setMockResponse.get(urls.topics.get(topic.id), topic)
+  setMockResponse.get(
+    urls.topics.list({ parent_topic_id: [topic.id] }),
+    subTopics,
+  )
+  const subTopicChannels = subTopics.results.map((subTopic) => {
+    subTopic.parent = topic.id
+    const subTopicChannel = factories.channels.channel({
+      channel_type: ChannelTypeEnum.Topic,
+      name: subTopic.name.replace(/\s/g, "-"),
+      title: subTopic.name,
+      topic_detail: { topic: subTopic.id },
+    })
+    const channelUrl = `/c/${subTopicChannel.channel_type}/${subTopicChannel.name.replace(/\s/g, "-")}`
+    subTopic.channel_url = channelUrl
+    subTopicChannel.channel_url = channelUrl
+    setMockResponse.get(urls.topics.get(subTopic.id), subTopic)
+    setMockResponse.get(
+      urls.channels.details(
+        subTopicChannel.channel_type,
+        subTopicChannel.name.replace(/\s/g, "-"),
+      ),
+      subTopicChannel,
+    )
+    return subTopicChannel
+  })
+  return {
+    topic,
+    subTopics,
+    subTopicChannels,
+  }
+}
+
+const ALL_CHANNEL_TYPES = Object.values(ChannelTypeEnum).map((v) => ({
+  channelType: v,
+}))
+const NON_UNIT_CHANNEL_TYPES = Object.values(ChannelTypeEnum)
+  .filter((v) => v !== ChannelTypeEnum.Unit)
+  .map((v) => ({ channelType: v }))
+
+describe.each(ALL_CHANNEL_TYPES)(
+  "ChannelPage, common behavior",
+  ({ channelType }) => {
+    it("Displays the channel search if search_filter is not undefined", async () => {
+      const { channel } = setupApis({
+        search_filter:
+          "platform=ocw&platform=mitxonline&department=8&department=9",
+        channel_type: channelType,
+      })
+      renderWithProviders(<ChannelPage />, {
+        url: `/c/${channel.channel_type}/${channel.name}`,
+      })
+      if (channelType === ChannelTypeEnum.Topic) {
+        setupTopicApis(channel)
+      }
+      await screen.findAllByText(channel.title)
+
+      expectLastProps(mockedChannelSearch, {
+        constantSearchParams: {
+          platform: ["ocw", "mitxonline"],
+          department: ["8", "9"],
+        },
+      })
+    }, 10000)
+    it("Does not display the channel search if search_filter is undefined", async () => {
+      const { channel } = setupApis({
+        channel_type: channelType,
+      })
+      channel.search_filter = undefined
+      renderWithProviders(<ChannelPage />, {
+        url: `/c/${channel.channel_type}/${channel.name}`,
+      })
+      if (channelType === ChannelTypeEnum.Topic) {
+        setupTopicApis(channel)
+      }
+      await screen.findAllByText(channel.title)
+
+      expect(mockedChannelSearch).toHaveBeenCalledTimes(0)
+    }, 10000)
+
+    it("Includes heading and subheading in banner", async () => {
+      const { channel } = setupApis({
+        channel_type: channelType,
+      })
+      channel.search_filter = undefined
+      renderWithProviders(<ChannelPage />, {
+        url: `/c/${channel.channel_type}/${channel.name}`,
+      })
+      if (channelType === ChannelTypeEnum.Topic) {
+        setupTopicApis(channel)
+      }
+      await screen.findAllByText(channel.title)
+
+      /**
+       * Except on a topic, whose redesigned hero carries the public
+       * description instead -- see the design on `TopicChannelTemplate`. The
+       * configured heading and sub-heading are not part of it.
+       */
+      if (channelType === ChannelTypeEnum.Topic) {
+        expect(screen.queryByText(channel.configuration.sub_heading)).toBe(null)
+        return
+      }
+      await waitFor(() => {
+        screen.getAllByText(channel.configuration.sub_heading).forEach((el) => {
+          expect(el).toBeInTheDocument()
+        })
+      })
+      await waitFor(() => {
+        screen.getAllByText(channel.configuration.heading).forEach((el) => {
+          expect(el).toBeInTheDocument()
+        })
+      })
+    }, 10000)
+
+    it.each([{ isSubscribed: false }, { isSubscribed: true }])(
+      "Displays the subscribe toggle for authenticated and unauthenticated users",
+      async ({ isSubscribed }) => {
+        const { channel } = setupApis(
+          { search_filter: "q=ocw", channel_type: channelType },
+          {},
+          { isSubscribed },
+        )
+        renderWithProviders(<ChannelPage />, {
+          url: `/c/${channel.channel_type}/${channel.name}`,
+        })
+        if (channelType === ChannelTypeEnum.Topic) {
+          setupTopicApis(channel)
+        }
+        const subscribedButton = await screen.findAllByText("Follow")
+        expect(subscribedButton[0]).toBeVisible()
+      },
+      10000,
+    )
+  },
+)
+
+describe.each(NON_UNIT_CHANNEL_TYPES)(
+  "ChannelPage, common non-unit ($channelType)",
+  ({ channelType }) => {
+    it("Does not display a featured carousel if the channel type is not 'unit'", async () => {
+      const { channel } = setupApis({
+        search_filter: "topic=physics",
+        channel_type: channelType,
+      })
+      if (channelType === ChannelTypeEnum.Topic) {
+        setupTopicApis(channel)
+      }
+
+      renderWithProviders(<ChannelPage />, {
+        url: `/c/${channel.channel_type}/${channel.name}`,
+      })
+      await screen.findAllByText(channel.title)
+      const carousels = screen.queryByText("Featured Courses")
+      expect(carousels).toBe(null)
+    }, 10000)
+
+    it("Displays the title, background, and avatar (channelType: %s)", async () => {
+      const { channel } = setupApis({
+        search_filter: "offered_by=ocw",
+        channel_type: channelType,
+      })
+      if (channelType === ChannelTypeEnum.Topic) {
+        setupTopicApis(channel)
+      }
+
+      const { view } = renderWithProviders(<ChannelPage />, {
+        url: `/c/${channel.channel_type}/${channel.name}`,
+      })
+      const title = await screen.findByRole("heading", { name: channel.title })
+      const paintsBanner = (el: Element) =>
+        window
+          .getComputedStyle(el)
+          .backgroundImage.includes(channel.configuration.banner_background)
+      // Banner background image
+      if (channelType === ChannelTypeEnum.Topic) {
+        /* The redesigned topic hero paints no photograph: the design dropped
+           it for plain white, so the channel's configured banner is drawn
+           nowhere in the hero -- not behind the title and not on a band of
+           its own. */
+        const hero = title.closest("section")
+        expect(hero).not.toBe(null)
+        expect(
+          Array.from(hero!.querySelectorAll("div")).some(paintsBanner),
+        ).toBe(false)
+      } else {
+        expect(someAncestor(title, paintsBanner)).toBe(true)
+      }
+      // logo -- not on a topic, whose hero is title and text only.
+      if (channelType !== ChannelTypeEnum.Topic) {
+        getByImageSrc(
+          view.container,
+          `${window.origin}${channel.configuration.logo}`,
+        )
+      }
+    }, 10000)
+
+    test("headings", async () => {
+      const { channel } = setupApis({
+        search_filter: "topic=Physics",
+        channel_type: channelType,
+      })
+      renderWithProviders(<ChannelPage />, {
+        url: `/c/${channel.channel_type}/${channel.name}`,
+      })
+      if (channelType === ChannelTypeEnum.Topic) {
+        setupTopicApis(channel)
+      }
+
+      await waitFor(() => {
+        assertHeadings([
+          { level: 1, name: channel.title },
+          { level: 2, name: `Search within ${channel.title}` },
+          { level: 3, name: "Search Results" },
+          /* A topic has no facet sidebar, so no "Filter" heading: its design
+             puts Format, Certificate and Free in a bar above the results. */
+          ...(channelType === ChannelTypeEnum.Topic
+            ? []
+            : [{ level: 3, name: "Filter" }]),
+        ])
+      })
+    }, 10000)
+  },
+)
+
+/**
+ * The topic page's design has no subtopic or related-topic chips -- its hero is
+ * the breadcrumb, the title with Follow, the description, and the featured
+ * row. The chips those tests covered are gone with it; subtopic navigation
+ * still lives on the topics listing page, which has its own tests.
+ */
+describe("while the feature flags are still loading", () => {
+  beforeEach(() => {
+    jest.mocked(useFeatureFlagsLoaded).mockReturnValue(false)
+  })
+
+  /**
+   * The page is behind a flag, and a flag that has not loaded reads `false`
+   * from the bootstrapped value -- which is the same thing it reads when the
+   * page is genuinely off. Waiting is what stops a user who is entitled to
+   * the page being shown the one for someone who is not.
+   */
+  test("holds a spinner on a page a flag decides", async () => {
+    const { channel } = setupApis({
+      search_filter: "department=Theater+Arts",
+      channel_type: ChannelTypeEnum.Department,
+    })
+    renderWithProviders(<ChannelPage />, {
+      url: `/c/${channel.channel_type}/${channel.name}`,
+    })
+
+    await screen.findByRole("progressbar")
+    expect(
+      screen.queryByRole("heading", { level: 1, name: channel.title }),
+    ).toBe(null)
+  })
+
+  /**
+   * Only the department page is decided by a flag. Every other channel draws
+   * the same page whatever the flags come back saying -- the topic page among
+   * them, now that the page it had before the redesign is gone -- so waiting on
+   * them buys nothing and costs the reader a spinner.
+   */
+  test.each([
+    {
+      channelType: ChannelTypeEnum.Unit,
+      searchFilter: "department=mechanical",
+    },
+    { channelType: ChannelTypeEnum.Topic, searchFilter: "topic=Physics" },
+  ])(
+    "draws a $channelType page, which no flag decides, rather than waiting",
+    async ({ channelType, searchFilter }) => {
+      const { channel } = setupApis({
+        search_filter: searchFilter,
+        channel_type: channelType,
+      })
+      if (channelType === ChannelTypeEnum.Topic) {
+        setupTopicApis(channel)
+      }
+      renderWithProviders(<ChannelPage />, {
+        url: `/c/${channel.channel_type}/${channel.name}`,
+      })
+
+      await screen.findByRole("heading", { level: 1, name: channel.title })
+      expect(screen.queryByRole("progressbar")).toBe(null)
+    },
+  )
+})
+
+describe("Channel Pages, Topic only", () => {
+  test("shows only what the design's hero carries", async () => {
+    const { channel } = setupApis({
+      search_filter: "topic=Physics",
+      channel_type: ChannelTypeEnum.Topic,
+    })
+    renderWithProviders(<ChannelPage />, {
+      url: `/c/${channel.channel_type}/${channel.name}`,
+    })
+    const { topic } = setupTopicApis(channel)
+    invariant(topic)
+
+    await screen.findByRole("heading", { level: 1, name: channel.title })
+    expect(screen.queryByText("Subtopics")).toBe(null)
+    expect(screen.queryByText("Related Topics")).toBe(null)
+  }, 10000)
+})
+
+describe("Channel Pages, Department only", () => {
+  /* The department page is the topic page's, behind a flag of its own. */
+  beforeEach(() => {
+    jest
+      .mocked(useFeatureFlagEnabled)
+      .mockImplementation(
+        (flag) => flag === FeatureFlags.DepartmentPageRedesign,
+      )
+  })
+
+  /**
+   * A department channel, and the Featured row its hero will ask for.
+   *
+   * The row is asked for whether or not a case cares about it, the hero
+   * being drawn differently by whether there is one.
+   */
+  const setupDepartment = ({
+    featuredCount = 2,
+    name,
+  }: { featuredCount?: number; name?: string } = {}) => {
+    const { channel } = setupApis({
+      /* Only where a case turns on it: the artwork is keyed on the slug, so
+         those cases name a department and the rest take the factory's. */
+      ...(name ? { name } : {}),
+      search_filter: "department=Theater+Arts",
+      channel_type: ChannelTypeEnum.Department,
+    })
+    const featured = factories.learningResources.resources({
+      count: featuredCount,
+    })
+    setMockResponse.get(
+      `${urls.channels.featured(channel.channel_type, channel.name)}?limit=12`,
+      featured,
+    )
+    return { channel, featured }
+  }
+
+  test("draws the redesigned hero, and reads its own featured list", async () => {
+    const { channel, featured } = setupDepartment()
+
+    renderWithProviders(<ChannelPage />, {
+      url: `/c/${channel.channel_type}/${channel.name}`,
+    })
+
+    await screen.findByRole("heading", { level: 1, name: channel.title })
+    /* The department's own trail step, not the topics one -- the two labels
+       come from one map, so a page reading the wrong key is a page whose
+       trail leads somewhere else entirely. */
+    await screen.findByRole("link", { name: DEPARTMENTS_LABEL })
+    expect(screen.queryByRole("link", { name: TOPICS_LABEL })).toBe(null)
+    /* The row is the channel's own curated list, so the titles in it are the
+       ones the department's featured endpoint answered with -- the point of
+       the whole exercise. */
+    for (const resource of featured.results) {
+      await screen.findByText(resource.title)
+    }
+  }, 10000)
+
+  /**
+   * The two halves of the lookup in `DEPARTMENT_BANNERS`, both named rather
+   * than left to the factory's random slug.
+   *
+   * The map is keyed on the channel's own slug, and an entry filed under a
+   * name no department has draws nothing and reports nothing: the page is
+   * simply the white one. Only a case that names a department with artwork
+   * reaches the slug, the image and `backgroundSrcSetCSS` at all.
+   */
+  test("draws the department's own artwork where there is some", async () => {
+    const { channel } = setupDepartment({ name: "theater-arts" })
+
+    renderWithProviders(<ChannelPage />, {
+      url: `/c/${channel.channel_type}/${channel.name}`,
+    })
+
+    await screen.findByRole("heading", { level: 1, name: channel.title })
+    await screen.findByTestId("channel-hero-photo")
+  }, 10000)
+
+  test("stands on plain white, with no photograph behind the title", async () => {
+    /* Concourse is a real department the design has no artwork for. */
+    const { channel } = setupDepartment({ name: "concourse" })
+
+    renderWithProviders(<ChannelPage />, {
+      url: `/c/${channel.channel_type}/${channel.name}`,
+    })
+
+    await screen.findByRole("heading", { level: 1, name: channel.title })
+    expect(screen.queryByTestId("channel-hero-photo")).toBe(null)
+  }, 10000)
+
+  test("carries Follow beside the title", async () => {
+    const { channel } = setupDepartment()
+
+    renderWithProviders(<ChannelPage />, {
+      url: `/c/${channel.channel_type}/${channel.name}`,
+    })
+
+    await screen.findByRole("button", { name: "Follow" })
+  }, 10000)
+
+  test("draws the old page with the flag off", async () => {
+    jest.mocked(useFeatureFlagEnabled).mockImplementation(() => false)
+    const { channel } = setupApis({
+      search_filter: "department=Theater+Arts",
+      channel_type: ChannelTypeEnum.Department,
+    })
+
+    renderWithProviders(<ChannelPage />, {
+      url: `/c/${channel.channel_type}/${channel.name}`,
+    })
+
+    await screen.findByRole("heading", { level: 1, name: channel.title })
+    expect(screen.queryByText("Featured")).toBe(null)
+  }, 10000)
+})
+
+describe("Channel Pages, Topic only, hero", () => {
+  test("stands on plain white, with no photograph behind the title", async () => {
+    /* The design used to run a photograph across the top of this and no longer
+       does. Asserted for the topic page specifically because the photograph
+       was only ever the topic page's: the department case below passing
+       proves nothing about whether this one still draws one. */
+    const { channel } = setupApis({
+      search_filter: "topic=Physics",
+      channel_type: ChannelTypeEnum.Topic,
+    })
+    setupTopicApis(channel)
+
+    renderWithProviders(<ChannelPage />, {
+      url: `/c/${channel.channel_type}/${channel.name}`,
+    })
+
+    await screen.findByRole("heading", { level: 1, name: channel.title })
+    expect(screen.queryByTestId("channel-hero-photo")).toBe(null)
+  }, 10000)
+
+  test("names the topics trail, not the departments one", async () => {
+    const { channel } = setupApis({
+      search_filter: "topic=Physics",
+      channel_type: ChannelTypeEnum.Topic,
+    })
+    setupTopicApis(channel)
+
+    renderWithProviders(<ChannelPage />, {
+      url: `/c/${channel.channel_type}/${channel.name}`,
+    })
+
+    await screen.findByRole("link", { name: TOPICS_LABEL })
+    expect(screen.queryByRole("link", { name: DEPARTMENTS_LABEL })).toBe(null)
+  }, 10000)
+})
+
+describe("Channel Pages, Unit only", () => {
+  it("Displays the channel title, banner", async () => {
+    const { channel } = setupApis({
+      search_filter: "offered_by=ocw",
+      channel_type: "unit",
+    })
+    renderWithProviders(<ChannelPage />, {
+      url: `/c/${channel.channel_type}/${channel.name}`,
+    })
+
+    await screen.findByRole("heading", { name: channel.title })
+  })
+
+  it("Displays the channel logo", async () => {
+    const { channel } = setupApis({
+      name: "ocw",
+      channel_type: "unit",
+    })
+    renderWithProviders(<ChannelPage />, {
+      url: `/c/${channel.channel_type}/${channel.name}`,
+    })
+
+    const images = await screen.findAllByRole("img", {
+      name: "MIT OpenCourseWare",
+    })
+    expect(images[0]).toHaveAttribute("src", "/images/unit_logos/ocw.svg")
+  })
+
+  it("Displays a featured carousel if the channel type is 'unit'", async () => {
+    const { channel } = setupApis({
+      search_filter: "offered_by=ocw",
+      channel_type: "unit",
+    })
+
+    renderWithProviders(<ChannelPage />, {
+      url: `/c/${channel.channel_type}/${channel.name}`,
+    })
+    await screen.findAllByText(channel.title)
+    const carousel = await screen.findByText("Featured Courses")
+    expect(carousel).toBeInTheDocument()
+
+    await waitFor(() => {
+      expect(makeRequest).toHaveBeenCalledWith(
+        expect.objectContaining({
+          method: "get",
+          url: urls.learningResources.featured({
+            limit: 12,
+            offered_by: ["ocw"],
+          }),
+        }),
+      )
+    })
+  })
+
+  test("headings", async () => {
+    const { channel } = setupApis({
+      search_filter: "offered_by=ocw",
+      channel_type: "unit",
+    })
+    renderWithProviders(<ChannelPage />, {
+      url: `/c/${channel.channel_type}/${channel.name}`,
+    })
+
+    await waitFor(() => {
+      assertHeadings([
+        { level: 1, name: channel.title },
+        { level: 2, name: "Featured Courses" },
+        { level: 2, name: "What Learners Say" },
+        { level: 2, name: `Search within ${channel.title}` },
+        { level: 3, name: "Search Results" },
+        { level: 3, name: "Filter" },
+      ])
+    })
+  })
+})

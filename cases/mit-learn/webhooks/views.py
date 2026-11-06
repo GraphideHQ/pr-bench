@@ -1,0 +1,541 @@
+import json
+import logging
+from collections import defaultdict
+
+from django.core.exceptions import BadRequest
+from django.db.transaction import non_atomic_requests
+from django.http import HttpResponseBadRequest
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_POST
+from drf_spectacular.utils import extend_schema, extend_schema_view
+from rest_framework import generics, status
+from rest_framework.parsers import JSONParser
+from rest_framework.response import Response
+
+from learning_resources.constants import LearningResourceType
+from learning_resources.etl.constants import (
+    CourseLoaderConfig,
+    ETLSource,
+    ProgramLoaderConfig,
+)
+from learning_resources.etl.loaders import (
+    load_courses,
+    load_documents,
+    load_ovs_video_from_webhook,
+    load_programs,
+    load_videos,
+)
+from learning_resources.etl.ownership import (
+    Pipeline,
+    RunMode,
+    is_shadow_run,
+    may_write,
+    run_mode,
+    writing_as,
+)
+from learning_resources.etl.shadow import run_shadow
+from learning_resources.etl.warehouse_guards import mass_unpublish_refusal
+from learning_resources.models import LearningResource
+from learning_resources.tasks import ingest_canvas_course, ingest_edx_run_archive
+from learning_resources.utils import (
+    resource_delete_actions,
+)
+from main.utils import clear_views_cache
+from webhooks.decorators import require_signature
+from webhooks.serializers import (
+    ContentFileWebHookRequestSerializer,
+    LearningResourceWebhookRequestSerializer,
+    LearningResourceWebhookResponseSerializer,
+    OVSVideoWebhookRequestSerializer,
+    WebhookResponseSerializer,
+)
+from webhooks.utils import sanitize_learning_resources
+
+log = logging.getLogger(__name__)
+
+
+class BaseWebhookView(generics.GenericAPIView):
+    @method_decorator(require_POST)
+    @method_decorator(require_signature)
+    @method_decorator(non_atomic_requests)
+    @method_decorator(csrf_exempt)
+    def dispatch(self, request, *args, **kwargs):
+        return super().dispatch(request, *args, **kwargs)
+
+
+@extend_schema_view(
+    post=extend_schema(
+        parameters=[ContentFileWebHookRequestSerializer()],
+        responses=WebhookResponseSerializer(),
+    ),
+)
+class ContentFileWebhookView(BaseWebhookView):
+    """
+    Webhook handler for ContentFile updates
+    """
+
+    permission_classes = []
+    authentication_classes = []
+    serializer_class = ContentFileWebHookRequestSerializer
+
+    def success(self, extra_data=None):
+        """
+        Return a success response with optional extra data
+        """
+        if not extra_data:
+            extra_data = {}
+        response = WebhookResponseSerializer(
+            data={"status": "success", "message": "Webhook received", **extra_data}
+        )
+        if response.is_valid():
+            return Response(response.data)
+        else:
+            log.error("Invalid response data: %s", response.errors)
+            return HttpResponseBadRequest("Invalid response data")
+
+    def get_data(self, request):
+        """
+        Get data from the serializer
+        """
+        serializer = ContentFileWebHookRequestSerializer(data=json.loads(request.body))
+        if not serializer.is_valid():
+            log.error("Invalid webhook data: %s", serializer.errors)
+            msg = "Invalid data"
+            raise BadRequest(msg)
+        return serializer.validated_data
+
+    def post(self, request):
+        try:
+            data = self.get_data(request)
+            log.info("Received webhook data: %s", data)
+            process_create_content_file_request(data)
+            return self.success()
+        except json.JSONDecodeError:
+            return HttpResponseBadRequest("Invalid JSON format")
+
+
+# An upsert writes the video and its collection's playlist together.
+OVS_TYPES = [LearningResourceType.video_playlist.name, LearningResourceType.video.name]
+
+
+@extend_schema_view(
+    post=extend_schema(
+        request=OVSVideoWebhookRequestSerializer,
+        responses=WebhookResponseSerializer(),
+    ),
+)
+class OVSVideoWebhookView(BaseWebhookView):
+    """
+    Webhook handler for OVS video upserts and deletes from the dagster pipeline
+    """
+
+    permission_classes = []
+    authentication_classes = []
+    parser_classes = [JSONParser]
+    serializer_class = OVSVideoWebhookRequestSerializer
+
+    def success(self, extra_data=None):
+        if not extra_data:
+            extra_data = {}
+        response = WebhookResponseSerializer(
+            data={"status": "success", "message": "Webhook received", **extra_data}
+        )
+        if response.is_valid():
+            return Response(response.data)
+        log.error("Invalid response data: %s", response.errors)
+        return HttpResponseBadRequest("Invalid response data")
+
+    def post(self, request):
+        try:
+            payload = json.loads(request.body)
+        except json.JSONDecodeError:
+            return HttpResponseBadRequest("Invalid JSON format")
+        serializer = OVSVideoWebhookRequestSerializer(data=payload)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        # The OVS push is the data platform's webhook path for OVS, so it writes
+        # only once (ovs, video_playlist) and (ovs, video) are cut over to the
+        # webhook, the same flip that stops get_ovs_data.
+        with writing_as(Pipeline.WEBHOOK):
+            if not may_write(ETLSource.ovs.name, OVS_TYPES):
+                msg = (
+                    f"The webhook does not own {ETLSource.ovs.name}/"
+                    f"{', '.join(OVS_TYPES)}. Set the ETLSourceOwnership rows in "
+                    "Django admin to cut them over."
+                )
+                return Response(
+                    {"status": "error", "message": msg},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            if data.get("delete"):
+                video_id = data["video_id"]
+                resource = LearningResource.objects.filter(
+                    readable_id=video_id,
+                    etl_source=ETLSource.ovs.name,
+                    resource_type=LearningResourceType.video.name,
+                ).first()
+                if resource:
+                    resource_delete_actions(resource)
+                else:
+                    log.info(
+                        "OVS delete webhook: no resource for video_id=%s", video_id
+                    )
+            else:
+                load_ovs_video_from_webhook(payload)
+
+        clear_views_cache()
+        return self.success()
+
+
+class ContentFileDeleteWebhookView(ContentFileWebhookView):
+    """
+    Webhook handler for ContentFile DELETE requests
+    """
+
+    def post(self, request):
+        try:
+            data = self.get_data(request)
+            process_delete_content_file_request(data)
+            return self.success()
+        except json.JSONDecodeError:
+            return HttpResponseBadRequest("Invalid JSON format")
+
+
+@extend_schema_view(
+    post=extend_schema(
+        request=LearningResourceWebhookRequestSerializer,
+        responses=LearningResourceWebhookResponseSerializer(),
+    ),
+)
+class LearningResourceWebhookView(BaseWebhookView):
+    """
+    Generic webhook handler for pre-computed LearningResource batches delivered
+    by the OL Data Platform (Dagster).
+
+    The request body is ``{"resources": [ ... ]}`` where each resource is a
+    canonical LearningResource dict carrying at minimum ``readable_id``,
+    ``etl_source`` and ``resource_type``. Resources are grouped by
+    ``(etl_source, resource_type)`` and routed to the matching loader
+    (``load_courses`` / ``load_programs`` / ``load_documents`` / ``load_videos``).
+    Each loader performs a full sync for that source and upserts the OpenSearch
+    index, so a batch must contain the authoritative set of resources for the
+    (etl_source, resource_type) it represents. A pair listed in the optional
+    ``sync`` array with no resources in the batch is pruned, unpublishing all
+    of it. Resource types without a loader are logged and skipped rather than
+    failing the whole batch.
+
+    A batch with a group the webhook shadows (ETLSourceOwnership.shadow) is
+    a shadow run as a whole: each group is compared with what is stored
+    (``learning_resources.etl.shadow``), nothing is written, and the
+    response's ``shadow`` counts what each group's load would have changed.
+    A video group the webhook owns is not compared in a shadow run, and its
+    entry carries an ``error`` in place of the counts. A group the webhook
+    neither owns nor shadows rejects the whole batch with 409.
+
+    A batch whose load would unpublish more than 10% of the published resources
+    of any pair it prunes, a declared pair with no resources included, is
+    rejected whole with 422, the limit the warehouse syncs apply. A truncated
+    batch and a bad model build look like that from here, and only MIT Learn
+    holds the published set to compare against. ``allow_mass_unpublish`` skips
+    the check. A shadow run is not refused: its counts report what the load
+    would unpublish.
+    """
+
+    permission_classes = []
+    authentication_classes = []
+    parser_classes = [JSONParser]
+    serializer_class = LearningResourceWebhookRequestSerializer
+
+    def success(self, extra_data=None):
+        if not extra_data:
+            extra_data = {}
+        response = LearningResourceWebhookResponseSerializer(
+            data={"status": "success", "message": "Webhook received", **extra_data}
+        )
+        if response.is_valid():
+            return Response(response.data)
+        log.error("Invalid response data: %s", response.errors)
+        return HttpResponseBadRequest("Invalid response data")
+
+    def post(self, request):
+        try:
+            payload = json.loads(request.body)
+        except json.JSONDecodeError:
+            return HttpResponseBadRequest("Invalid JSON format")
+        serializer = LearningResourceWebhookRequestSerializer(data=payload)
+        serializer.is_valid(raise_exception=True)
+        # Descriptions come from third-party feeds by way of the sender, so
+        # they are sanitized here rather than trusted to arrive clean.
+        grouped = group_learning_resources(
+            sanitize_learning_resources(serializer.validated_data["resources"]),
+            serializer.validated_data["sync"],
+        )
+        # Check ownership of every group before loading any, since a partial
+        # load would leave the batch half applied with no way for the sender
+        # to tell.
+        with writing_as(Pipeline.WEBHOOK):
+            modes = group_modes(grouped)
+            unowned = [
+                f"{etl_source}/{resource_type}"
+                for (etl_source, resource_type), mode in modes.items()
+                if mode == RunMode.SKIP
+            ]
+            if unowned:
+                msg = (
+                    f"The webhook neither owns nor shadows {', '.join(unowned)}. "
+                    "Set the ETLSourceOwnership rows in Django admin to cut "
+                    "them over or shadow them."
+                )
+                log.warning("learning_resources webhook rejected: %s", msg)
+                return Response(
+                    {"status": "error", "message": msg},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            if RunMode.SHADOW in modes.values():
+                # The batch is applied whole or not at all, as for the 409
+                # above, so a group the webhook owns is compared with the
+                # rest instead of written.
+                summary, shadow_runs = run_shadow(
+                    list(modes), lambda: load_learning_resource_groups(grouped)
+                )
+                log.info("learning_resources webhook shadowed: %s", summary)
+                return self.success(
+                    {
+                        "message": "Shadow run: nothing was written",
+                        "shadow": [
+                            {
+                                "etl_source": run.etl_source,
+                                "resource_type": run.resource_type,
+                                **(
+                                    {"error": run.error}
+                                    if run.error
+                                    else {"counts": run.counts}
+                                ),
+                            }
+                            for run in shadow_runs
+                        ],
+                    }
+                )
+            # After the shadow branch: a shadow writes nothing, and its report
+            # is where to see what the load would unpublish.
+            refusal = (
+                None
+                if serializer.validated_data["allow_mass_unpublish"]
+                else first_mass_unpublish_refusal(grouped)
+            )
+            if refusal:
+                log.warning("learning_resources webhook rejected: %s", refusal)
+                return Response(
+                    {"status": "error", "message": refusal},
+                    status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                )
+            summary = load_learning_resource_groups(grouped)
+        log.info("learning_resources webhook processed: %s", summary)
+        clear_views_cache()
+        return self.success()
+
+
+# The resource types _load_resource_group has a loader for. Podcasts are not
+# here: MIT Learn pulls them from the warehouse (SyncPodcastsTask).
+_SUPPORTED_TYPES = {
+    LearningResourceType.course.name,
+    LearningResourceType.program.name,
+    LearningResourceType.document.name,
+    LearningResourceType.video.name,
+}
+# load_videos upserts what it is given and leaves the rest of a source alone.
+_PRUNED_TYPES = _SUPPORTED_TYPES - {LearningResourceType.video.name}
+
+
+def _load_resource_group(etl_source, resource_type, resources):
+    """
+    Dispatch a group of same-typed resources to the matching loader.
+
+    Returns the list of loaded LearningResource objects, or ``None`` if the
+    resource_type has no supported loader (the group is then skipped).
+    """
+    # Only a sync-declared pair reaches here with no resources, and an empty
+    # declared pair is the sender saying nothing of it is published any more.
+    prune_empty = not resources
+    if resource_type == LearningResourceType.course.name:
+        return load_courses(
+            etl_source, resources, config=CourseLoaderConfig(prune_empty=prune_empty)
+        )
+    if resource_type == LearningResourceType.program.name:
+        # Child courses arrive as references to courses their own source's
+        # course delivery already loaded, so look them up rather than upsert,
+        # as the legacy program pipelines do.
+        return load_programs(
+            etl_source,
+            resources,
+            config=ProgramLoaderConfig(
+                courses=CourseLoaderConfig(fetch_only=True),
+                prune=True,
+                prune_empty=prune_empty,
+            ),
+        )
+    if resource_type == LearningResourceType.document.name:
+        return load_documents(etl_source, resources)
+    if resource_type == LearningResourceType.video.name:
+        # load_videos does not report to a shadow run and would write, so a
+        # shadow run leaves an owned video group alone and reports it not
+        # compared. run_mode never shadows a video group.
+        return [] if is_shadow_run() else load_videos(resources)
+    return None
+
+
+def group_learning_resources(resources, sync):
+    """
+    Group canonical LearningResource dicts by (etl_source, resource_type),
+    adding an empty group for each sync-declared pair with no resources so
+    its loader prunes it.
+    """
+    grouped = defaultdict(list)
+    for resource in resources:
+        grouped[(resource["etl_source"], resource["resource_type"])].append(resource)
+    for pair in sync:
+        grouped.setdefault((pair["etl_source"], pair["resource_type"]), [])
+    return grouped
+
+
+def group_modes(grouped):
+    """
+    Return what the current pipeline's load does (write, shadow or skip) for
+    each supported (etl_source, resource_type) group.
+    """
+    return {
+        (etl_source, resource_type): run_mode(etl_source, resource_type)
+        for etl_source, resource_type in grouped
+        if resource_type in _SUPPORTED_TYPES
+    }
+
+
+def kept_readable_ids(resource_type, resources):
+    """
+    Return the readable_ids a group's load will leave published. The loaders
+    upsert row by row, so a repeated readable_id ends as its last row leaves it.
+    upsert_course_or_program unpublishes a course or program with no runs, and
+    a row with no ``published`` key keeps the value before it.
+    """
+    kept = {}
+    for resource in resources:
+        readable_id = resource["readable_id"]
+        has_runs = resource_type == LearningResourceType.document.name or resource.get(
+            "runs"
+        )
+        kept[readable_id] = has_runs and resource.get(
+            "published", kept.get(readable_id, True)
+        )
+    return {readable_id for readable_id, is_kept in kept.items() if is_kept}
+
+
+def omitted_test_mode_course_ids(etl_source, resources):
+    """
+    Return the source's published test_mode courses a batch leaves out, which
+    load_courses does not prune. load_programs and load_documents do prune theirs.
+    """
+    return set(
+        LearningResource.objects.filter(
+            etl_source=etl_source,
+            resource_type=LearningResourceType.course.name,
+            published=True,
+            test_mode=True,
+        )
+        .exclude(readable_id__in=[resource["readable_id"] for resource in resources])
+        .values_list("readable_id", flat=True)
+    )
+
+
+def first_mass_unpublish_refusal(grouped):
+    """
+    Return why the first group over the unpublish limit is refused, or None if
+    none is, checking every pruned group before any of them loads.
+    """
+    for (etl_source, resource_type), resources in grouped.items():
+        if resource_type not in _PRUNED_TYPES:
+            continue
+        kept_ids = kept_readable_ids(resource_type, resources)
+        if resource_type == LearningResourceType.course.name:
+            kept_ids |= omitted_test_mode_course_ids(etl_source, resources)
+        refusal = mass_unpublish_refusal(etl_source, resource_type, kept_ids)
+        if refusal:
+            return refusal
+    return None
+
+
+def load_learning_resource_groups(grouped):
+    """
+    Route each group to its loader and summarize what was loaded or skipped.
+    Unsupported resource types are logged and skipped rather than failing the
+    whole batch.
+    """
+    summary = {"loaded": 0, "skipped": 0, "groups": []}
+    for (etl_source, resource_type), items in grouped.items():
+        loaded = _load_resource_group(etl_source, resource_type, items)
+        if loaded is None:
+            log.warning(
+                "No loader for resource_type=%s (etl_source=%s); skipping %d "
+                "resource(s)",
+                resource_type,
+                etl_source,
+                len(items),
+            )
+            summary["skipped"] += len(items)
+            status = "skipped"
+            loaded_count = 0
+        else:
+            loaded_count = len(loaded)
+            summary["loaded"] += loaded_count
+            status = "loaded"
+        summary["groups"].append(
+            {
+                "etl_source": etl_source,
+                "resource_type": resource_type,
+                "received": len(items),
+                "loaded": loaded_count,
+                "status": status,
+            }
+        )
+    return summary
+
+
+def process_create_content_file_request(data):
+    """
+    Process a content file CREATE webhook request based on the ETL source
+    """
+    etl_source = data.get("source")
+    content_path = data.get("content_path")
+    readable_id = data.get("course_readable_id") or data.get("course_id")
+    log.info("Processing %s content file: %s", etl_source, content_path)
+    if etl_source == ETLSource.canvas.name:
+        ingest_canvas_course.apply_async([content_path, False])
+    else:
+        ingest_edx_run_archive.apply_async(
+            [etl_source, content_path],
+            kwargs={"run_id": readable_id, "overwrite": False},
+        )
+
+
+def process_delete_content_file_request(data):
+    """
+    Process a content file DELETE webhhook request based on the ETL source
+    """
+    etl_source = data.get("source")
+    course_id = data.get("course_id")
+    course_id_pattern = (
+        f"{course_id}-" if etl_source == ETLSource.canvas.name else course_id
+    )
+    # This deletes the course itself, which the legacy ETL may no longer own.
+    if not may_write(etl_source, LearningResourceType.course.name):
+        return
+    if course_id:
+        try:
+            resource = LearningResource.objects.get(
+                readable_id__istartswith=course_id_pattern,
+                etl_source=etl_source,
+            )
+            resource_delete_actions(resource)
+        except LearningResource.DoesNotExist:
+            log.warning("Resource with readable_id %s does not exist", course_id)

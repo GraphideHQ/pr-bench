@@ -1,0 +1,459 @@
+"""ETL functions for website_content news data."""
+
+import html
+import logging
+from urllib.parse import urlparse
+
+from news_events.constants import FeedType
+from news_events.etl import loaders
+from website_content.constants import WebsiteContentType
+from website_content.models import WebsiteContent
+
+log = logging.getLogger(__name__)
+
+_SAFE_LINK_SCHEMES = ("http", "https", "mailto", "tel")
+
+
+def _escape_html(text: str) -> str:
+    """Escape text for safe interpolation into an HTML attribute or text node."""
+    return html.escape(text, quote=True)
+
+
+def _safe_str_attr(value: object, default: str = "") -> str:
+    """
+    Return value if it's a string, otherwise a safe default.
+
+    ProseMirror content is stored as unvalidated JSON, so a link mark's
+    href/target/rel can be null, a number, a list, etc. -- not just a
+    string or absent. dict.get(key, default) only covers "key absent";
+    this covers "key present but not a string" too, so a single
+    malformed article can't raise an uncaught exception and abort the
+    whole feed transform (transform_items has no per-article isolation).
+    """
+    return value if isinstance(value, str) else default
+
+
+def _is_safe_link_href(href: str) -> bool:
+    """Allow http(s)/mailto/tel URLs and site-relative paths."""
+    try:
+        parsed = urlparse(href)
+    except ValueError:
+        # Malformed URLs (e.g. "http://[") make urlparse raise instead of
+        # just failing to parse -- treat anything it can't handle as unsafe.
+        return False
+    if parsed.scheme:
+        return parsed.scheme in _SAFE_LINK_SCHEMES
+    # "//host" and "/\host" are treated as other-host URLs by browsers, so a
+    # leading "/" is only site-relative when not immediately followed by
+    # another "/" or "\".
+    return href.startswith("/") and href[1:2] not in ("/", "\\")
+
+
+def website_content_feed_guid(content_id: int) -> str:
+    """
+    Return the FeedItem guid for a website content item.
+
+    Single source of truth for the convention: the sync writes items under this
+    guid and the unpublish path deletes them by it, so the two must not drift.
+    """
+    return f"article-{content_id}"
+
+
+def extract_single_website_content(article: WebsiteContent) -> dict:
+    """
+    Extract a single published news content item from the database.
+    Returns a dict in the same format as extract().
+    """
+    return {
+        "id": article.id,
+        "title": article.title,
+        "slug": article.slug,
+        "content": article.content,
+        "cover_image": article.cover_image,
+        "user": article.user,
+        "created_on": article.created_on,
+        "updated_on": article.updated_on,
+        "publish_date": article.publish_date,
+    }
+
+
+def transform_single_article(article_data: dict) -> dict:
+    """
+    Transform a single article into feed item format.
+    Returns a dict suitable for loaders.load_feed_item.
+    """
+    items = transform_items([article_data])
+    return items[0] if items else None
+
+
+def sync_single_website_content_news_to_news(article: WebsiteContent):
+    """
+    Sync a single published news content item to the news feed.
+    Only syncs content items with content_type='news'.
+    """
+    if not article.is_published:
+        return
+
+    if article.content_type != WebsiteContentType.news.name:
+        return
+    article_data = extract_single_website_content(article)
+
+    item_data = transform_single_article(article_data)
+    if not item_data:
+        return
+    # Find or create the FeedSource for MIT Learn Articles
+    from news_events.models import FeedSource
+
+    source, _ = FeedSource.objects.get_or_create(
+        title="MIT Learn Articles",
+        defaults={
+            "url": "/news",
+            "feed_type": FeedType.news.name,
+            "description": "Articles created by MIT Learn staff",
+        },
+    )
+    loaders.load_feed_item(source, item_data)
+
+
+def delete_website_content_news_from_news(content_id: int) -> int:
+    """
+    Remove a website content item's news feed entry.
+
+    The counterpart to `sync_single_website_content_news_to_news`. Deleting by
+    guid rather than by looking the content up means this still works for an
+    item that has since been hard-deleted, and it is a no-op for content that
+    never had a feed entry (a draft, or a non-news type).
+
+    Returns:
+        int: the number of feed items removed (0 or 1).
+    """
+    from news_events.models import FeedItem
+
+    guid = website_content_feed_guid(content_id)
+    # delete() returns the cascade total, which counts the item's detail row
+    # too; report the FeedItem count so the number means what it says.
+    _, per_model = FeedItem.objects.filter(guid=guid).delete()
+    deleted = per_model.get(FeedItem._meta.label, 0)  # noqa: SLF001
+    if deleted:
+        log.info("Removed news feed item %s for content %s", guid, content_id)
+    else:
+        log.info("No news feed item %s to remove for content %s", guid, content_id)
+    return deleted
+
+
+def extract() -> list[dict]:
+    """
+    Extract published articles from the database.
+
+    Returns:
+        list[dict]: List of article data dictionaries.
+    """
+    # Get only published news-type content items
+    articles = WebsiteContent.objects.filter(
+        is_published=True, content_type=WebsiteContentType.news.name
+    ).select_related("user")
+
+    return [
+        {
+            "id": article.id,
+            "title": article.title,
+            "slug": article.slug,
+            "content": article.content,
+            "cover_image": article.cover_image,
+            "user": article.user,
+            "created_on": article.created_on,
+            "updated_on": article.updated_on,
+            "publish_date": article.publish_date,
+        }
+        for article in articles
+    ]
+
+
+def transform_items(articles_data: list[dict]) -> list[dict]:
+    """
+    Transform articles into feed item format.
+
+    Args:
+        articles_data (list[dict]): List of article data dictionaries
+
+    Returns:
+        list[dict]: List of transformed feed items
+    """
+    entries = []
+
+    for article in articles_data:
+        # Extract content from JSON field
+        content_json = article.get("content", {})
+
+        # Extract summary from banner paragraph node
+        summary_text = extract_summary_from_banner(content_json)
+
+        # Convert JSON content to plain text for full content
+        content_text = extract_text_from_content(content_json)
+
+        cover_image_url = article.get("cover_image", "")
+        image_data = (
+            {"url": cover_image_url, "alt": "", "description": ""}
+            if cover_image_url
+            else None
+        )
+
+        log.info(
+            "Article %s: Extracted image: %s",
+            article.get("id"),
+            image_data,
+        )
+
+        # Get author information
+        user = article.get("user")
+        author_name = ""
+        if user:
+            author_name = f"{user.first_name} {user.last_name}".strip()
+            if not author_name:
+                author_name = user.username
+
+        # Build the article URL using slug
+        slug = article.get("slug")
+        article_url = f"/news/{slug}" if slug else f"/news/{article.get('id')}"
+
+        # Use publish_date if available, otherwise fall back to created_on
+        publish_date = article.get("publish_date") or article.get("created_on")
+
+        entry = {
+            "guid": website_content_feed_guid(article.get("id")),
+            "title": article.get("title", ""),
+            "url": article_url,
+            "summary": summary_text,
+            "content": content_text,
+            "image": image_data,
+            "detail": {
+                "authors": [author_name] if author_name else [],
+                "topics": [],  # Add topics if you have them in your Article model
+                "publish_date": publish_date.isoformat() if publish_date else None,
+            },
+        }
+        entries.append(entry)
+
+    return entries
+
+
+def _extract_text_from_paragraph(paragraph_node: dict) -> str:
+    """
+    Extract text content from a paragraph node, preserving links as HTML anchor tags.
+
+    Args:
+        paragraph_node (dict): Paragraph node containing text nodes
+
+    Returns:
+        str: Extracted text content with links as HTML anchor tags
+    """
+    paragraph_content = paragraph_node.get("content", [])
+    text_parts = []
+
+    for text_node in paragraph_content:
+        if isinstance(text_node, dict) and text_node.get("type") == "text":
+            text = _safe_str_attr(text_node.get("text"))
+            if text:
+                text = _escape_html(text)
+
+                # Check if this text has link marks
+                marks = text_node.get("marks", [])
+                if not isinstance(marks, list):
+                    marks = []
+                link_mark = None
+
+                # Find link mark if it exists
+                for mark in marks:
+                    if isinstance(mark, dict) and mark.get("type") == "link":
+                        link_mark = mark
+                        break
+
+                # If there's a link, wrap in anchor tag
+                if link_mark:
+                    attrs = link_mark.get("attrs", {})
+                    if not isinstance(attrs, dict):
+                        attrs = {}
+                    href = _safe_str_attr(attrs.get("href"))
+                    target = _safe_str_attr(attrs.get("target"), "_blank")
+                    rel = _safe_str_attr(
+                        attrs.get("rel"), "noopener noreferrer nofollow"
+                    )
+
+                    if href:
+                        safe_href = href if _is_safe_link_href(href) else "#"
+                        text = (
+                            f'<a href="{_escape_html(safe_href)}" '
+                            f'target="{_escape_html(target)}" '
+                            f'rel="{_escape_html(rel)}">{text}</a>'
+                        )
+
+                text_parts.append(text)
+
+    return "".join(text_parts)
+
+
+def _find_paragraph_in_banner(content_array: list) -> str:
+    """
+    Find and extract text from paragraph inside banner node.
+
+    Args:
+        content_array (list): Array of content nodes
+
+    Returns:
+        str: Text from banner paragraph or empty string
+    """
+    for node in content_array:
+        if isinstance(node, dict) and node.get("type") == "banner":
+            banner_content = node.get("content", [])
+
+            for child in banner_content:
+                if isinstance(child, dict) and child.get("type") == "paragraph":
+                    summary = _extract_text_from_paragraph(child)
+                    if summary.strip():
+                        return summary
+
+    return ""
+
+
+def _find_first_paragraph(content_array: list) -> str:
+    """
+    Find and extract text from first non-empty paragraph in content.
+
+    Args:
+        content_array (list): Array of content nodes
+
+    Returns:
+        str: Text from first paragraph or empty string
+    """
+    for node in content_array:
+        if isinstance(node, dict) and node.get("type") == "paragraph":
+            summary = _extract_text_from_paragraph(node)
+            if summary.strip():
+                return summary
+
+    return ""
+
+
+def extract_summary_from_banner(content_json: dict) -> str:
+    """
+    Extract summary text from the paragraph node inside the banner node.
+    Falls back to first paragraph in content if banner paragraph is empty.
+
+    Args:
+        content_json (dict): The JSON content from Article
+
+    Returns:
+        str: Summary text from banner paragraph or first available paragraph
+    """
+    if not content_json:
+        return ""
+
+    content_array = content_json.get("content", [])
+
+    # Try to get summary from banner paragraph first
+    summary = _find_paragraph_in_banner(content_array)
+    if summary:
+        return summary
+
+    # Fallback to first non-empty paragraph
+    return _find_first_paragraph(content_array)
+
+
+def extract_text_from_content(content_json: dict) -> str:  # noqa: C901
+    """
+    Extract plain text from JSON content structure.
+
+    Args:
+        content_json (dict): The JSON content from Article
+
+    Returns:
+        str: Plain text extracted from content
+    """
+    if not content_json:
+        return ""
+
+    def extract_text_from_node(node):  # noqa: C901
+        """Recursively extract text from ProseMirror nodes"""
+        if not node:
+            return []
+
+        texts = []
+
+        # Handle dict nodes
+        if isinstance(node, dict):
+            # Direct text node
+            if node.get("type") == "text":
+                text = node.get("text", "")
+                if text:
+                    texts.append(text)
+            # Node with content array (ProseMirror structure)
+            elif "content" in node:
+                content = node["content"]
+                if isinstance(content, list):
+                    for child in content:
+                        texts.extend(extract_text_from_node(child))
+                else:
+                    texts.extend(extract_text_from_node(content))
+            # Simple text field (fallback)
+            elif "text" in node:
+                texts.append(node["text"])
+
+        # Handle list nodes
+        elif isinstance(node, list):
+            for item in node:
+                texts.extend(extract_text_from_node(item))
+
+        return texts
+
+    # Extract text from ProseMirror structure
+    text_parts = extract_text_from_node(content_json)
+
+    # Fallback: EditorJS structure
+    if not text_parts:
+        blocks = content_json.get("blocks", [])
+        for block in blocks:
+            if isinstance(block, dict):
+                text = block.get("text", "") or block.get("data", {}).get("text", "")
+                if text:
+                    text_parts.append(text)
+
+    return " ".join(text_parts)
+
+
+def transform(articles_data: list[dict]) -> list[dict]:
+    """
+    Transform the articles data into feed source format.
+
+    Args:
+        articles_data (list[dict]): List of article data
+
+    Returns:
+        list[dict]: List of transformed source data
+    """
+    if not articles_data:
+        return []
+
+    # Transform items first
+    items = transform_items(articles_data)
+
+    # Extract the first article's image to use as feed source image
+    source_image = None
+    for item in items:
+        if item.get("image"):
+            source_image = item["image"]
+            break
+
+    # Fallback: use a static logo if no articles have images
+    if not source_image:
+        # Example: {"url": "/static/images/mit-learn-logo.png", ...}
+        source_image = None
+    return [
+        {
+            "title": "MIT Learn Articles",
+            "url": "/news",
+            "feed_type": FeedType.news.name,
+            "description": "Articles created by MIT Learn staff",
+            "items": items,
+            "image": source_image,
+        }
+    ]

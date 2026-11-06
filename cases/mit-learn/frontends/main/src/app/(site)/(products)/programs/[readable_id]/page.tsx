@@ -1,0 +1,102 @@
+import type { AppPageProps } from "@/common/searchParams"
+import React from "react"
+import { HydrationBoundary, dehydrate } from "@tanstack/react-query"
+import {
+  safeGenerateMetadata,
+  standardizeMetadata,
+  MetadataNotFound,
+} from "@/common/metadata"
+import ProgramPage from "@/app-pages/ProductPages/ProgramPage"
+import { reqTreeChildQueries } from "@/app-pages/ProductPages/useReqTreeChildren"
+import { notFound, redirect } from "next/navigation"
+import { DisplayModeEnum } from "@mitodl/mitxonline-api-axios/v2"
+import { programPageView } from "@/common/urls"
+import { pagesQueries } from "api/mitxonline-hooks/pages"
+import { programsQueries } from "api/mitxonline-hooks/programs"
+import { DEFAULT_RESOURCE_IMG } from "ol-utilities"
+import { getQueryClient } from "@/app/getQueryClient"
+
+export const generateMetadata = async (
+  props: AppPageProps<"/programs/[readable_id]">,
+) => {
+  const params = await props.params
+  const readableId = decodeURIComponent(params.readable_id)
+
+  return safeGenerateMetadata(async () => {
+    const queryClient = getQueryClient()
+
+    const { results: programs } = await queryClient.fetchQuery(
+      programsQueries.programsList({ readable_id: readableId, live: true }),
+    )
+
+    if (programs.length === 0) {
+      throw new MetadataNotFound()
+    }
+    const [program] = programs
+
+    const image = program.page?.feature_image_src || DEFAULT_RESOURCE_IMG
+
+    return standardizeMetadata({
+      title: program.title,
+      image,
+    })
+  })
+}
+
+const Page: React.FC<AppPageProps<"/programs/[readable_id]">> = async (
+  props,
+) => {
+  const params = await props.params
+  const readableId = decodeURIComponent(params.readable_id)
+
+  const queryClient = getQueryClient()
+
+  /**
+   * queryClient.fetchQueryOr404 cannot be used here as the Wagtail Pages and
+   * MITxOnline Programs API are list endpoints that also 200 with empty results.
+   */
+  const [programPages, programs] = await Promise.all([
+    queryClient.fetchQuery(pagesQueries.programPages(readableId)),
+    queryClient.fetchQuery(
+      programsQueries.programsList({ readable_id: readableId, live: true }),
+    ),
+  ])
+
+  if (programPages.items.length === 0 || programs.results.length === 0) {
+    notFound()
+  }
+
+  const program = programs.results[0]
+  if (program.display_mode === DisplayModeEnum.Course) {
+    redirect(
+      programPageView({
+        readable_id: readableId,
+        display_mode: program.display_mode,
+      }),
+    )
+  }
+
+  /**
+   * Serial by necessity: the route has only a readable id, and the child ids
+   * live in the program's requirement tree. Without them the requirements
+   * section paints skeletons and cannot yet tell course-like children from
+   * programs, since a req_tree node carries a child's id but not display_mode.
+   */
+  const children = reqTreeChildQueries(program)
+  await Promise.all([
+    children.courseIds.length > 0
+      ? queryClient.prefetchQuery(children.courses)
+      : null,
+    children.programIds.length > 0
+      ? queryClient.prefetchQuery(children.programs)
+      : null,
+  ])
+
+  return (
+    <HydrationBoundary state={dehydrate(queryClient)}>
+      <ProgramPage readableId={readableId} />
+    </HydrationBoundary>
+  )
+}
+
+export default Page

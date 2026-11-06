@@ -1,0 +1,528 @@
+import { env, requiredEnv } from "@/env"
+import type { V2ProgramDisplayModeEnum } from "@mitodl/mitxonline-api-axios/v2"
+import { slugify } from "@/common/slugs"
+import { DisplayModeEnum } from "@mitodl/mitxonline-api-axios/v2"
+
+// matches ! $ & ' ( ) * + , ; = : @ ~
+const SAFE_IN_PATH_SEGMENT =
+  /%21|%24|%26|%27|%28|%29|%2A|%2B|%2C|%3B|%3D|%3A|%40|%7E/gi
+
+const encodePathSegment = (pathSegment: string) => {
+  const overAggressive = encodeURIComponent(pathSegment)
+  return overAggressive.replace(SAFE_IN_PATH_SEGMENT, (match) =>
+    decodeURIComponent(match),
+  )
+}
+
+const generatePath = (
+  template: string,
+  params: Record<string, string | number>,
+): string => {
+  return template.replace(/\[(\w+)\]/g, (_, key) => {
+    if (params[key] === undefined) {
+      throw new Error(`Missing parameter '${key}'`)
+    }
+    return encodePathSegment(String(params[key]))
+  })
+}
+
+export const HOME = "/"
+
+export const ONBOARDING = "/onboarding"
+export const ORGANIZATIONAL_LEARNING = "/organizational-learning"
+export const ORGANIZATIONAL_LEARNING_FORM_ID = "get-in-touch"
+export const LEARNINGPATH_LISTING = "/learningpaths"
+export const LEARNINGPATH_VIEW = "/learningpaths/[id]"
+export const learningPathsView = (id: number) =>
+  generatePath(LEARNINGPATH_VIEW, { id: String(id) })
+export const PROGRAMLETTER_VIEW = "/program_letter/[id]/view/"
+export const programLetterView = (id: string) =>
+  generatePath(PROGRAMLETTER_VIEW, { id: String(id) })
+export const NEWS_LISTING = "/news/"
+export const NEWS_VIEW = "/news/[id]"
+export const NEWS_DRAFT_VIEW = "/news/[id]/draft"
+export const NEWS_EDIT = "/news/[id]/edit"
+export const NEWS_CREATE = "/news/new"
+export const newsView = (id: string) =>
+  generatePath(NEWS_VIEW, { id: String(id) })
+export const newsDraftView = (id: string) =>
+  generatePath(NEWS_DRAFT_VIEW, { id: String(id) })
+export const newsEditView = (id: number) =>
+  generatePath(NEWS_EDIT, { id: String(id) })
+
+// Articles (served under /articles)
+export const ARTICLES_LISTING = "/articles/"
+export const ARTICLES_VIEW = "/articles/[id]"
+export const ARTICLES_DRAFT_VIEW = "/articles/[id]/draft"
+export const articleView = (id: string) =>
+  generatePath(ARTICLES_VIEW, { id: String(id) })
+export const articleDraftView = (id: string) =>
+  generatePath(ARTICLES_DRAFT_VIEW, { id: String(id) })
+
+// Generic website content editing routes
+export const WEBSITE_CONTENT_CREATE = "/website_content/[type]/new"
+export const WEBSITE_CONTENT_EDIT = "/website_content/[type]/[idOrSlug]/edit"
+export const WEBSITE_CONTENT_DRAFTS = "/website_content/drafts"
+export const websiteContentCreateView = (type: string) =>
+  `/website_content/${type}/new`
+export const websiteContentEditView = (
+  type: string,
+  idOrSlug: string | number,
+) => `/website_content/${type}/${idOrSlug}/edit`
+export const websiteContentDraftsView = (contentType?: string) =>
+  contentType
+    ? `${WEBSITE_CONTENT_DRAFTS}?content_type=${contentType}`
+    : WEBSITE_CONTENT_DRAFTS
+
+export const DEPARTMENTS = "/departments/"
+export const TOPICS = "/topics/"
+
+export const CHANNEL_VIEW = "/c/[channelType]/[name]" as const
+export const makeChannelViewPath = (channelType: string, name: string) =>
+  generatePath(CHANNEL_VIEW, { channelType, name })
+
+const MITOL_API_BASE_URL = env("NEXT_PUBLIC_MITOL_API_BASE_URL")
+
+export const DASHBOARD_VIEW = "/dashboard/[tab]"
+const dashboardView = (tab: string) => generatePath(DASHBOARD_VIEW, { tab })
+
+export const DASHBOARD_HOME = "/dashboard"
+export const DASHBOARD_MY_LEARNING_ID = "my-learning"
+export const DASHBOARD_MY_LEARNING = `${DASHBOARD_HOME}#${DASHBOARD_MY_LEARNING_ID}`
+export const MY_LISTS = dashboardView("my-lists")
+export const PROFILE = dashboardView("profile")
+export const SETTINGS = dashboardView("settings")
+
+export const USERLIST_VIEW = "/dashboard/my-lists/[id]"
+export const userListView = (id: number) =>
+  generatePath(USERLIST_VIEW, { id: String(id) })
+export const CONTRACT_VIEW =
+  "/dashboard/organization/[orgSlug]/contract/[contractSlug]"
+export const contractView = (orgSlug: string, contractSlug: string) =>
+  generatePath(CONTRACT_VIEW, { orgSlug: orgSlug, contractSlug: contractSlug })
+export const CONTRACT_ADMIN_VIEW =
+  "/organization/[orgSlug]/contract/[contractSlug]/admin"
+export const contractAdminView = (orgSlug: string, contractSlug: string) =>
+  generatePath(CONTRACT_ADMIN_VIEW, { orgSlug, contractSlug })
+/**
+ * B2B analytics comes at two scopes. The org view aggregates every contract;
+ * the contract view narrows to one, mirroring how MITx Online's manager
+ * dashboard is addressed. Both are backed by their own materialized views.
+ */
+export const ORGANIZATION_ANALYTICS_VIEW =
+  "/dashboard/organization/[orgSlug]/analytics"
+export const organizationAnalyticsView = (orgSlug: string) =>
+  generatePath(ORGANIZATION_ANALYTICS_VIEW, { orgSlug })
+export const CONTRACT_ANALYTICS_VIEW =
+  "/dashboard/organization/[orgSlug]/contract/[contractSlug]/analytics"
+export const contractAnalyticsView = (orgSlug: string, contractSlug: string) =>
+  generatePath(CONTRACT_ANALYTICS_VIEW, { orgSlug, contractSlug })
+/**
+ * Outside `/dashboard` — and so without its sidebar — for the same reason as
+ * CONTRACT_ADMIN_VIEW: the learner table is too wide for the dashboard grid's
+ * content column, and this page reads as a console rather than a dashboard
+ * section. Contract-scoped only; the learner-progress endpoint has no org-wide
+ * form.
+ */
+export const CONTRACT_LEARNERS_VIEW =
+  "/organization/[orgSlug]/contract/[contractSlug]/learners"
+/**
+ * The learner directory's Status filter values. `passed` covers both `passed`
+ * and `certified` (see `STATUS_FILTER_COMPLETION_STATUS`), which is why the
+ * URL param is `status` rather than the API's `completion_status`.
+ */
+export const CONTRACT_LEARNERS_STATUSES = [
+  "not_started",
+  "in_progress",
+  "passed",
+  "unknown",
+] as const
+export type ContractLearnersStatus = (typeof CONTRACT_LEARNERS_STATUSES)[number]
+export type ContractLearnersFilters = {
+  status?: ContractLearnersStatus
+  /** A course run's readable id. */
+  module?: string
+  needsAttention?: boolean
+  page?: number
+}
+export const contractLearnersView = (
+  orgSlug: string,
+  contractSlug: string,
+  filters: ContractLearnersFilters = {},
+) => {
+  const path = generatePath(CONTRACT_LEARNERS_VIEW, { orgSlug, contractSlug })
+  const params = new URLSearchParams()
+  if (filters.status) params.set("status", filters.status)
+  if (filters.module) params.set("module", filters.module)
+  if (filters.needsAttention) params.set("needs_attention", "true")
+  if (filters.page && filters.page > 1) params.set("page", String(filters.page))
+  const search = params.toString()
+  return search ? `${path}?${search}` : path
+}
+export const PROGRAM_VIEW = "/dashboard/program/[id]"
+export const programView = (id: number) =>
+  generatePath(PROGRAM_VIEW, { id: String(id) })
+
+export const RECEIPT_VIEW = "/receipt/[orderId]"
+export const receiptView = (orderId: number) =>
+  generatePath(RECEIPT_VIEW, { orderId: String(orderId) })
+/**
+ * Enrollments carry no order reference, so these routes resolve the order from the
+ * run/program before redirecting to `RECEIPT_VIEW`.
+ */
+export const RECEIPT_BY_RUN_VIEW = "/receipt/by-run/[runId]"
+export const receiptByRunView = (runId: number) =>
+  generatePath(RECEIPT_BY_RUN_VIEW, { runId: String(runId) })
+export const RECEIPT_BY_PROGRAM_VIEW = "/receipt/by-program/[programId]"
+export const receiptByProgramView = (programId: number) =>
+  generatePath(RECEIPT_BY_PROGRAM_VIEW, { programId: String(programId) })
+
+export const SEARCH = "/search"
+
+export const ABOUT = "/about"
+export const ABOUT_NON_DEGREE_LEARNING_FRAGMENT = "non-degree-learning"
+
+export const ACCESSIBILITY = "https://accessibility.mit.edu/"
+
+export const PRIVACY = "/privacy"
+
+export const HONOR_CODE = "/honor_code"
+
+export const TERMS = "/terms"
+
+export const UNITS = "/units"
+
+export const CONTACT = "https://support.learn.mit.edu/"
+
+/** The support site's "submit a request" form. */
+export const SUPPORT_REQUEST = `${CONTACT}hc/en-us/requests/new`
+
+export const RECOMMENDER_QUERY_PARAM = "recommender"
+
+export const RESOURCE_DRAWER_PARAMS = {
+  resource: "resource",
+  resource_title: "resource_title",
+  syllabus: "syllabus",
+  syllabusOnly: "syllabus_only",
+} as const
+
+/** Prefix a same-origin path with the public origin (for canonical tags). */
+export const absoluteUrl = (path: string): string =>
+  `${requiredEnv("NEXT_PUBLIC_ORIGIN")}${path}`
+
+/**
+ * Point `params` at a resource's drawer: the authoritative `resource` id plus
+ * the cosmetic `resource_title` slug.
+ *
+ * A blank slug *deletes* `resource_title` rather than leaving it. Callers
+ * typically copy an existing query string, which may still carry a previous
+ * resource's slug, and pairing that with the new id would mislabel the URL.
+ */
+export const setResourceParams = (
+  params: URLSearchParams,
+  resourceId: number,
+  title: string | undefined,
+): void => {
+  params.set(RESOURCE_DRAWER_PARAMS.resource, String(resourceId))
+  const slug = title ? slugify(title) : ""
+  if (slug) {
+    params.set(RESOURCE_DRAWER_PARAMS.resource_title, slug)
+  } else {
+    params.delete(RESOURCE_DRAWER_PARAMS.resource_title)
+  }
+}
+
+/**
+ * Relative drawer URL on the search page:
+ *   /search?resource={id}[&resource_title={slug}]
+ * `resource` is the authoritative id; `resource_title` is a cosmetic slug,
+ * omitted when blank and ignored on lookup.
+ */
+export const resourceDrawerSearch = (
+  resourceId: number,
+  title: string | undefined,
+) => {
+  const params = new URLSearchParams()
+  setResourceParams(params, resourceId, title)
+  return `${SEARCH}?${params.toString()}`
+}
+
+export const canonicalResourceDrawerUrl = (
+  resourceId: number,
+  title: string | undefined,
+) => absoluteUrl(resourceDrawerSearch(resourceId, title))
+
+export const querifiedSearchUrl = (
+  params:
+    string | string[][] | URLSearchParams | Record<string, string> | undefined,
+) => `${SEARCH}?${new URLSearchParams(params).toString()}`
+
+export const SEARCH_NEW = querifiedSearchUrl({ sortby: "new" })
+
+export const SEARCH_UPCOMING = querifiedSearchUrl({ sortby: "upcoming" })
+
+export const SEARCH_POPULAR = querifiedSearchUrl({ sortby: "-views" })
+
+export const SEARCH_FREE = querifiedSearchUrl({ free: "true" })
+
+export const SEARCH_PODCASTS = querifiedSearchUrl({
+  resource_category: "Podcast",
+  resource_type_group: "learning_material",
+  sortby: "new",
+})
+
+export const SEARCH_PODCAST_EPISODES = querifiedSearchUrl({
+  resource_category: "Podcast Episode",
+  resource_type_group: "learning_material",
+  sortby: "new",
+})
+
+const CERTIFICATION_SEARCH_PARAMS = new URLSearchParams()
+CERTIFICATION_SEARCH_PARAMS.append("certification_type", "professional")
+CERTIFICATION_SEARCH_PARAMS.append("certification_type", "completion")
+CERTIFICATION_SEARCH_PARAMS.append("certification_type", "micromasters")
+export const SEARCH_CERTIFICATE = querifiedSearchUrl(
+  CERTIFICATION_SEARCH_PARAMS,
+)
+
+export const SEARCH_COURSE = querifiedSearchUrl({
+  resource_type_group: "course",
+})
+
+export const SEARCH_PROGRAM = querifiedSearchUrl({
+  resource_type_group: "program",
+})
+
+export const SEARCH_LEARNING_MATERIAL = querifiedSearchUrl({
+  resource_type_group: "learning_material",
+})
+
+export const LOGIN = `${MITOL_API_BASE_URL}/login`
+export const LOGOUT = `${MITOL_API_BASE_URL}/logout/`
+
+type UrlDescriptor = {
+  pathname: string
+  searchParams: URLSearchParams | null
+}
+export type LoginUrlOpts = {
+  /**
+   * URL to redirect to after login + signup.
+   */
+  next: UrlDescriptor
+  /**
+   * URL to redirect to after signup, overriding `next` for signup if provided.
+   */
+  signupNext?: UrlDescriptor
+}
+
+const stringifyUrlDescriptor = (val: UrlDescriptor) => {
+  // ORIGIN is read at call time (request time) so NEXT_PUBLIC_ORIGIN is
+  // available — it is not set at build time in the standalone Docker image.
+  // requiredEnv() is safe here: stringifyUrlDescriptor only runs when building
+  // login/signup URLs at request time, never during `next build`.
+  const url = new URL(requiredEnv("NEXT_PUBLIC_ORIGIN"))
+  url.pathname = val.pathname
+  if (val.searchParams) {
+    val.searchParams.forEach((v, k) => url.searchParams.set(k, v))
+  }
+  return url.toString()
+}
+/**
+ * Returns the URL to the authentication page (login and signup).
+ *
+ * NOTES:
+ *  1. useAuthToCurrent() is a convenience function that uses the current
+ *    pathname and search parameters to generate the next URL.
+ *  2. `next` is required to encourage its use. You can explicitly pass `null`
+ *    for values to skip them if desired.
+ */
+export const auth = (opts: LoginUrlOpts) => {
+  const { next: loginNext, signupNext } = opts
+
+  const url = new URL(LOGIN)
+  url.searchParams.set("next", stringifyUrlDescriptor(loginNext))
+  if (signupNext) {
+    url.searchParams.set("signup_next", stringifyUrlDescriptor(signupNext))
+  }
+  return url.toString()
+}
+
+/**
+ * Keycloak account actions the user can start from the settings page.
+ *
+ * Must stay in sync with `AccountAction` in authentication/constants.py.
+ */
+export enum AccountAction {
+  UpdateEmail = "update-email",
+  UpdatePassword = "update-password",
+}
+
+/**
+ * Outcome of an account action, reported back on the URL we're returned to.
+ *
+ * Must stay in sync with `AccountActionStatus` in authentication/constants.py.
+ */
+export enum AccountActionStatus {
+  Success = "success",
+  Cancelled = "cancelled",
+  Error = "error",
+  Unavailable = "unavailable",
+}
+
+export const ACCOUNT_ACTION_PARAM = "account_action"
+export const ACCOUNT_ACTION_STATUS_PARAM = "account_action_status"
+
+/**
+ * Returns the URL that hands the user off to Keycloak to change their email or
+ * password. Django owns the handoff — it holds the OIDC client config and
+ * validates the user is allowed to perform the action.
+ */
+export const accountAction = (action: AccountAction, next: UrlDescriptor) => {
+  const url = new URL(`${MITOL_API_BASE_URL}/account/action/start/${action}/`)
+  url.searchParams.set("next", stringifyUrlDescriptor(next))
+  return url.toString()
+}
+
+export const B2B_ATTACH_VIEW = "/enrollmentcode/[code]"
+export const b2bAttachView = (code: string) =>
+  generatePath(B2B_ATTACH_VIEW, { code: code })
+
+export const FACEBOOK_SHARE_BASE_URL =
+  "https://www.facebook.com/sharer/sharer.php"
+export const TWITTER_SHARE_BASE_URL = "https://x.com/share"
+export const LINKEDIN_SHARE_BASE_URL =
+  "https://www.linkedin.com/sharing/share-offsite"
+export const LINKEDIN_ADD_TO_PROFILE_BASE_URL =
+  "https://www.linkedin.com/profile/add"
+
+export const COURSE_PAGE_VIEW = "/courses/[readableId]"
+export const coursePageView = (readableId: string) =>
+  generatePath(COURSE_PAGE_VIEW, { readableId })
+// The resource page builders below take the resource's `url_slug`. `slug` is
+// required-but-undefinable so a call site can't silently omit it; passing
+// undefined emits the bare path, which resolves and 307-redirects to the
+// slugged canonical.
+export const VIDEO_PLAYLIST_PAGE_VIEW = "/video-playlist/[id]"
+export const videoPlaylistPath = (
+  id: number | string,
+  slug: string | undefined,
+) => {
+  const base = generatePath(VIDEO_PLAYLIST_PAGE_VIEW, { id: String(id) })
+  return slug === undefined ? base : `${base}/${slug}`
+}
+export const PODCASTS_PAGE_VIEW = "/podcasts"
+
+export const PODCAST_PAGE_VIEW = "/podcast/[podcastId]"
+export const podcastPath = (
+  podcastId: number | string,
+  slug: string | undefined,
+) => {
+  const base = generatePath(PODCAST_PAGE_VIEW, {
+    podcastId: String(podcastId),
+  })
+  return slug === undefined ? base : `${base}/${slug}`
+}
+
+export const PODCAST_EPISODE_PAGE_VIEW =
+  "/podcast/[podcastId]/podcast_episode/[episodeId]"
+/**
+ * An episode's path. The parent podcast is the caller's to choose: an episode in
+ * several podcasts is viewable under any of them, so a page passes the podcast
+ * it is being viewed under rather than the canonical one.
+ */
+export const podcastEpisodePath = (
+  id: string,
+  podcastId: string,
+  slug: string | undefined,
+) => {
+  const base = generatePath(PODCAST_EPISODE_PAGE_VIEW, {
+    podcastId, // bare context id
+    episodeId: id,
+  })
+  return slug === undefined ? base : `${base}/${slug}`
+}
+
+export const VIDEO_DETAIL_PAGE_VIEW = "/video/[videoId]"
+/**
+ * A video's path. `?playlist` is the caller's to choose: a video in several
+ * playlists is viewable in any of them, so a page passes the playlist it is
+ * being viewed in rather than the canonical one.
+ */
+export const videoDetailPath = (
+  videoId: number | string,
+  playlistId: number | string | undefined,
+  slug: string | undefined,
+) => {
+  const path = generatePath(VIDEO_DETAIL_PAGE_VIEW, {
+    videoId: String(videoId),
+  })
+  const base = slug === undefined ? path : `${path}/${slug}`
+  if (playlistId !== undefined) {
+    const params = new URLSearchParams({ playlist: String(playlistId) })
+    return `${base}?${params.toString()}`
+  }
+  return base
+}
+
+/**
+ * Append a request's incoming search params to a canonical URL so redirects
+ * preserve tracking params (e.g. utm_*). Params the canonical already sets
+ * win, and `omit` lists params the canonical builder owns (always dropped
+ * from the incoming set so a rejected value — e.g. a non-member `playlist` —
+ * can't be re-forwarded and redirect again).
+ */
+export const carrySearchParams = (
+  canonical: string,
+  incoming: Record<string, string | string[] | undefined>,
+  omit: string[] = [],
+): string => {
+  const [path, query] = canonical.split("?")
+  const params = new URLSearchParams()
+  Object.entries(incoming).forEach(([key, value]) => {
+    if (omit.includes(key) || value === undefined) return
+    const values = Array.isArray(value) ? value : [value]
+    values.forEach((v) => params.append(key, v))
+  })
+  new URLSearchParams(query).forEach((value, key) => {
+    params.delete(key)
+    params.append(key, value)
+  })
+  const qs = params.toString()
+  return qs ? `${path}?${qs}` : path
+}
+
+export const PROGRAM_PAGE_VIEW = "/programs/[readableId]"
+export const PROGRAM_AS_COURSE_PAGE_VIEW = "/courses/p/[readableId]"
+
+export const programPageView = (program: {
+  readable_id: string
+  /**
+   * If display_mode is "course", program should be rendered on a course page at
+   * /courses/p/[readable_id] instead of /programs/[readable_id].
+   *
+   * NOTE:
+   * Explicitly allow null/undefined since program.display_mode is required and
+   * (at least according to our OpenAPI spec) optional:
+   * ```ts
+   * programPageView({
+   *   readable_id: p.readable_id, display_mode: p.display_mode
+   * })
+   * ```
+   * But require it (arg is not optional, i.e., not `display_mode?`) to
+   * encourage callers to pass the value.
+   */
+  display_mode: V2ProgramDisplayModeEnum | null | undefined
+}) => {
+  const pattern =
+    program.display_mode === DisplayModeEnum.Course
+      ? PROGRAM_AS_COURSE_PAGE_VIEW
+      : PROGRAM_PAGE_VIEW
+  return generatePath(pattern, { readableId: program.readable_id })
+}
+export const ocwLearnPageView = (originalUrl: string) => {
+  const url = new URL(originalUrl)
+  if (!url.hostname.includes("ocw.mit.edu")) {
+    return originalUrl
+  }
+  return url.pathname.replace(/^\/courses/, "/courses/o")
+}

@@ -1,0 +1,1168 @@
+import React from "react"
+import {
+  urls,
+  factories,
+  RequirementTreeBuilder,
+} from "api/mitxonline-test-utils"
+import {
+  setMockResponse,
+  urls as learnUrls,
+  factories as learnFactories,
+} from "api/test-utils"
+import type {
+  V2Program,
+  V2ProgramDetail,
+  ProgramPageItem,
+  CourseWithCourseRunsSerializerV2,
+} from "@mitodl/mitxonline-api-axios/v2"
+import { DisplayModeEnum } from "@mitodl/mitxonline-api-axios/v2"
+import {
+  renderWithProviders,
+  waitFor,
+  screen,
+  within,
+  user,
+} from "@/test-utils"
+import ProgramPage from "./ProgramPage"
+import { reqTreeChildQueries } from "./useReqTreeChildren"
+import { TestIds } from "./ProductSummary"
+import { assertHeadings, allowConsoleErrors } from "ol-test-utilities"
+import { notFound } from "next/navigation"
+import {
+  STAY_UPDATED_FORM_ID,
+  withHubspotFormId,
+} from "./test-utils/stayUpdated"
+
+import invariant from "tiny-invariant"
+import { getIdsFromReqTree } from "@/common/mitxonline"
+import { faker } from "@faker-js/faker/locale/en"
+import { PostHogEvents } from "@/common/constants"
+import { capturePostHog } from "@/common/analytics/posthog"
+
+jest.mock("@/common/analytics/posthog", () => ({
+  capturePostHog: jest.fn(),
+  initPostHog: jest.fn(),
+}))
+const mockCapture = jest.mocked(capturePostHog)
+
+const makeProgram = factories.programs.program
+const makePage = factories.pages.programPageItem
+
+type ReqSection = {
+  title: string
+} & (
+  | { operator: "all_of"; courseCount: number; programCount?: number }
+  | {
+      operator: "min_number_of"
+      required: number
+      outOf: number
+      programCount?: number
+    }
+)
+
+const makeReqs = ({
+  required = { count: 0, title: "Required Courses" },
+  electives = { count: 0, outOf: 0, title: "Elective Courses" },
+}: {
+  required?: { count: number; title: string }
+  electives?: { count: number; outOf: number; title: string }
+} = {}): Pick<V2Program, "requirements" | "req_tree"> => {
+  const sections: ReqSection[] = []
+  if (required.count) {
+    sections.push({
+      operator: "all_of",
+      courseCount: required.count,
+      title: required.title,
+    })
+  }
+  if (electives.outOf) {
+    sections.push({
+      operator: "min_number_of",
+      required: electives.count,
+      outOf: electives.outOf,
+      title: electives.title,
+    })
+  }
+  return makeReqsFromSections(sections)
+}
+
+const makeReqsFromSections = (
+  sections: ReqSection[],
+): Pick<V2Program, "requirements" | "req_tree"> => {
+  const reqTree = new RequirementTreeBuilder()
+  const allCourses: { id: number; readableId: string }[] = []
+
+  const addCourses = (node: RequirementTreeBuilder, count: number) => {
+    Array.from({ length: count }).forEach(() => {
+      const id = faker.number.int()
+      allCourses.push({ id, readableId: faker.lorem.slug() })
+      node.addCourse({ course: id })
+    })
+  }
+
+  sections.forEach((section) => {
+    if (section.operator === "all_of") {
+      const op = reqTree.addOperator({
+        operator: "all_of",
+        title: section.title,
+      })
+      addCourses(op, section.courseCount)
+      if (section.programCount) {
+        Array.from({ length: section.programCount }).forEach(() => {
+          op.addProgram()
+        })
+      }
+    } else {
+      const op = reqTree.addOperator({
+        operator: "min_number_of",
+        operator_value: String(section.required),
+        title: section.title,
+      })
+      addCourses(op, section.outOf)
+      if (section.programCount) {
+        Array.from({ length: section.programCount }).forEach(() => {
+          op.addProgram()
+        })
+      }
+    }
+  })
+
+  const requirements: V2Program["requirements"] = {
+    courses: {
+      required: allCourses.map((c) => ({
+        id: c.id,
+        readable_id: c.readableId,
+      })),
+      electives: [],
+    },
+  }
+
+  return { requirements, req_tree: reqTree.serialize() }
+}
+
+const expectRawContent = (el: HTMLElement, htmlString: string) => {
+  const raw = within(el).getByTestId("raw")
+  expect(htmlString.length).toBeGreaterThan(0)
+  expect(raw.innerHTML).toBe(htmlString)
+}
+
+const setupApis = ({
+  program,
+  page,
+  childProgramOverrides,
+}: {
+  program: V2Program
+  page: ProgramPageItem
+  childProgramOverrides?: Partial<V2ProgramDetail>
+}): {
+  courses: CourseWithCourseRunsSerializerV2[]
+  childPrograms: V2ProgramDetail[]
+} => {
+  setMockResponse.get(
+    urls.programs.programsList({
+      readable_id: program.readable_id,
+      live: true,
+    }),
+    { results: [program] },
+  )
+
+  setMockResponse.get(urls.pages.programPages(program.readable_id), {
+    items: [page],
+  })
+
+  const { courseIds, programIds } = getIdsFromReqTree(program.req_tree)
+  const courses: CourseWithCourseRunsSerializerV2[] = courseIds.map((id) =>
+    factories.courses.course({ id }),
+  )
+
+  if (courseIds.length > 0) {
+    setMockResponse.get(
+      urls.courses.coursesList({
+        id: courses.map((course) => course.id),
+        page_size: courses.length,
+      }),
+      { results: courses },
+    )
+  }
+
+  const childPrograms: V2ProgramDetail[] = programIds.map((id) =>
+    factories.programs.program({ id, ...childProgramOverrides }),
+  )
+
+  if (programIds.length > 0) {
+    setMockResponse.get(
+      urls.programs.programsList({
+        id: programIds,
+        page_size: programIds.length,
+      }),
+      { results: childPrograms },
+    )
+  }
+
+  setMockResponse.get(
+    learnUrls.userMe.get(),
+    learnFactories.user.user({ is_authenticated: false }),
+  )
+
+  const stayUpdatedFormId = page.hubspot_form_id?.trim()
+  if (stayUpdatedFormId) {
+    setMockResponse.get(
+      learnUrls.hubspot.details({ form_id: stayUpdatedFormId }),
+      learnFactories.hubspot.form({
+        id: stayUpdatedFormId,
+        name: "Stay Updated",
+      }),
+    )
+  }
+
+  setMockResponse.get(urls.programEnrollments.enrollmentsListV3(), [])
+
+  return { courses, childPrograms }
+}
+
+describe("ProgramPage", () => {
+  test("Page has expected headings", async () => {
+    const program = makeProgram({
+      ...makeReqs({
+        required: { count: 3, title: "Core Dog Courses" },
+        electives: { count: 2, outOf: 4, title: "Elective Cat Courses" },
+      }),
+      // Deterministic offering: the InfoBox now renders offering-card headings
+      // (e.g. "Learn for Free" / "Certificate Track") from ProgramEnrollArea,
+      // so pin a single free enrollment mode to keep this heading list stable.
+      enrollment_modes: [
+        factories.courses.enrollmentMode({ requires_payment: false }),
+      ],
+    })
+    const page = makePage({ program_details: program })
+    invariant(page.faculty.length > 0)
+    setupApis({ program, page })
+    renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+
+    await waitFor(
+      () => {
+        assertHeadings(
+          [
+            { level: 1, name: page.title },
+            { level: 2, name: "Program Information" },
+            { level: 3, name: "Learn for Free" },
+            { level: 2, name: "About this Program" },
+            { level: 2, name: "What you'll learn" },
+            { level: 2, name: "Courses" },
+            { level: 3, name: "Core Dog Courses" },
+            { level: 3, name: "Elective Cat Courses: Complete 2 out of 4" },
+            { level: 2, name: "How you'll learn" },
+            { level: 2, name: "Prerequisites" },
+            { level: 2, name: "Meet your instructors" },
+            { level: 3, name: page.faculty[0].instructor_name },
+            { level: 2, name: "FAQs" },
+            ...page.faqs.map((faq) => ({ level: 3, name: faq.question })),
+            { level: 2, name: "What learners are saying" },
+          ],
+          { maxLevel: 3 },
+        )
+      },
+      { timeout: 3000 },
+    )
+  })
+
+  // Collapsing sections tested in AboutSection.test.tsx
+  test("About section has expected content", async () => {
+    const program = makeProgram({ ...makeReqs() })
+    const page = makePage({ program_details: program })
+    invariant(page.about)
+    setupApis({ program, page })
+    renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+    const section = await screen.findByRole("region", {
+      name: "About this Program",
+    })
+    expectRawContent(section, page.about)
+  })
+
+  test.each([
+    { required: 3, electives: 2, showRequired: true, showElectives: true },
+    { required: 3, electives: 0, showRequired: true, showElectives: false },
+    // the next cases don't really make sense... All programs should have required courses
+    { required: 0, electives: 2, showRequired: false, showElectives: true },
+    { required: 0, electives: 0, showRequired: false, showElectives: false },
+  ])(
+    "Renders required course and elective subsections appropriately (Required: $required, Electives: $electives)",
+    async ({ required, electives, showRequired, showElectives }) => {
+      const titles = {
+        required: faker.lorem.words(3),
+        elective: faker.lorem.words(3),
+      }
+      const program = makeProgram({
+        ...makeReqs({
+          required: { count: required, title: titles.required },
+          electives: {
+            count: electives,
+            outOf: 2 * electives,
+            title: titles.elective,
+          },
+        }),
+      })
+      const page = makePage({ program_details: program })
+      setupApis({ program, page })
+      renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+      const section = await screen.findByRole("region", { name: "Courses" })
+      const requiredHeading = within(section).queryByRole("heading", {
+        name: `${titles.required}`,
+      })
+      const electiveHeading = within(section).queryByRole("heading", {
+        name: `${titles.elective}: Complete ${electives} out of ${2 * electives}`,
+      })
+
+      expect(!!requiredHeading).toBe(showRequired)
+      expect(!!electiveHeading).toBe(showElectives)
+    },
+  )
+
+  test("Renders requirements section correctly", async () => {
+    const numReq = faker.number.int({ min: 2, max: 5 })
+    const numElective = faker.number.int({ min: 2, max: 3 })
+    const numOutOf = faker.number.int({
+      min: numElective + 1,
+      max: numElective + 3,
+    })
+    const titles = {
+      required: faker.lorem.words(3),
+      elective: faker.lorem.words(3),
+    }
+    const program = makeProgram({
+      ...makeReqs({
+        required: { count: numReq, title: titles.required },
+        electives: {
+          count: numElective,
+          outOf: numOutOf,
+          title: titles.elective,
+        },
+      }),
+    })
+    const page = makePage({ program_details: program })
+    setupApis({ program, page })
+    renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+
+    const section = await screen.findByRole("region", { name: "Courses" })
+    within(section).getByText(
+      `To complete this program, you must take ${numReq} required courses and ${numElective} elective courses.`,
+    )
+    within(section).getByRole("heading", { name: `${titles.required}` })
+    within(section).getByRole("heading", {
+      name: `${titles.elective}: Complete ${numElective} out of ${numOutOf}`,
+    })
+    const [reqList, electiveList] = within(section).getAllByRole("list")
+
+    await waitFor(() => {
+      expect(within(reqList).getAllByRole("listitem").length).toBe(numReq)
+    })
+    await waitFor(() => {
+      expect(within(electiveList).getAllByRole("listitem").length).toBe(
+        numOutOf,
+      )
+    })
+
+    const allLists = within(section).getAllByRole("list")
+    allLists.forEach((list) => {
+      within(list)
+        .getAllByRole("listitem")
+        .forEach((item) => {
+          const links = within(item).getAllByRole("link")
+          expect(links.length).toBeGreaterThanOrEqual(1)
+        })
+    })
+  })
+
+  test("Shows 'Additional elective courses' text when electives require 0", async () => {
+    const numReq = faker.number.int({ min: 2, max: 5 })
+    const numElectives = faker.number.int({ min: 2, max: 5 })
+    const titles = {
+      required: faker.lorem.words(3),
+      elective: faker.lorem.words(3),
+    }
+    const program = makeProgram({
+      ...makeReqs({
+        required: { count: numReq, title: titles.required },
+        electives: {
+          count: 0,
+          outOf: numElectives,
+          title: titles.elective,
+        },
+      }),
+    })
+    const page = makePage({ program_details: program })
+    setupApis({ program, page })
+    renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+
+    const section = await screen.findByRole("region", { name: "Courses" })
+    within(section).getByText(
+      `To complete this program, you must take ${numReq} required courses. Additional elective courses are available.`,
+    )
+  })
+
+  test("Renders multiple elective sections", async () => {
+    const sections: ReqSection[] = [
+      { operator: "all_of", courseCount: 2, title: "Core Courses" },
+      {
+        operator: "min_number_of",
+        required: 1,
+        outOf: 3,
+        title: "Biophysics Electives",
+      },
+      {
+        operator: "min_number_of",
+        required: 2,
+        outOf: 4,
+        title: "Philosophy Electives",
+      },
+    ]
+    const program = makeProgram({ ...makeReqsFromSections(sections) })
+    const page = makePage({ program_details: program })
+    setupApis({ program, page })
+    renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+
+    const section = await screen.findByRole("region", { name: "Courses" })
+
+    within(section).getByRole("heading", { name: "Core Courses" })
+    within(section).getByRole("heading", {
+      name: "Biophysics Electives: Complete 1 out of 3",
+    })
+    within(section).getByRole("heading", {
+      name: "Philosophy Electives: Complete 2 out of 4",
+    })
+
+    const lists = within(section).getAllByRole("list")
+    expect(lists).toHaveLength(3)
+
+    await waitFor(() => {
+      expect(within(lists[0]).getAllByRole("listitem").length).toBe(2)
+    })
+    await waitFor(() => {
+      expect(within(lists[1]).getAllByRole("listitem").length).toBe(3)
+    })
+    await waitFor(() => {
+      expect(within(lists[2]).getAllByRole("listitem").length).toBe(4)
+    })
+  })
+
+  test("Renders a mixed requirement section with courses and programs", async () => {
+    const reqTree = new RequirementTreeBuilder()
+    const op = reqTree.addOperator({
+      operator: "all_of",
+      title: "Core Requirements",
+    })
+    op.addCourse()
+    op.addProgram()
+    op.addCourse()
+
+    const program = makeProgram({ req_tree: reqTree.serialize() })
+    const page = makePage({ program_details: program })
+    const { courses, childPrograms } = setupApis({ program, page })
+
+    renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+
+    // A true program child suppresses the "Courses" framing.
+    const section = await screen.findByRole("region", { name: "Requirements" })
+    const list = within(section).getByRole("list")
+
+    await waitFor(() => {
+      expect(within(list).getAllByRole("listitem")).toHaveLength(3)
+    })
+
+    courses.forEach((course) => {
+      const link = within(list).getByRole("link", {
+        name: new RegExp(course.title),
+      })
+      expect(link).toHaveAttribute("href", `/courses/${course.readable_id}`)
+    })
+
+    childPrograms.forEach((prog) => {
+      const link = within(list).getByRole("link", {
+        name: new RegExp(prog.title),
+      })
+      expect(link).toHaveAttribute("href", `/programs/${prog.readable_id}`)
+    })
+  })
+
+  test("Links child program to /courses/p/ when display_mode is course", async () => {
+    const reqTree = new RequirementTreeBuilder()
+    const op = reqTree.addOperator({ operator: "all_of" })
+    op.addProgram()
+
+    const program = makeProgram({ req_tree: reqTree.serialize() })
+    const page = makePage({ program_details: program })
+    const { childPrograms } = setupApis({
+      program,
+      page,
+      childProgramOverrides: { display_mode: DisplayModeEnum.Course },
+    })
+
+    renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+    const section = await screen.findByRole("region", { name: "Courses" })
+
+    const link = await within(section).findByRole("link", {
+      name: new RegExp(childPrograms[0].title),
+    })
+    expect(link).toHaveAttribute(
+      "href",
+      `/courses/p/${childPrograms[0].readable_id}`,
+    )
+  })
+
+  test("Links child program to /programs/ when display_mode is null", async () => {
+    const reqTree = new RequirementTreeBuilder()
+    const op = reqTree.addOperator({ operator: "all_of" })
+    op.addProgram()
+
+    const program = makeProgram({ req_tree: reqTree.serialize() })
+    const page = makePage({ program_details: program })
+    const { childPrograms } = setupApis({ program, page })
+
+    renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+    const section = await screen.findByRole("region", { name: "Requirements" })
+
+    const link = await within(section).findByRole("link", {
+      name: new RegExp(childPrograms[0].title),
+    })
+    expect(link).toHaveAttribute(
+      "href",
+      `/programs/${childPrograms[0].readable_id}`,
+    )
+  })
+
+  test("Hides course framing when requirements are true programs", async () => {
+    const reqTree = new RequirementTreeBuilder()
+    const tracks = reqTree.addOperator({
+      operator: "min_number_of",
+      operator_value: "1",
+      title: "Tracks",
+    })
+    tracks.addProgram()
+    tracks.addProgram()
+
+    const program = makeProgram({ req_tree: reqTree.serialize() })
+    const page = makePage({ program_details: program })
+    const { childPrograms } = setupApis({ program, page })
+
+    renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+
+    const section = await screen.findByRole("region", { name: "Requirements" })
+    // Settle the child programs first; the negatives below must describe the
+    // resolved page, not a mid-load render.
+    expect(
+      await within(section).findByRole("link", {
+        name: new RegExp(childPrograms[0].title),
+      }),
+    ).toBeVisible()
+
+    expect(section).not.toHaveTextContent("To complete this program")
+    expect(screen.queryByRole("heading", { name: "Courses" })).toBe(null)
+    expect(screen.queryByTestId(TestIds.RequirementsRow)).toBe(null)
+  })
+
+  test("Suppressed case keeps one section heading above the groups", async () => {
+    const reqTree = new RequirementTreeBuilder()
+    const tracks = reqTree.addOperator({
+      operator: "min_number_of",
+      operator_value: "1",
+      title: "Tracks",
+    })
+    tracks.addProgram()
+    tracks.addProgram()
+    const capstone = reqTree.addOperator({
+      operator: "all_of",
+      title: "Capstone",
+    })
+    capstone.addProgram()
+
+    const program = makeProgram({
+      req_tree: reqTree.serialize(),
+      enrollment_modes: [
+        factories.courses.enrollmentMode({ requires_payment: false }),
+      ],
+    })
+    const page = makePage({ program_details: program })
+    setupApis({ program, page })
+    renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+
+    // Both groups stay at level 3 under one level-2 section heading, so a
+    // second group never becomes a page-level peer.
+    await waitFor(() => {
+      assertHeadings(
+        [
+          { level: 1, name: page.title },
+          { level: 2, name: "Program Information" },
+          { level: 3, name: "Learn for Free" },
+          { level: 2, name: "About this Program" },
+          { level: 2, name: "What you'll learn" },
+          { level: 2, name: "Requirements" },
+          { level: 3, name: "Tracks: Complete 1 out of 2" },
+          { level: 3, name: "Capstone" },
+          { level: 2, name: "How you'll learn" },
+          { level: 2, name: "Prerequisites" },
+          { level: 2, name: "Meet your instructors" },
+          { level: 3, name: page.faculty[0].instructor_name },
+          { level: 2, name: "FAQs" },
+          ...page.faqs.map((faq) => ({ level: 3, name: faq.question })),
+          { level: 2, name: "What learners are saying" },
+        ],
+        { maxLevel: 3 },
+      )
+    })
+  })
+
+  test("Keeps course framing when child programs are displayed as courses", async () => {
+    const reqTree = new RequirementTreeBuilder()
+    const op = reqTree.addOperator({ operator: "all_of" })
+    op.addProgram()
+    op.addProgram()
+
+    const program = makeProgram({ req_tree: reqTree.serialize() })
+    const page = makePage({ program_details: program })
+    setupApis({
+      program,
+      page,
+      childProgramOverrides: { display_mode: DisplayModeEnum.Course },
+    })
+
+    renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+
+    const section = await screen.findByRole("region", { name: "Courses" })
+    expect(section).toHaveTextContent(
+      "To complete this program, you must take 2 required courses.",
+    )
+    expect(
+      await screen.findByTestId(TestIds.RequirementsRow),
+    ).toHaveTextContent("2 Courses to complete program")
+  })
+
+  test("Withholds course framing until the child programs resolve", async () => {
+    const reqTree = new RequirementTreeBuilder()
+    const op = reqTree.addOperator({ operator: "all_of" })
+    op.addProgram()
+
+    const program = makeProgram({ req_tree: reqTree.serialize() })
+    const page = makePage({ program_details: program })
+    const { childPrograms } = setupApis({
+      program,
+      page,
+      childProgramOverrides: { display_mode: DisplayModeEnum.Course },
+    })
+
+    // Until this resolves, a course-like child is indistinguishable from a
+    // true program: req_tree carries ids, not display_mode.
+    const childProgramsResponse = Promise.withResolvers<{
+      results: V2ProgramDetail[]
+    }>()
+    setMockResponse.get(
+      urls.programs.programsList({
+        id: getIdsFromReqTree(program.req_tree).programIds,
+        page_size: 1,
+      }),
+      childProgramsResponse.promise,
+    )
+
+    renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+
+    await screen.findByRole("region", { name: "Requirements" })
+    expect(screen.queryByRole("heading", { name: "Courses" })).toBe(null)
+    expect(screen.queryByTestId(TestIds.RequirementsRow)).toBe(null)
+
+    childProgramsResponse.resolve({ results: childPrograms })
+
+    await screen.findByRole("region", { name: "Courses" })
+    expect(await screen.findByTestId(TestIds.RequirementsRow)).toBeVisible()
+  })
+
+  test("Withholds course framing when the child programs request fails", async () => {
+    const reqTree = new RequirementTreeBuilder()
+    const op = reqTree.addOperator({ operator: "all_of" })
+    op.addProgram()
+
+    const program = makeProgram({ req_tree: reqTree.serialize() })
+    const page = makePage({ program_details: program })
+    setupApis({ program, page })
+
+    setMockResponse.get(
+      urls.programs.programsList({
+        id: getIdsFromReqTree(program.req_tree).programIds,
+        page_size: 1,
+      }),
+      { detail: "error" },
+      { code: 500 },
+    )
+
+    allowConsoleErrors()
+    const { queryClient } = renderWithProviders(
+      <ProgramPage readableId={program.readable_id} />,
+    )
+
+    await screen.findByRole("region", { name: "Requirements" })
+    // Wait on the query, not the DOM: the negatives below hold during loading
+    // too, so without this they would pass without the failure ever landing.
+    await waitFor(() => {
+      expect(
+        queryClient.getQueryState(
+          reqTreeChildQueries(program).programs.queryKey,
+        )?.status,
+      ).toBe("error")
+    })
+    expect(screen.queryByRole("heading", { name: "Courses" })).toBe(null)
+    expect(screen.queryByTestId(TestIds.RequirementsRow)).toBe(null)
+  })
+
+  // Interaction and active content are tested in InstructorsSection.test.tsx
+  test("Instructors section has expected content", async () => {
+    const program = makeProgram({ ...makeReqs() })
+    const page = makePage({ program_details: program })
+    invariant(page.faculty.length > 0)
+    setupApis({ program, page })
+    renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+
+    const section = await screen.findByRole("region", {
+      name: "Meet your instructors",
+    })
+    const buttons = page.faculty.map((faculty) =>
+      within(section).getByRole("button", { name: faculty.instructor_name }),
+    )
+    expect(buttons.length).toBe(page.faculty.length)
+  })
+
+  test("Renders an enrollment button", async () => {
+    // Pin a paid-only offering: the header and infobox CTAs both read "Enroll
+    // in Program" for "paid", whereas "free"/"both" use non-matching labels
+    // ("Start Learning" / "Earn Certificate"). Without pinning this, the
+    // default random enrollment mode makes the /enroll/i assertion flaky.
+    const program = makeProgram({
+      ...makeReqs(),
+      enrollment_modes: [
+        factories.courses.enrollmentMode({ requires_payment: true }),
+      ],
+    })
+    const page = makePage({ program_details: program })
+    setupApis({ program, page })
+    renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+
+    const buttons = await screen.findAllByRole("button", {
+      name: /enroll/i,
+    })
+    expect(buttons.length).toBeGreaterThan(0)
+  })
+
+  test("Shows a YouTube video in the sidebar when video_url is a YouTube URL", async () => {
+    const videoId = "abc123"
+    const program = makeProgram({ ...makeReqs() })
+    const page = makePage({
+      program_details: program,
+      video_url: `https://www.youtube.com/watch?v=${videoId}`,
+    })
+    setupApis({ program, page })
+    renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+
+    await screen.findByRole("heading", { name: page.title })
+    const iframe = document.querySelector(
+      `iframe[src="https://www.youtube.com/embed/${videoId}"]`,
+    )
+    expect(iframe).toBeInTheDocument()
+  })
+
+  test("Shows an image in the sidebar when video_url is null", async () => {
+    const program = makeProgram({ ...makeReqs() })
+    const page = makePage({ program_details: program, video_url: null })
+    setupApis({ program, page })
+    renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+
+    await screen.findByRole("heading", { name: page.title })
+    expect(
+      document.querySelector("iframe[src*='youtube.com/embed']"),
+    ).not.toBeInTheDocument()
+    expect(document.querySelector("img")).toBeInTheDocument()
+  })
+
+  test("Uses DEFAULT_RESOURCE_IMG when feature_image_src is falsy", async () => {
+    const program = makeProgram({
+      ...makeReqs(),
+      page: { feature_image_src: "" },
+    })
+    const page = makePage({ program_details: program, video_url: null })
+    setupApis({ program, page })
+    const { view } = renderWithProviders(
+      <ProgramPage readableId={program.readable_id} />,
+    )
+
+    await screen.findByRole("heading", { name: page.title })
+    const imgs = Array.from(view.container.querySelectorAll("img"))
+    expect(imgs.some((img) => img.src.includes("default_resource"))).toBe(true)
+  })
+
+  test.each([
+    { programs: [], pages: [makePage()] },
+    {
+      programs: [makeProgram({ ...makeReqs() })],
+      pages: [],
+    },
+  ])("Returns 404 if no program found", async ({ programs, pages }) => {
+    setMockResponse.get(
+      urls.programs.programsList({ readable_id: "readable_id", live: true }),
+      { results: programs },
+    )
+    setMockResponse.get(urls.pages.programPages("readable_id"), {
+      items: pages,
+    })
+
+    renderWithProviders(<ProgramPage readableId="readable_id" />)
+    await waitFor(() => {
+      expect(notFound).toHaveBeenCalled()
+    })
+  })
+
+  test("Returns 404 if program has live=false", async () => {
+    const program = makeProgram({ ...makeReqs() })
+    const page = makePage({ program_details: program })
+    // Simulate live=false: the API filters it out, returning empty results
+    setMockResponse.get(
+      urls.programs.programsList({
+        readable_id: program.readable_id,
+        live: true,
+      }),
+      { results: [] },
+    )
+    setMockResponse.get(urls.pages.programPages(program.readable_id), {
+      items: [page],
+    })
+    renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+    await waitFor(() => {
+      expect(notFound).toHaveBeenCalled()
+    })
+  })
+
+  test("clicking a requirement card fires course_card_clicked", async () => {
+    allowConsoleErrors()
+    const program = makeProgram({
+      ...makeReqs({ required: { count: 1, title: "Required" } }),
+    })
+    const page = makePage({ program_details: program })
+    const { courses } = setupApis({ program, page })
+    process.env.NEXT_PUBLIC_POSTHOG_API_KEY = "test-key"
+    mockCapture.mockClear()
+
+    renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+
+    const course = courses[0]
+    const card = await screen.findByRole("heading", { name: course.title })
+    await user.click(card)
+
+    expect(mockCapture).toHaveBeenCalledWith(
+      PostHogEvents.CourseCardClicked,
+      expect.objectContaining({
+        resourceId: course.id,
+        readableId: course.readable_id,
+      }),
+    )
+    delete process.env.NEXT_PUBLIC_POSTHOG_API_KEY
+  })
+
+  describe("Program type label", () => {
+    test.each(["MicroMasters®", "MicroMasters"])(
+      "Shows 'MicroMasters®' label when program_type is '%s'",
+      async (programType) => {
+        const program = makeProgram({
+          ...makeReqs(),
+          program_type: programType,
+        })
+        const page = makePage({ program_details: program })
+        setupApis({ program, page })
+        renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+
+        await screen.findByRole("heading", { name: page.title })
+        const programTypeLabel = screen.getByTestId("product-page-label")
+        expect(programTypeLabel).toBeInTheDocument()
+        expect(
+          within(programTypeLabel).getByText("MicroMasters®"),
+        ).toBeInTheDocument()
+      },
+    )
+
+    test("Shows no label for unbranded types like 'Series'", async () => {
+      const program = makeProgram({ ...makeReqs(), program_type: "Series" })
+      const page = makePage({ program_details: program })
+      setupApis({ program, page })
+      renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+
+      await screen.findByRole("heading", { name: page.title })
+      expect(screen.queryByTestId("product-page-label")).not.toBeInTheDocument()
+    })
+
+    test("Shows no label when program_type is null", async () => {
+      const program = makeProgram({ ...makeReqs(), program_type: null })
+      const page = makePage({ program_details: program })
+      setupApis({ program, page })
+      renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+
+      await screen.findByRole("heading", { name: page.title })
+      expect(screen.queryByTestId("product-page-label")).not.toBeInTheDocument()
+    })
+  })
+
+  describe("Stay Updated button", () => {
+    test("Shows button when the page has a hubspot form id", async () => {
+      const program = makeProgram({ ...makeReqs() })
+      const page = withHubspotFormId(
+        makePage({ program_details: program }),
+        STAY_UPDATED_FORM_ID,
+      )
+      setupApis({ program, page })
+      renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+
+      expect(
+        await screen.findByRole("button", { name: "Stay Updated" }),
+      ).toBeInTheDocument()
+    })
+
+    test.each([
+      { label: "the form id is blank", hubspotFormId: "" },
+      { label: "the form id is null", hubspotFormId: null },
+    ])("Hides button when $label", async ({ hubspotFormId }) => {
+      const program = makeProgram({ ...makeReqs() })
+      const page = withHubspotFormId(
+        makePage({ program_details: program }),
+        hubspotFormId,
+      )
+      setupApis({ program, page })
+      renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+
+      await screen.findByRole("heading", { name: page.title })
+      expect(
+        screen.queryByRole("button", { name: "Stay Updated" }),
+      ).not.toBeInTheDocument()
+    })
+  })
+
+  test("Renders without crashing when program_details.page is null", async () => {
+    const program = makeProgram({ ...makeReqs(), page: null })
+    const page = makePage({ program_details: program })
+    setupApis({ program, page })
+    renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+
+    await screen.findByRole("heading", { name: page.title })
+  })
+
+  describe("program tracks", () => {
+    const makeTrackedProgram = () => {
+      const root = new RequirementTreeBuilder()
+      const core = root.addOperator({ operator: "all_of", title: "Core" })
+      core.addCourse()
+      core.addCourse()
+      const container = root.addOperator({
+        operator: "min_number_of",
+        operator_value: "1",
+        title: "Tracks",
+      })
+      const general = container.addTrack({
+        title: "General",
+        description: "Broad foundation.",
+      })
+      const generalRequired = general.addOperator({
+        operator: "all_of",
+        title: "Required",
+      })
+      generalRequired.addCourse()
+      generalRequired.addCourse()
+      const methods = container.addTrack({
+        title: "Methods",
+        description: "Time-series methods.",
+      })
+      const methodsElectives = methods.addOperator({
+        operator: "min_number_of",
+        operator_value: "2",
+        title: "Electives",
+      })
+      methodsElectives.addCourse()
+      methodsElectives.addCourse()
+      methodsElectives.addCourse()
+      root.addOperator({ operator: "all_of", title: "Capstone" }).addCourse()
+      return makeProgram({ req_tree: root.serialize() })
+    }
+
+    test("Shows a tab per track between the other groups", async () => {
+      const program = makeTrackedProgram()
+      const page = makePage({ program_details: program })
+      setupApis({ program, page })
+      renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+
+      const section = await screen.findByRole("region", { name: "Courses" })
+      within(section).getByText(
+        "To complete this program, you must take 3 required courses. You must also complete 1 of 2 tracks.",
+      )
+      const headings = within(section)
+        .getAllByRole("heading", { level: 3 })
+        .map((h) => h.textContent)
+      expect(headings).toEqual(["Core", "Track courses", "Capstone"])
+
+      const tabs = within(section).getAllByRole("tab")
+      expect(tabs.map((tab) => tab.textContent)).toEqual(["General", "Methods"])
+      expect(tabs[0]).toHaveAttribute("aria-selected", "true")
+
+      const generalPanel = within(section).getByRole("tabpanel")
+      within(generalPanel).getByText("Broad foundation.")
+      await waitFor(() => {
+        expect(within(generalPanel).getAllByRole("listitem")).toHaveLength(2)
+      })
+
+      await user.click(tabs[1])
+      const methodsPanel = within(section).getByRole("tabpanel")
+      within(methodsPanel).getByText("Time-series methods.")
+      within(methodsPanel).getByText("Complete 2 out of 3 courses.")
+      expect(within(methodsPanel).getAllByRole("listitem")).toHaveLength(3)
+    })
+
+    test("Compares the tracks", async () => {
+      const program = makeTrackedProgram()
+      const page = makePage({ program_details: program })
+      const { courses } = setupApis({ program, page })
+      renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+
+      const compare = await screen.findByRole("region", {
+        name: "Compare the tracks",
+      })
+      const [core1, core2, general1, general2, m1, m2, m3, capstone] = courses
+      const included = within(compare)
+        .getByRole("heading", { name: "Included in every track" })
+        .closest("div")
+      invariant(included)
+      await waitFor(() => {
+        expect(
+          within(included)
+            .getAllByRole("listitem")
+            .map((li) => li.textContent),
+        ).toEqual([core1.title, core2.title, capstone.title])
+      })
+
+      const rows = within(compare)
+        .getAllByRole("heading", { level: 3 })
+        .filter((h) => h.textContent !== "Included in every track")
+        .map((h) => h.closest("li"))
+      expect(rows.map((row) => row?.querySelector("h3")?.textContent)).toEqual([
+        "General",
+        "Methods",
+      ])
+      const [generalRow, methodsRow] = rows
+      invariant(generalRow && methodsRow)
+      within(generalRow).getByText("Broad foundation.")
+      expect(
+        within(generalRow)
+          .getAllByRole("listitem")
+          .map((li) => li.textContent),
+      ).toEqual([general1.title, general2.title])
+      within(methodsRow).getByText("Complete 2 out of 3 courses.")
+      expect(
+        within(methodsRow)
+          .getAllByRole("listitem")
+          .map((li) => li.textContent),
+      ).toEqual([m1.title, m2.title, m3.title])
+    })
+
+    test("Shows a track's groups under sub-headings, and no callout without content", async () => {
+      const root = new RequirementTreeBuilder()
+      const container = root.addOperator({
+        operator: "min_number_of",
+        operator_value: "1",
+        title: "Tracks",
+      })
+      const plain = container.addTrack({ title: "Plain", description: "" })
+      plain.addOperator({ operator: "all_of", title: "Required" }).addCourse()
+      const mixed = container.addTrack({
+        title: "Mixed",
+        description: "Required plus electives.",
+      })
+      mixed.addOperator({ operator: "all_of", title: "Required" }).addCourse()
+      const electives = mixed.addOperator({
+        operator: "min_number_of",
+        operator_value: "1",
+        title: "Electives",
+      })
+      electives.addCourse()
+      electives.addCourse()
+      const program = makeProgram({ req_tree: root.serialize() })
+      const page = makePage({ program_details: program })
+      setupApis({ program, page })
+      renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+
+      const section = await screen.findByRole("region", { name: "Courses" })
+      const plainPanel = within(section).getByRole("tabpanel")
+      // The panel opens straight onto the course list.
+      expect(plainPanel.firstElementChild).toContainElement(
+        within(plainPanel).getByRole("list"),
+      )
+      expect(
+        within(plainPanel).queryByRole("heading", { level: 4 }),
+      ).not.toBeInTheDocument()
+
+      await user.click(within(section).getByRole("tab", { name: "Mixed" }))
+      const mixedPanel = within(section).getByRole("tabpanel")
+      within(mixedPanel).getByText("Required plus electives.")
+      expect(
+        within(mixedPanel)
+          .getAllByRole("heading", { level: 4 })
+          .map((h) => h.textContent),
+      ).toEqual(["Required", "Electives: Complete 1 out of 2"])
+      expect(
+        within(mixedPanel).queryByText("Complete 1 out of 2 courses."),
+      ).not.toBeInTheDocument()
+    })
+
+    test("Shows a requirement group's description under its title", async () => {
+      const root = new RequirementTreeBuilder()
+      root.addOperator({ operator: "all_of", title: "Core" }).addCourse()
+      const container = root.addOperator({
+        operator: "min_number_of",
+        operator_value: "1",
+        title: "Tracks",
+      })
+      const track = container.addTrack({ title: "Policy" })
+      track.addOperator({ operator: "all_of", title: "Required" }).addCourse()
+      const electives = track.addOperator({
+        operator: "min_number_of",
+        operator_value: "1",
+        title: "Electives",
+        description: "Pick the one closest to your work.",
+      })
+      electives.addCourse()
+      electives.addCourse()
+      root
+        .addOperator({
+          operator: "all_of",
+          title: "Capstone",
+          description: "Unlocks after all required courses are complete",
+        })
+        .addCourse()
+      const program = makeProgram({ req_tree: root.serialize() })
+      const page = makePage({ program_details: program })
+      setupApis({ program, page })
+      renderWithProviders(<ProgramPage readableId={program.readable_id} />)
+
+      const section = await screen.findByRole("region", { name: "Courses" })
+      const capstoneNote = within(section).getByText(
+        "Unlocks after all required courses are complete",
+      )
+      expect(
+        within(section).getByRole("heading", { name: "Capstone" })
+          .nextElementSibling,
+      ).toBe(capstoneNote)
+
+      const panel = within(section).getByRole("tabpanel")
+      const electivesNote = within(panel).getByText(
+        "Pick the one closest to your work.",
+      )
+      expect(
+        within(panel).getByRole("heading", { name: /^Electives/ })
+          .nextElementSibling,
+      ).toBe(electivesNote)
+      // Groups without a description get no extra line.
+      expect(
+        within(section).getByRole("heading", { name: "Core" })
+          .nextElementSibling?.tagName,
+      ).not.toBe("P")
+    })
+  })
+})

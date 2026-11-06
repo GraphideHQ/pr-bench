@@ -1,0 +1,707 @@
+import React from "react"
+import { SimpleMenu, Stack, styled } from "ol-components"
+import {
+  CardRoot,
+  CardTypeText,
+  CoursewareActionColumn,
+  CoursewareButton,
+  CoursewareButtonLink,
+  MenuButton,
+  Separator,
+  Ellipse,
+  SubtitleLink,
+  SubtitleLinkRoot,
+  TitleHeading,
+  TitleLink,
+  TitleText,
+  CourseDateSummary,
+  UpgradedBanner,
+} from "./CardShared"
+import {
+  EnrollmentStatus,
+  DashboardType,
+  getCertificateLink,
+  getDashboardEnrollmentStatus,
+  pickCertificateEnrollment,
+} from "./model/dashboardViewModel"
+import {
+  canOpenCourseware,
+  getCourseDateText,
+  hasCourseStaffRole,
+} from "./courseDateUtils"
+import { isVerifiedEnrollmentMode } from "@/common/mitxonline"
+import { RiArrowUpCircleLine, RiAwardLine, RiMore2Line } from "@remixicon/react"
+import { useReplaceBasketItem } from "@/common/mitxonline/useReplaceBasketItem"
+import { useComplianceGate } from "@/common/mitxonline/useComplianceGate"
+import {
+  useCreateB2bEnrollment,
+  useCreateVerifiedProgramEnrollment,
+} from "api/mitxonline-hooks/enrollment"
+import { SILENCE_ERROR_TOAST } from "api/mutation-meta"
+import { badRequestDetail } from "api/mutation-errors"
+import { isInPast, calendarDaysUntil, NoSSR } from "ol-utilities"
+import { SiblingRunsPanel, SiblingRunsToggle } from "./SiblingRunsAccordion"
+import { EnrollmentStatusIcon } from "./EnrollmentStatus"
+import { mitxUserQueries } from "api/mitxonline-hooks/user"
+import { useQuery } from "@tanstack/react-query"
+import { coursePageView } from "@/common/urls"
+import { getRunMenuItems } from "./runMenuItems"
+import { useOrderIdForRun } from "@/common/mitxonline/useOrderIdForResource"
+import type { SimpleMenuItem } from "ol-components"
+import {
+  CourseRunEnrollmentV3,
+  EnrollmentModeEnum,
+  V3UserProgramEnrollment,
+} from "@mitodl/mitxonline-api-axios/v3"
+import { ProgressBadge } from "./ProgressBadge"
+
+const formatUpgradeTime = (daysFloat: number) => {
+  if (daysFloat < 0) return ""
+  const days = Math.floor(daysFloat)
+  if (days > 1) {
+    return `${days} days remaining`
+  } else if (days === 1) {
+    return `${days} day remaining`
+  }
+  return "Less than a day remaining"
+}
+
+const RedEllipse = styled(Ellipse)(({ theme }) => ({
+  marginLeft: "6px",
+  marginRight: "6px",
+  backgroundColor: theme.custom.colors.red,
+}))
+
+const EnrolledTitleLink = styled(TitleLink)<{
+  enrollmentstatus: EnrollmentStatus
+}>(({ enrollmentstatus, theme }) => ({
+  color:
+    enrollmentstatus === EnrollmentStatus.Completed
+      ? theme.custom.colors.silverGrayDark
+      : theme.custom.colors.black,
+}))
+
+const UpgradeBanner: React.FC<
+  {
+    canUpgrade: boolean
+    certificateUpgradeDeadline?: string | null
+    certificateUpgradePrice?: string | null
+    productId?: number | null
+    /** The run the upgrade product is for, for the compliance check. */
+    runId?: number
+    isVerifiedProgramEnrollment?: boolean
+    readableId?: string
+    coursewareUrl?: string
+    programReadableIds?: string[]
+    programCoursewareId?: string
+    onUpgradeFailure?: (message: string) => void
+  } & React.HTMLAttributes<HTMLDivElement>
+> = ({
+  canUpgrade,
+  certificateUpgradeDeadline,
+  certificateUpgradePrice,
+  productId,
+  runId,
+  isVerifiedProgramEnrollment,
+  readableId,
+  coursewareUrl,
+  programReadableIds,
+  programCoursewareId,
+  onUpgradeFailure,
+  ...others
+}) => {
+  // Upgrade failures are caught below and surfaced via onUpgradeFailure (an
+  // inline alert in the parent), so suppress the global error toast. A caught
+  // mutateAsync rejection does NOT suppress the cache-level onError, so this
+  // opt-out is what prevents a double alert. `onUpgradeFailure` is optional —
+  // a caller that omits it has no error surface of its own, so only silence
+  // the toast when the callback is actually wired.
+  const upgradeErrorMeta = onUpgradeFailure ? { meta: SILENCE_ERROR_TOAST } : {}
+  const replaceBasketItem = useReplaceBasketItem(upgradeErrorMeta)
+  const createVerifiedProgramEnrollment =
+    useCreateVerifiedProgramEnrollment(upgradeErrorMeta)
+  const { mutateWithCompliance } = useComplianceGate()
+
+  const programRequestBody = programReadableIds?.length
+    ? programReadableIds
+    : programCoursewareId
+      ? [programCoursewareId]
+      : []
+  // Mirrors useEnrollmentHandler's gating: without a program identifier the
+  // verified-program-enrollment endpoint can't resolve which program to
+  // credit the upgrade against, so fall back to checkout instead of calling
+  // it with an empty request_body.
+  const canOneClickUpgrade = Boolean(
+    isVerifiedProgramEnrollment && readableId && programRequestBody.length > 0,
+  )
+
+  const handleUpgradeClick = async (e: React.MouseEvent<HTMLAnchorElement>) => {
+    e.preventDefault()
+
+    if (canOneClickUpgrade) {
+      // A dismissed compliance dialog is not an upgrade failure, so
+      // mutateWithCompliance skips onError for it. The checkout fallback below
+      // is gated inside useReplaceBasketItem instead, so it isn't checked twice.
+      await mutateWithCompliance(
+        createVerifiedProgramEnrollment,
+        { courserun_id: readableId!, request_body: programRequestBody },
+        {
+          onSuccess: () => {
+            if (coursewareUrl) {
+              window.location.href = coursewareUrl
+            }
+          },
+          onError: (error) => {
+            onUpgradeFailure?.(
+              badRequestDetail(error) ??
+                "There was a problem upgrading your enrollment. Please try again.",
+            )
+          },
+        },
+      )
+      return
+    }
+
+    if (!productId) return
+
+    try {
+      await replaceBasketItem.mutateAsync(
+        productId,
+        runId ? { type: "course_run", id: runId } : undefined,
+      )
+    } catch (error) {
+      onUpgradeFailure?.(
+        badRequestDetail(error) ??
+          "There was a problem adding the certificate to your cart.",
+      )
+    }
+  }
+
+  if (!canUpgrade || !certificateUpgradePrice || !productId) {
+    return null
+  }
+
+  // If deadline is provided, check it hasn't passed
+  if (certificateUpgradeDeadline && isInPast(certificateUpgradeDeadline)) {
+    return null
+  }
+
+  const calendarDays = certificateUpgradeDeadline
+    ? calendarDaysUntil(certificateUpgradeDeadline)
+    : null
+
+  return (
+    <SubtitleLinkRoot {...others}>
+      <SubtitleLink href="#" onClick={handleUpgradeClick}>
+        <RiArrowUpCircleLine size="16px" />
+        {canOneClickUpgrade
+          ? "Upgrade for certificate"
+          : `Upgrade for certificate - $${certificateUpgradePrice}`}
+      </SubtitleLink>
+      {calendarDays !== null && (
+        <>
+          <RedEllipse />
+          <NoSSR>
+            {/* This uses local time. */}
+            {formatUpgradeTime(calendarDays)}
+          </NoSSR>
+        </>
+      )}
+    </SubtitleLinkRoot>
+  )
+}
+
+const EnrolledCardShell = styled.div(({ theme }) => ({
+  border: `1px solid ${theme.custom.colors.lightGray2}`,
+  borderRadius: "8px",
+  overflow: "hidden",
+  backgroundColor: theme.custom.colors.white,
+  [theme.breakpoints.down("sm")]: {
+    display: "none",
+  },
+  '&[data-layout="compact"]': {
+    border: "none",
+    borderBottom: `1px solid ${theme.custom.colors.lightGray2}`,
+    borderRadius: "0px !important",
+    boxShadow: "none",
+    "&:first-of-type": {
+      borderTopLeftRadius: "8px !important",
+      borderTopRightRadius: "8px !important",
+    },
+    "&:last-of-type": {
+      borderBottomLeftRadius: "8px !important",
+      borderBottomRightRadius: "8px !important",
+      borderBottom: "none",
+    },
+  },
+}))
+
+const CardHeaderContent = styled.div({
+  padding: "16px",
+  display: "flex",
+  gap: "8px",
+  alignItems: "center",
+})
+
+const MobileAccordionWrapper = styled.div({
+  width: "100%",
+})
+
+type EnrolledCourseCardProps = {
+  enrollment: CourseRunEnrollmentV3
+  siblingEnrollments?: CourseRunEnrollmentV3[]
+  contractId?: number
+  ancestorContext?: {
+    programEnrollment?: V3UserProgramEnrollment
+    parentProgramReadableIds?: string[]
+    useVerifiedEnrollment?: boolean
+  }
+  layout?: "default" | "compact"
+  headingLevel?: "h2" | "h3" | "h4" | "h5" | "h6"
+  onUpgradeError?: (error: string) => void
+  isModule?: boolean
+  disabled?: boolean
+  Component?: React.ElementType
+  className?: string
+}
+
+export const EnrolledCourseCard = ({
+  enrollment,
+  siblingEnrollments,
+  contractId,
+  ancestorContext,
+  layout = "default",
+  headingLevel,
+  onUpgradeError,
+  isModule,
+  disabled = false,
+  Component,
+  className,
+}: EnrolledCourseCardProps) => {
+  const course = enrollment.run.course
+  const run = enrollment.run
+  const isCompact = layout === "compact"
+  const isContractPageResource = Boolean(
+    contractId ?? enrollment.b2b_contract_id,
+  )
+  const cardTypeLabelText =
+    isModule || isContractPageResource ? "Module" : "Course"
+  const cardTypeLabel =
+    !isModule && !isCompact ? (
+      <CardTypeText>{cardTypeLabelText}</CardTypeText>
+    ) : null
+  const mitxOnlineUser = useQuery(mitxUserQueries.me())
+  const isStaff = mitxOnlineUser.data?.is_staff
+  /**
+   * Enrollment mode does not decide this: a refund returns the learner to audit,
+   * and the receipt is where they confirm it went through. Whether an order
+   * exists is the only question, and the lookup answers it.
+   *
+   * Every card shares one `orders/history` query (same cache key), so this is a
+   * single request for the whole dashboard rather than one per card.
+   */
+  const receiptResolution = useOrderIdForRun(run?.id ?? null)
+  const title = isCompact ? course.title : run?.title || course.title
+  const coursewareUrl = run?.courseware_url
+  const certificateLink = getCertificateLink(
+    pickCertificateEnrollment([enrollment, ...(siblingEnrollments ?? [])])
+      ?.certificate?.link,
+    "course",
+  )
+  const enrollmentMode = enrollment?.enrollment_mode
+  const offerUpgrade = !isContractPageResource
+  const startDate = run?.start_date
+  const coursewareOpen = canOpenCourseware(startDate, {
+    isStaff,
+    isCourseStaff: hasCourseStaffRole(enrollment),
+  })
+  const endDate = run?.end_date
+  const hasEnded = endDate ? isInPast(endDate) : false
+  const hasCourseDateText = getCourseDateText(startDate, endDate) !== null
+  const courseDateText = (
+    <CourseDateSummary startDate={startDate} endDate={endDate} />
+  )
+  const canUpgrade =
+    offerUpgrade &&
+    !isVerifiedEnrollmentMode(enrollmentMode) &&
+    (run?.is_upgradable ?? false) &&
+    (enrollment?.run?.upgrade_product_is_active ?? false) &&
+    !hasEnded
+  const showUpgradeBanner =
+    canUpgrade &&
+    !!run?.upgrade_product_price &&
+    !!run?.upgrade_product_id &&
+    !(run?.upgrade_deadline && isInPast(run.upgrade_deadline))
+  const isVerifiedProgramEnrollment =
+    Boolean(ancestorContext?.useVerifiedEnrollment) ||
+    isVerifiedEnrollmentMode(
+      ancestorContext?.programEnrollment?.enrollment_mode,
+    )
+  const enrollmentStatus = getDashboardEnrollmentStatus({
+    type: DashboardType.CourseRunEnrollment,
+    data: enrollment,
+  })
+  /**
+   * A contract run can be a public run, so the learner may hold an audit
+   * enrollment in it from before they joined the contract. Continuing through
+   * the one-click B2B enroll API upgrades that enrollment under the contract.
+   */
+  const needsContractUpgrade =
+    isContractPageResource && enrollmentMode === EnrollmentModeEnum.Audit
+  // Failures are deliberately silent: the learner is still enrolled, so the
+  // click falls through to the courseware either way rather than trapping them
+  // on the dashboard behind an upgrade they may not be eligible for.
+  const createB2bEnrollment = useCreateB2bEnrollment({
+    meta: SILENCE_ERROR_TOAST,
+  })
+  const { mutateWithCompliance } = useComplianceGate()
+  const handleContinueClick = async (e: React.MouseEvent<HTMLElement>) => {
+    if (!needsContractUpgrade || !run?.courseware_id || !coursewareUrl) return
+    e.preventDefault()
+    if (createB2bEnrollment.isPending) return
+    const b2bProgramId =
+      ancestorContext?.parentProgramReadableIds?.[0] ??
+      ancestorContext?.programEnrollment?.program.readable_id
+    await mutateWithCompliance(
+      createB2bEnrollment,
+      {
+        readable_id: run.courseware_id,
+        B2BEnrollRequestRequest: b2bProgramId
+          ? { program_id: b2bProgramId }
+          : undefined,
+      },
+      {
+        onSettled: () => {
+          window.location.href = coursewareUrl
+        },
+      },
+    )
+  }
+  const upgradedAndIncomplete =
+    !isContractPageResource && isVerifiedEnrollmentMode(enrollmentMode)
+  const certButton = certificateLink ? (
+    <>
+      <SubtitleLink href={certificateLink}>
+        <RiAwardLine size="16px" />
+        {isCompact ? "Certificate" : "View Certificate"}
+      </SubtitleLink>
+    </>
+  ) : null
+  const certStatus = certButton ? (
+    certButton
+  ) : showUpgradeBanner ? (
+    <UpgradeBanner
+      data-testid="upgrade-root"
+      canUpgrade={showUpgradeBanner}
+      certificateUpgradeDeadline={run?.upgrade_deadline}
+      certificateUpgradePrice={run?.upgrade_product_price}
+      productId={run?.upgrade_product_id}
+      runId={run?.id}
+      isVerifiedProgramEnrollment={isVerifiedProgramEnrollment}
+      readableId={run?.courseware_id}
+      coursewareUrl={coursewareOpen ? (coursewareUrl ?? undefined) : undefined}
+      programReadableIds={ancestorContext?.parentProgramReadableIds}
+      programCoursewareId={
+        ancestorContext?.programEnrollment?.program.readable_id
+      }
+      onUpgradeFailure={onUpgradeError}
+    />
+  ) : upgradedAndIncomplete ? (
+    <UpgradedBanner />
+  ) : null
+
+  const metaSegments = [
+    hasCourseDateText ? courseDateText : null,
+    certStatus,
+  ].filter(Boolean)
+
+  const endDateAndUpgradeSection =
+    metaSegments.length > 0 ? (
+      <Stack direction="row" alignItems="center" gap="12px">
+        {metaSegments.map((segment, i) => (
+          <React.Fragment key={i}>
+            {i > 0 && <Ellipse />}
+            {segment}
+          </React.Fragment>
+        ))}
+      </Stack>
+    ) : null
+  const titleSection = (
+    <Stack gap="6px">
+      {coursewareUrl && coursewareOpen && !disabled ? (
+        <TitleHeading as={headingLevel}>
+          <EnrolledTitleLink
+            size="medium"
+            color="black"
+            href={coursewareUrl}
+            onClick={handleContinueClick}
+            enrollmentstatus={enrollmentStatus}
+          >
+            {title}
+          </EnrolledTitleLink>
+        </TitleHeading>
+      ) : (
+        <TitleText as={headingLevel}>{title}</TitleText>
+      )}
+      {endDateAndUpgradeSection}
+    </Stack>
+  )
+  const courseHasEnded = run?.end_date ? isInPast(run.end_date) : false
+  const isDisabled = disabled || !coursewareUrl || !coursewareOpen
+  const isCompleted =
+    enrollmentStatus === EnrollmentStatus.Completed || courseHasEnded
+  const buttonText = isCompleted ? "View" : "Continue"
+  const variant = isCompleted ? "secondary" : "primary"
+  const compactVariant = isCompleted ? "text" : "primary"
+  const ctaButton = isCompact ? (
+    isDisabled ? (
+      <CoursewareButton
+        size="small"
+        variant={compactVariant}
+        disabled
+        data-testid="courseware-button"
+        aria-label={`${buttonText} course: ${title}`}
+      >
+        {buttonText}
+      </CoursewareButton>
+    ) : (
+      <CoursewareButtonLink
+        size="small"
+        variant={compactVariant}
+        href={coursewareUrl ?? ""}
+        onClick={handleContinueClick}
+        aria-busy={createB2bEnrollment.isPending}
+        data-testid="courseware-button"
+        aria-label={`${buttonText} course: ${title}`}
+      >
+        {buttonText}
+      </CoursewareButtonLink>
+    )
+  ) : isDisabled ? (
+    <CoursewareButton
+      size="small"
+      variant={variant}
+      disabled
+      data-testid="courseware-button"
+      aria-label={`${buttonText} course: ${title}`}
+    >
+      {buttonText}
+    </CoursewareButton>
+  ) : (
+    <CoursewareButtonLink
+      size="small"
+      variant={variant}
+      href={coursewareUrl ?? ""}
+      onClick={handleContinueClick}
+      aria-busy={createB2bEnrollment.isPending}
+      data-testid="courseware-button"
+      aria-label={`${buttonText} course: ${title}`}
+    >
+      {buttonText}
+    </CoursewareButtonLink>
+  )
+  const buttonSection = isCompact ? (
+    <Stack direction="row" gap="8px" alignItems="center">
+      <CoursewareActionColumn direction="row" justifyContent="center">
+        {ctaButton}
+      </CoursewareActionColumn>
+    </Stack>
+  ) : (
+    ctaButton
+  )
+  const menuItems: SimpleMenuItem[] = []
+  const readableId = run?.course.readable_id
+  const detailsUrl = readableId ? coursePageView(readableId) : undefined
+
+  if (detailsUrl && !isContractPageResource) {
+    menuItems.push({
+      className: "dashboard-card-menu-item",
+      key: "view-course-details",
+      label: "View Course Details",
+      href: detailsUrl,
+    })
+  }
+
+  menuItems.push(...getRunMenuItems({ enrollment, title, receiptResolution }))
+
+  const menuButton = (
+    <MenuButton
+      size="small"
+      variant="text"
+      aria-label="More options"
+      status={enrollmentStatus}
+      hidden={menuItems.length === 0}
+      disabled={disabled}
+    >
+      <RiMore2Line />
+    </MenuButton>
+  )
+  // Rendered disabled rather than hidden so the CTA beside it doesn't shift.
+  const contextMenu = disabled ? (
+    menuButton
+  ) : (
+    <SimpleMenu items={menuItems} trigger={menuButton} />
+  )
+
+  const progressBadgeSection =
+    isModule && isCompact ? null : (
+      <Stack direction="row" gap="4px" alignItems="center">
+        <ProgressBadge
+          enrollmentStatus={enrollmentStatus}
+          startDate={startDate}
+          endDate={endDate}
+        />
+        <Separator />
+        {cardTypeLabel}
+      </Stack>
+    )
+
+  const hasMultipleRuns = (siblingEnrollments?.length ?? 0) > 0
+  const showEnrollmentStatusIcon =
+    !isContractPageResource && isModule && isCompact
+  const runCount = (siblingEnrollments?.length ?? 0) + 1
+  const [runsExpanded, setRunsExpanded] = React.useState(false)
+  const toggleRunsExpanded = () => setRunsExpanded((v) => !v)
+  const desktopRunsPanelId = `sibling-runs-panel-desktop-${enrollment.id}`
+  const mobileRunsPanelId = `sibling-runs-panel-mobile-${enrollment.id}`
+  const desktopRunsToggleId = `sibling-runs-toggle-desktop-${enrollment.id}`
+  const mobileRunsToggleId = `sibling-runs-toggle-mobile-${enrollment.id}`
+
+  return (
+    <>
+      {hasMultipleRuns ? (
+        <EnrolledCardShell
+          data-testid="enrollment-card-desktop"
+          data-layout={layout}
+          className={className}
+          as={Component}
+        >
+          <CardHeaderContent>
+            {showEnrollmentStatusIcon && (
+              <Stack>
+                <EnrollmentStatusIcon status={enrollmentStatus} />
+              </Stack>
+            )}
+            <Stack
+              gap="8px"
+              justifyContent="start"
+              alignItems="stretch"
+              flex={1}
+            >
+              {progressBadgeSection}
+              {titleSection}
+            </Stack>
+            <Stack
+              direction="column"
+              alignSelf="stretch"
+              gap="8px"
+              alignItems="flex-end"
+              justifyContent="space-between"
+            >
+              <Stack direction="row" gap="8px" alignItems="center">
+                {buttonSection}
+                {contextMenu}
+              </Stack>
+              <SiblingRunsToggle
+                runCount={runCount}
+                expanded={runsExpanded}
+                onClick={toggleRunsExpanded}
+                id={desktopRunsToggleId}
+                controls={desktopRunsPanelId}
+              />
+            </Stack>
+          </CardHeaderContent>
+          <SiblingRunsPanel
+            enrollment={enrollment}
+            siblingEnrollments={siblingEnrollments ?? []}
+            expanded={runsExpanded}
+            id={desktopRunsPanelId}
+            labelledBy={desktopRunsToggleId}
+            disabled={disabled}
+          />
+        </EnrolledCardShell>
+      ) : (
+        <CardRoot
+          screenSize="desktop"
+          data-testid="enrollment-card-desktop"
+          as={Component}
+          className={className}
+          layout={layout}
+        >
+          {showEnrollmentStatusIcon && (
+            <Stack alignSelf="start">
+              <EnrollmentStatusIcon status={enrollmentStatus} />
+            </Stack>
+          )}
+          <Stack gap="4px" justifyContent="start" alignItems="stretch" flex={1}>
+            {progressBadgeSection}
+            {titleSection}
+          </Stack>
+          <Stack direction="row" gap="8px" alignItems="center">
+            {buttonSection}
+            {contextMenu}
+          </Stack>
+        </CardRoot>
+      )}
+      <CardRoot
+        screenSize="mobile"
+        data-testid="enrollment-card-mobile"
+        as={Component}
+        className={className}
+        layout={layout}
+      >
+        <Stack direction="row" gap="8px" alignItems="flex-start" width="100%">
+          {showEnrollmentStatusIcon && (
+            <Stack alignSelf="start">
+              <EnrollmentStatusIcon status={enrollmentStatus} />
+            </Stack>
+          )}
+          <Stack direction="column" gap="8px" flex={1} minWidth={0}>
+            <Stack
+              direction="row"
+              justifyContent="space-between"
+              alignItems="stretch"
+              flex={1}
+              width="100%"
+            >
+              <Stack direction="column" gap="8px" flex={1}>
+                {titleSection}
+              </Stack>
+              {contextMenu}
+            </Stack>
+            <Stack
+              direction="row"
+              gap="8px"
+              alignItems="center"
+              justifyContent="flex-end"
+              width="100%"
+            >
+              {buttonSection}
+            </Stack>
+          </Stack>
+        </Stack>
+        {hasMultipleRuns && (
+          <MobileAccordionWrapper>
+            <Stack direction="row" justifyContent="flex-end" width="100%">
+              <SiblingRunsToggle
+                runCount={runCount}
+                expanded={runsExpanded}
+                onClick={toggleRunsExpanded}
+                id={mobileRunsToggleId}
+                controls={mobileRunsPanelId}
+              />
+            </Stack>
+            <SiblingRunsPanel
+              enrollment={enrollment}
+              siblingEnrollments={siblingEnrollments ?? []}
+              expanded={runsExpanded}
+              id={mobileRunsPanelId}
+              labelledBy={mobileRunsToggleId}
+              disabled={disabled}
+            />
+          </MobileAccordionWrapper>
+        )}
+      </CardRoot>
+    </>
+  )
+}

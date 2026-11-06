@@ -1,0 +1,585 @@
+import React from "react"
+import { screen } from "@testing-library/react"
+import {
+  renderWithProviders,
+  setMockResponse,
+  user,
+  waitFor,
+} from "@/test-utils"
+import { makeRequest } from "api/test-utils"
+import mockRouter from "next-router-mock"
+import { contractView, DASHBOARD_HOME } from "@/common/urls"
+import { DashboardAnnouncer } from "../DashboardAnnouncer"
+import {
+  factories as mitxOnlineFactories,
+  urls as mitxOnlineUrls,
+} from "api/mitxonline-test-utils"
+import { OrganizationCards } from "./OrganizationCards"
+import type { UserOrganizationPage } from "@mitodl/mitxonline-api-axios/v0"
+import { useFeatureFlagEnabled } from "posthog-js/react"
+
+jest.mock("posthog-js/react")
+const mockedUseFeatureFlagEnabled = jest.mocked(useFeatureFlagEnabled)
+
+describe("OrganizationCards", () => {
+  beforeEach(() => {
+    mockedUseFeatureFlagEnabled.mockReturnValue(true)
+  })
+
+  type SetupOptions = {
+    organizations?: UserOrganizationPage[]
+    isUserLoading?: boolean
+  }
+
+  const createOrganizations = (
+    count: number,
+    withContracts: boolean = true,
+  ): UserOrganizationPage[] => {
+    return Array.from({ length: count }, (_, i) =>
+      mitxOnlineFactories.organizations.organization({
+        id: i + 1,
+        name: `Test Organization ${i + 1}`,
+        description: `Description for org ${i + 1}`,
+        logo: `https://example.com/logo${i + 1}.png`,
+        slug: `org-test-${i + 1}`,
+        contracts: withContracts
+          ? [
+              mitxOnlineFactories.contracts.contract({
+                id: i + 1,
+                name: `Contract ${i + 1}`,
+                organization: i + 1,
+              }),
+            ]
+          : [],
+      }),
+    )
+  }
+
+  const setup = ({ organizations = [] }: SetupOptions = {}) => {
+    const mitxOnlineUser = mitxOnlineFactories.user.user({
+      b2b_organizations: organizations,
+    })
+
+    // Mock user API response
+    setMockResponse.get(mitxOnlineUrls.userMe.get(), mitxOnlineUser)
+
+    return renderWithProviders(<OrganizationCards />)
+  }
+
+  it("renders nothing when user has no B2B organizations", () => {
+    setup({ organizations: [] })
+
+    expect(screen.queryByText(/As a member of/)).not.toBeInTheDocument()
+  })
+
+  it("renders organization cards when user has B2B organizations and contracts", async () => {
+    const organizations = createOrganizations(2)
+
+    setup({ organizations })
+
+    for (const org of organizations) {
+      const elements = await screen.findAllByText((content, element) => {
+        return (
+          element?.textContent ===
+          `As a member of ${org.name} you have access to:`
+        )
+      })
+      expect(elements.length).toBeGreaterThan(0)
+      await screen.findByRole("heading", {
+        name: `As a member of ${org.name} you have access to:`,
+      })
+    }
+  })
+
+  it("displays organization logo", async () => {
+    const organization = mitxOnlineFactories.organizations.organization({
+      id: 1,
+      name: "Test Organization",
+      description: "Test Description",
+      logo: "https://example.com/logo1.png",
+      slug: "org-test",
+      sso_organization_id: null,
+      contracts: [
+        mitxOnlineFactories.contracts.contract({
+          id: 1,
+          organization: 1,
+          name: "Contract 1",
+        }),
+      ],
+    })
+    setup({ organizations: [organization] })
+
+    const image = await screen.findByAltText("")
+    expect(image).toBeInTheDocument()
+    // Next.js Image optimizes URLs, so we check that it contains the original URL
+    expect(image).toHaveAttribute(
+      "src",
+      expect.stringContaining("example.com%2Flogo1.png"),
+    )
+  })
+
+  describe("when organization has contracts", () => {
+    it("renders contract cards with correct information", async () => {
+      const organization = mitxOnlineFactories.organizations.organization({
+        id: 1,
+        name: "Test Organization",
+        description: "Test description",
+        logo: "https://example.com/logo.png",
+        slug: "org-test-org",
+        sso_organization_id: null,
+        contracts: [
+          mitxOnlineFactories.contracts.contract({
+            id: 1,
+            name: "Contract 1",
+            organization: 1,
+          }),
+          mitxOnlineFactories.contracts.contract({
+            id: 2,
+            name: "Contract 2",
+            organization: 1,
+          }),
+        ],
+      })
+
+      setup({ organizations: [organization] })
+
+      // Should show all contracts for the organization
+      // Each contract appears twice (mobile + desktop)
+      expect(
+        await screen.findAllByRole("link", { name: "Contract 1" }),
+      ).toHaveLength(2)
+      expect(screen.getAllByRole("link", { name: "Contract 2" })).toHaveLength(
+        2,
+      )
+      // Contract names should be wrapped in heading elements
+      expect(
+        screen.getAllByRole("heading", { name: "Contract 1" }),
+      ).toHaveLength(2)
+      expect(
+        screen.getAllByRole("heading", { name: "Contract 2" }),
+      ).toHaveLength(2)
+    })
+
+    it("renders Continue buttons with correct organization URLs", async () => {
+      const contract1 = mitxOnlineFactories.contracts.contract({
+        id: 1,
+        name: "Contract 1",
+        organization: 1,
+        slug: "contract-1",
+      })
+      const contract2 = mitxOnlineFactories.contracts.contract({
+        id: 2,
+        name: "Contract 2",
+        organization: 1,
+        slug: "contract-2",
+      })
+      const organization = mitxOnlineFactories.organizations.organization({
+        id: 1,
+        name: "Test Organization",
+        description: "Test description",
+        logo: "https://example.com/logo.png",
+        slug: "org-test-org",
+        sso_organization_id: null,
+        contracts: [contract1, contract2],
+      })
+
+      setup({ organizations: [organization] })
+
+      const continueButtons = await screen.findAllByRole("link", {
+        name: /^Continue /,
+      })
+      expect(continueButtons).toHaveLength(4) // 2 contracts × 2 screen sizes (mobile + desktop)
+
+      // Check that we have the correct number of buttons for each contract
+      const contract1Buttons = continueButtons.filter(
+        (button) =>
+          button.getAttribute("href") ===
+          "/dashboard/organization/test-org/contract/contract-1",
+      )
+      const contract2Buttons = continueButtons.filter(
+        (button) =>
+          button.getAttribute("href") ===
+          "/dashboard/organization/test-org/contract/contract-2",
+      )
+      expect(contract1Buttons).toHaveLength(2) // mobile + desktop
+      expect(contract2Buttons).toHaveLength(2) // mobile + desktop
+    })
+
+    it("renders cards for both mobile and desktop screen sizes", async () => {
+      const organization = mitxOnlineFactories.organizations.organization({
+        id: 1,
+        name: "Test Organization",
+        description: "Test description",
+        logo: "https://example.com/logo.png",
+        slug: "org-test-org",
+        sso_organization_id: null,
+        contracts: [
+          mitxOnlineFactories.contracts.contract({
+            id: 1,
+            name: "Contract 1",
+            organization: 1,
+          }),
+        ],
+      })
+
+      setup({ organizations: [organization] })
+
+      // Each contract should render twice (mobile + desktop)
+      const contractTexts = await screen.findAllByText("Contract 1")
+      expect(contractTexts).toHaveLength(2)
+    })
+  })
+
+  describe("when organization has no matching contracts", () => {
+    it("renders organization header but no contract cards", async () => {
+      const organization = mitxOnlineFactories.organizations.organization({
+        id: 1,
+        name: "Test Organization",
+        description: "Test description",
+        logo: "https://example.com/logo.png",
+        slug: "org-test-org",
+        sso_organization_id: null,
+        contracts: [], // No contracts for this organization
+      })
+
+      setup({ organizations: [organization] })
+
+      const elements = await screen.findAllByText((content, element) => {
+        return (
+          element?.textContent ===
+          "As a member of Test Organization you have access to:"
+        )
+      })
+      expect(elements.length).toBeGreaterThan(0)
+
+      expect(
+        screen.queryByRole("link", { name: /^Continue / }),
+      ).not.toBeInTheDocument()
+      expect(screen.queryByText("Other Org Contract")).not.toBeInTheDocument()
+    })
+  })
+
+  describe("with multiple organizations", () => {
+    it("renders all organizations with their respective contracts", async () => {
+      const org1 = mitxOnlineFactories.organizations.organization({
+        id: 1,
+        name: "Organization One",
+        description: "Test description",
+        logo: "https://example.com/logo1.png",
+        slug: "org-one",
+        sso_organization_id: null,
+        contracts: [
+          mitxOnlineFactories.contracts.contract({
+            id: 1,
+            name: "Org1 Contract 1",
+            organization: 1,
+            slug: "org1-contract-1",
+          }),
+          mitxOnlineFactories.contracts.contract({
+            id: 2,
+            name: "Org1 Contract 2",
+            organization: 1,
+            slug: "org1-contract-2",
+          }),
+        ],
+      })
+      const org2 = mitxOnlineFactories.organizations.organization({
+        id: 2,
+        name: "Organization Two",
+        description: "Test description",
+        logo: "https://example.com/logo2.png",
+        slug: "org-two",
+        sso_organization_id: null,
+        contracts: [
+          mitxOnlineFactories.contracts.contract({
+            id: 3,
+            name: "Org2 Contract 1",
+            organization: 2,
+            slug: "org2-contract-1",
+          }),
+        ],
+      })
+
+      setup({ organizations: [org1, org2] })
+
+      // Check organization headers
+      const org1Elements = await screen.findAllByText((content, element) => {
+        return (
+          element?.textContent ===
+          "As a member of Organization One you have access to:"
+        )
+      })
+      expect(org1Elements.length).toBeGreaterThan(0)
+
+      const org2Elements = screen.getAllByText((content, element) => {
+        return (
+          element?.textContent ===
+          "As a member of Organization Two you have access to:"
+        )
+      })
+      expect(org2Elements.length).toBeGreaterThan(0)
+
+      // Check contracts are displayed under correct organizations
+      await screen.findAllByText("Org1 Contract 1")
+      expect(screen.getAllByText("Org1 Contract 1")).toHaveLength(2) // mobile + desktop
+      expect(screen.getAllByText("Org1 Contract 2")).toHaveLength(2) // mobile + desktop
+      expect(screen.getAllByText("Org2 Contract 1")).toHaveLength(2) // mobile + desktop
+
+      // Check Continue button URLs point to correct organizations and contracts
+      const allButtons = screen.getAllByRole("link", { name: /^Continue / })
+
+      const org1Contract1Buttons = allButtons.filter(
+        (button) =>
+          button.getAttribute("href") ===
+          "/dashboard/organization/one/contract/org1-contract-1",
+      )
+      const org1Contract2Buttons = allButtons.filter(
+        (button) =>
+          button.getAttribute("href") ===
+          "/dashboard/organization/one/contract/org1-contract-2",
+      )
+      const org2Contract1Buttons = allButtons.filter(
+        (button) =>
+          button.getAttribute("href") ===
+          "/dashboard/organization/two/contract/org2-contract-1",
+      )
+
+      expect(org1Contract1Buttons).toHaveLength(2) // mobile + desktop
+      expect(org1Contract2Buttons).toHaveLength(2) // mobile + desktop
+      expect(org2Contract1Buttons).toHaveLength(2) // mobile + desktop
+    })
+  })
+
+  describe("edge cases", () => {
+    it("handles organization with undefined logo gracefully", async () => {
+      const organization = mitxOnlineFactories.organizations.organization({
+        id: 1,
+        name: "Test Organization",
+        logo: undefined,
+        slug: "org-test-org",
+        sso_organization_id: null,
+        contracts: [
+          mitxOnlineFactories.contracts.contract({
+            id: 1,
+            organization: 1,
+          }),
+        ],
+      })
+
+      setup({ organizations: [organization] })
+
+      const elements = await screen.findAllByText((content, element) => {
+        return (
+          element?.textContent ===
+          "As a member of Test Organization you have access to:"
+        )
+      })
+      expect(elements.length).toBeGreaterThan(0)
+
+      const image = screen.getByAltText("")
+      expect(image).toBeInTheDocument() // Should use default graduate logo
+    })
+
+    it("handles slug transformation correctly (removes 'org-' prefix)", async () => {
+      const contract = mitxOnlineFactories.contracts.contract({
+        id: 1,
+        name: "Test Contract",
+        organization: 1,
+        slug: "test-contract",
+      })
+      const organization = mitxOnlineFactories.organizations.organization({
+        id: 1,
+        name: "Test Organization",
+        description: "Test description",
+        logo: "https://example.com/logo.png",
+        slug: "org-my-company",
+        sso_organization_id: null,
+        contracts: [contract],
+      })
+
+      setup({ organizations: [organization] })
+
+      const continueButtons = await screen.findAllByRole("link", {
+        name: /^Continue /,
+      })
+      expect(continueButtons[0]).toHaveAttribute(
+        "href",
+        "/dashboard/organization/my-company/contract/test-contract",
+      )
+    })
+
+    it("handles slug without 'org-' prefix", async () => {
+      const contract = mitxOnlineFactories.contracts.contract({
+        id: 1,
+        name: "Test Contract",
+        organization: 1,
+        slug: "test-contract",
+      })
+      const organization = mitxOnlineFactories.organizations.organization({
+        id: 1,
+        name: "Test Organization",
+        description: "Test description",
+        logo: "https://example.com/logo.png",
+        slug: "my-company", // No 'org-' prefix
+        sso_organization_id: null,
+        contracts: [contract],
+      })
+
+      setup({ organizations: [organization] })
+
+      const continueButtons = await screen.findAllByRole("link", {
+        name: /^Continue /,
+      })
+      expect(continueButtons[0]).toHaveAttribute(
+        "href",
+        "/dashboard/organization/my-company/contract/test-contract",
+      )
+    })
+
+    it("filters contracts correctly when none match organization ID", async () => {
+      const organization = mitxOnlineFactories.organizations.organization({
+        id: 1,
+        name: "Test Organization",
+        description: "Test description",
+        logo: "https://example.com/logo.png",
+        slug: "org-test-org",
+        sso_organization_id: null,
+        contracts: [], // No contracts for this organization
+      })
+
+      setup({ organizations: [organization] })
+
+      const elements = await screen.findAllByText((content, element) => {
+        return (
+          element?.textContent ===
+          "As a member of Test Organization you have access to:"
+        )
+      })
+      expect(elements.length).toBeGreaterThan(0)
+
+      expect(screen.queryByText("Other Org Contract 1")).not.toBeInTheDocument()
+      expect(screen.queryByText("Other Org Contract 2")).not.toBeInTheDocument()
+      expect(
+        screen.queryByRole("link", { name: /^Continue / }),
+      ).not.toBeInTheDocument()
+    })
+  })
+
+  describe("data consent before navigating to a contract", () => {
+    const setupContract = (consented: boolean | null) => {
+      const contract = mitxOnlineFactories.contracts.contract({
+        name: "Consent Contract",
+        consented_to_data_sharing: consented,
+      })
+      const org = mitxOnlineFactories.organizations.organization({
+        slug: "org-consent-org",
+        contracts: [contract],
+      })
+      const mitxOnlineUser = mitxOnlineFactories.user.user({
+        b2b_organizations: [org],
+      })
+      setMockResponse.get(mitxOnlineUrls.userMe.get(), mitxOnlineUser)
+      setMockResponse.post(
+        mitxOnlineUrls.b2b.dataConsent(contract.id),
+        undefined,
+        { code: 204 },
+      )
+      renderWithProviders(
+        <DashboardAnnouncer>
+          <OrganizationCards />
+        </DashboardAnnouncer>,
+        { url: DASHBOARD_HOME },
+      )
+      return { contract, href: contractView("consent-org", contract.slug) }
+    }
+
+    const continueButton = async () =>
+      (
+        await screen.findAllByRole("link", {
+          name: "Continue Consent Contract",
+        })
+      )[0]
+
+    // Reports whether the app blocked the link, then stops jsdom from trying
+    // to navigate (it can't).
+    const clickIsBlocked = async (link: HTMLElement) => {
+      let blocked = false
+      const listener = (event: Event) => {
+        blocked = event.defaultPrevented
+        event.preventDefault()
+      }
+      window.addEventListener("click", listener)
+      await user.click(link)
+      window.removeEventListener("click", listener)
+      return blocked
+    }
+
+    it("follows the link without asking once consent is true", async () => {
+      setupContract(true)
+      const link = await continueButton()
+      expect(link).not.toHaveAttribute("data-disable-nprogress")
+      expect(await clickIsBlocked(link)).toBe(false)
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+    })
+
+    it("asks first, and navigates to the contract after agreeing", async () => {
+      const { contract, href } = setupContract(null)
+      const links = await screen.findAllByRole("link", {
+        name: /Consent Contract/,
+      })
+      for (const link of links) {
+        expect(link).toHaveAttribute("data-disable-nprogress", "true")
+      }
+      expect(await clickIsBlocked(await continueButton())).toBe(true)
+
+      await screen.findByRole("dialog")
+      expect(mockRouter.asPath).toBe(DASHBOARD_HOME)
+
+      await user.click(
+        screen.getByRole("checkbox", {
+          name: "I have read and consent to the data sharing described above.",
+        }),
+      )
+      await user.click(
+        screen.getByRole("button", { name: "Agree and continue" }),
+      )
+
+      await waitFor(() => expect(mockRouter.asPath).toBe(href))
+      expect(
+        screen.getByText("Consent recorded. Opening Consent Contract."),
+      ).toBeInTheDocument()
+      expect(makeRequest).toHaveBeenCalledWith(
+        expect.objectContaining({
+          method: "post",
+          url: mitxOnlineUrls.b2b.dataConsent(contract.id),
+          body: { consented: true },
+        }),
+      )
+    })
+
+    it("stays on dashboard home after declining", async () => {
+      const { contract } = setupContract(false)
+      await user.click(await continueButton())
+      await user.click(await screen.findByRole("button", { name: "Cancel" }))
+
+      await waitFor(() =>
+        expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+      )
+      expect(mockRouter.asPath).toBe(DASHBOARD_HOME)
+      expect(makeRequest).toHaveBeenCalledWith(
+        expect.objectContaining({
+          method: "post",
+          url: mitxOnlineUrls.b2b.dataConsent(contract.id),
+          body: { consented: false },
+        }),
+      )
+    })
+
+    it("follows the link without asking when the flag is off", async () => {
+      mockedUseFeatureFlagEnabled.mockReturnValue(false)
+      setupContract(null)
+      expect(await clickIsBlocked(await continueButton())).toBe(false)
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+    })
+  })
+})

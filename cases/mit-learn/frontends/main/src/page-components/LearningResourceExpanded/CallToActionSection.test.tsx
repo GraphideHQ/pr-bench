@@ -1,0 +1,524 @@
+import React from "react"
+import { screen, fireEvent } from "@testing-library/react"
+import { renderWithProviders } from "@/test-utils"
+import { faker } from "@faker-js/faker/locale/en"
+import { factories } from "api/test-utils"
+import type { LearningResource } from "api"
+import { DEFAULT_RESOURCE_IMG } from "ol-utilities"
+import { getByImageSrc, queryByImageSrc } from "ol-test-utilities"
+import { PlatformEnum, ResourceTypeEnum } from "api"
+import { useFeatureFlagEnabled } from "posthog-js/react"
+import { capturePostHog } from "@/common/analytics/posthog"
+import { FeatureFlags } from "@/common/feature_flags"
+import CallToActionSection from "./CallToActionSection"
+import type { ImageConfig } from "ol-components"
+import { kebabCase } from "lodash"
+
+jest.mock("posthog-js/react")
+jest.mock("@/common/analytics/posthog", () => ({
+  capturePostHog: jest.fn(),
+  initPostHog: jest.fn(),
+}))
+
+const mockCapturePostHog = jest.mocked(capturePostHog)
+const mockUseFeatureFlagEnabled = jest.mocked(useFeatureFlagEnabled)
+mockUseFeatureFlagEnabled.mockReturnValue(false)
+
+const IMG_CONFIG: ImageConfig = {
+  width: 385,
+  height: 200,
+}
+
+describe("CallToActionSection", () => {
+  describe("Resource URL rendering", () => {
+    it.each([
+      {
+        resourceType: ResourceTypeEnum.Course,
+        platform: PlatformEnum.Xpro,
+        resourceCategory: "Course",
+        expectedText: "Learn More",
+      },
+      {
+        resourceType: ResourceTypeEnum.Course,
+        platform: PlatformEnum.Ocw,
+        resourceCategory: "Course",
+        expectedText: "Access Course Materials",
+      },
+
+      {
+        resourceType: ResourceTypeEnum.Program,
+        platform: PlatformEnum.Xpro,
+        resourceCategory: "Program",
+        expectedText: "Learn More",
+      },
+      {
+        resourceType: ResourceTypeEnum.Video,
+        platform: PlatformEnum.Youtube,
+        resourceCategory: "Video",
+        expectedText: "Watch Video",
+      },
+      {
+        resourceType: ResourceTypeEnum.Video,
+        platform: PlatformEnum.Ocw,
+        resourceCategory: "Lecture Video",
+        expectedText: "Watch Video",
+      },
+      {
+        resourceType: ResourceTypeEnum.VideoPlaylist,
+        platform: PlatformEnum.Youtube,
+        resourceCategory: "Video Playlist",
+        expectedText: "Learn More",
+      },
+      {
+        resourceType: ResourceTypeEnum.Podcast,
+        expectedText: "Listen to Podcast",
+        resourceCategory: "Podcast",
+        platform: PlatformEnum.Podcast,
+      },
+      {
+        resourceType: ResourceTypeEnum.PodcastEpisode,
+        expectedText: "Listen to Podcast",
+        resourceCategory: "Podcast Episode",
+        platform: PlatformEnum.Podcast,
+      },
+      {
+        resourceType: ResourceTypeEnum.Document,
+        resourceCategory: "Article",
+        expectedText: "View Article",
+        platform: PlatformEnum.Climate,
+      },
+      {
+        resourceType: ResourceTypeEnum.Document,
+        expectedText: "Access Learning Material",
+        resourceCategory: "Assignment",
+        platform: PlatformEnum.Ocw,
+      },
+      {
+        resourceType: ResourceTypeEnum.Document,
+        resourceCategory: "Assignment",
+        expectedText: "Learn More",
+        platform: PlatformEnum.Xpro,
+      },
+    ])(
+      "renders link with correct text for $resourceType and platform $platform",
+      ({ resourceType, expectedText, platform, resourceCategory }) => {
+        const resource = factories.learningResources.resource({
+          resource_type: resourceType,
+          resource_category: resourceCategory,
+          platform: { code: platform },
+          playlists: [],
+          url: "https://example.com/resource",
+        })
+
+        renderWithProviders(
+          <CallToActionSection
+            imgConfig={IMG_CONFIG}
+            resource={resource}
+            shareUrl="https://learn.mit.edu/test"
+          />,
+        )
+
+        const link = screen.getByRole("link", { name: expectedText })
+        expect(link).toBeInTheDocument()
+      },
+    )
+  })
+
+  describe("resources whose canonical home is on Learn", () => {
+    const render = (resource: LearningResource) =>
+      renderWithProviders(
+        <CallToActionSection
+          imgConfig={IMG_CONFIG}
+          resource={resource}
+          shareUrl="https://learn.mit.edu/test"
+        />,
+      )
+
+    it.each([
+      {
+        label: "a video playlist",
+        resource: () =>
+          factories.learningResources.videoPlaylist({
+            resource_category: "Video Playlist",
+          }),
+        cta: "Learn More",
+      },
+      {
+        label: "a video in a playlist",
+        resource: () =>
+          factories.learningResources.video({
+            resource_category: "Video",
+            playlists: [String(faker.number.int({ min: 1, max: 1e6 }))],
+          }),
+        cta: "Watch Video",
+      },
+      {
+        label: "a podcast",
+        resource: () =>
+          factories.learningResources.podcast({
+            resource_category: "Podcast",
+          }),
+        cta: "Listen to Podcast",
+      },
+      {
+        label: "an episode with a parent podcast",
+        resource: () =>
+          factories.learningResources.podcastEpisode({
+            resource_category: "Podcast Episode",
+            podcast_episode: {
+              podcasts: [faker.number.int({ min: 1, max: 1e6 })],
+            },
+          }),
+        cta: "Listen to Podcast",
+      },
+    ])("sends $label to its learn_url", ({ resource: make, cta }) => {
+      const resource = make() as LearningResource
+      render(resource)
+      expect(screen.getByRole("link", { name: cta })).toHaveAttribute(
+        "href",
+        resource.learn_url,
+      )
+    })
+
+    it("sends an episode with no parent podcast to the source instead", () => {
+      // Its learn_url is this very drawer, so linking there would be circular.
+      const episode = factories.learningResources.podcastEpisode({
+        resource_category: "Podcast Episode",
+        url: "https://example.com/episode.mp3",
+        podcast_episode: { podcasts: [] },
+      }) as LearningResource
+      render(episode)
+      expect(
+        screen.getByRole("link", { name: "Listen to Podcast" }),
+      ).toHaveAttribute("href", expect.stringContaining("example.com/episode"))
+    })
+
+    it("sends a video outside every playlist to the source instead", () => {
+      const video = factories.learningResources.video({
+        resource_category: "Video",
+        url: "https://youtube.com/watch?v=abc",
+        playlists: [],
+      }) as LearningResource
+      render(video)
+      expect(screen.getByRole("link", { name: "Watch Video" })).toHaveAttribute(
+        "href",
+        expect.stringContaining("youtube.com/watch"),
+      )
+    })
+  })
+
+  describe("UTM parameters", () => {
+    it("adds UTM params to external URLs", () => {
+      const resource = factories.learningResources.resource({
+        resource_type: ResourceTypeEnum.Course,
+        platform: { code: PlatformEnum.Xpro },
+        title: "Test Course Title",
+        url: "https://external-site.com/course",
+      })
+
+      renderWithProviders(
+        <CallToActionSection
+          imgConfig={IMG_CONFIG}
+          resource={resource}
+          shareUrl="https://learn.mit.edu/test"
+        />,
+      )
+
+      const link = screen.getByRole("link", { name: "Learn More" })
+      expect(link).toHaveAttribute(
+        "href",
+        `https://external-site.com/course?utm_source=mit-learn&utm_medium=referral&utm_content=${kebabCase(resource.title)}`,
+      )
+    })
+
+    it("adds UTM params to URLs with existing query params", () => {
+      const resource = factories.learningResources.resource({
+        resource_type: ResourceTypeEnum.Course,
+        platform: { code: PlatformEnum.Xpro },
+        title: "Test Course",
+        url: "https://external-site.com/course?existing=param",
+      })
+
+      renderWithProviders(
+        <CallToActionSection
+          imgConfig={IMG_CONFIG}
+          resource={resource}
+          shareUrl="https://learn.mit.edu/test"
+        />,
+      )
+
+      const link = screen.getByRole("link", { name: "Learn More" })
+      const href = link.getAttribute("href")
+      expect(href).toContain("utm_source=mit-learn")
+      expect(href).toContain("utm_medium=referral")
+      expect(href).toContain("utm_content=test-course")
+      expect(href).toContain("existing=param")
+    })
+
+    it("does NOT add UTM params to internal URLs", () => {
+      const NEXT_PUBLIC_ORIGIN = process.env.NEXT_PUBLIC_ORIGIN
+      const resource = factories.learningResources.resource({
+        resource_type: ResourceTypeEnum.Course,
+        platform: { code: PlatformEnum.Xpro },
+        title: "Test Course",
+        url: `${NEXT_PUBLIC_ORIGIN}/internal/page`,
+      })
+
+      renderWithProviders(
+        <CallToActionSection
+          imgConfig={IMG_CONFIG}
+          resource={resource}
+          shareUrl="https://learn.mit.edu/test"
+        />,
+      )
+
+      const link = screen.getByRole("link", { name: "Learn More" })
+      const href = link.getAttribute("href")
+      expect(href).not.toContain("utm_source")
+      expect(href).not.toContain("utm_medium")
+      expect(href).not.toContain("utm_content")
+      expect(href).toBe(`${NEXT_PUBLIC_ORIGIN}/internal/page`)
+    })
+
+    it("does NOT add UTM params to relative URLs", () => {
+      const resource = factories.learningResources.resource({
+        resource_type: ResourceTypeEnum.Course,
+        platform: { code: PlatformEnum.Xpro },
+        title: "Test Course",
+        url: "/relative/path",
+      })
+
+      renderWithProviders(
+        <CallToActionSection
+          imgConfig={IMG_CONFIG}
+          resource={resource}
+          shareUrl="https://learn.mit.edu/test"
+        />,
+      )
+
+      const link = screen.getByRole("link", { name: "Learn More" })
+      const href = link.getAttribute("href")
+      expect(href).not.toContain("utm_source")
+      expect(href).not.toContain("utm_medium")
+      expect(href).not.toContain("utm_content")
+      expect(href).toBe("/relative/path")
+    })
+  })
+
+  describe("MITx Online product pages", () => {
+    it("links to the resource's Learn product URL without rewriting it", () => {
+      // MITx Online product-page URLs are supplied by the backend ETL in
+      // `resource.url`; the component links to them directly rather than
+      // deriving a path from readable_id. The URL is same-origin (internal),
+      // so it gets no UTM params.
+      const NEXT_PUBLIC_ORIGIN = process.env.NEXT_PUBLIC_ORIGIN
+      const productUrl = `${NEXT_PUBLIC_ORIGIN}/courses/product-page-slug`
+      const resource = factories.learningResources.resource({
+        platform: { code: PlatformEnum.Mitxonline },
+        resource_type: ResourceTypeEnum.Course,
+        readable_id: "a-different-readable-id",
+        url: productUrl,
+      })
+
+      renderWithProviders(
+        <CallToActionSection
+          imgConfig={IMG_CONFIG}
+          resource={resource}
+          shareUrl="https://learn.mit.edu/test"
+        />,
+      )
+
+      const link = screen.getByRole("link", { name: "Learn More" })
+      expect(link).toHaveAttribute("href", productUrl)
+      expect(link.getAttribute("href")).not.toContain("utm_")
+    })
+  })
+
+  describe("Image fallback chain", () => {
+    const render = (
+      resource: ReturnType<typeof factories.learningResources.resource>,
+    ) =>
+      renderWithProviders(
+        <CallToActionSection
+          imgConfig={IMG_CONFIG}
+          resource={resource}
+          shareUrl="https://learn.mit.edu/test"
+        />,
+      )
+
+    it("shows content_files image when resource.image is null for Document/Video", () => {
+      const contentFileImageSrc = "https://example.com/content-file.jpg"
+      const resource = factories.learningResources.resource({
+        resource_type: ResourceTypeEnum.Document,
+        image: null,
+        content_files: [
+          factories.learningResources.contentFile({
+            image_src: contentFileImageSrc,
+          }),
+        ],
+      })
+
+      const { view } = render(resource)
+
+      getByImageSrc(view.container, contentFileImageSrc)
+    })
+
+    it("falls back to the original image, then DEFAULT_RESOURCE_IMG, when image.url fails", () => {
+      const primaryUrl = "https://example.com/primary.jpg"
+      const resource = factories.learningResources.resource({
+        resource_type: ResourceTypeEnum.Document,
+        image: { url: primaryUrl, alt: "primary" },
+      })
+
+      const { view } = render(resource)
+      const raw = { nextJsOriginalSrc: false }
+      expect(queryByImageSrc(view.container, primaryUrl, raw)).toBeNull()
+      // Optimized image fails: retry the original, loaded directly
+      fireEvent.error(getByImageSrc(view.container, primaryUrl))
+      const original = getByImageSrc(view.container, primaryUrl, raw)
+      // Original fails too: use the default
+      fireEvent.error(original)
+      getByImageSrc(view.container, DEFAULT_RESOURCE_IMG)
+    })
+  })
+
+  describe("OCW product pages", () => {
+    const ocwSlug =
+      "16-01-unified-engineering-i-ii-iii-iv-fall-2005-spring-2006"
+    const ocwUrl = `https://ocw.mit.edu/courses/${ocwSlug}/`
+
+    const ocwResource: typeof factories.learningResources.resource = (
+      overrides,
+    ) => {
+      return factories.learningResources.resource({
+        platform: { code: PlatformEnum.Ocw },
+        url: ocwUrl,
+        ...overrides,
+      })
+    }
+
+    it("links to internal OCW page when flag is ON for OCW course", () => {
+      mockUseFeatureFlagEnabled.mockImplementation(
+        (flag) => flag === FeatureFlags.OcwProductPages,
+      )
+      const resource = ocwResource({ resource_type: ResourceTypeEnum.Course })
+
+      renderWithProviders(
+        <CallToActionSection
+          imgConfig={IMG_CONFIG}
+          resource={resource}
+          shareUrl="https://learn.mit.edu/test"
+        />,
+      )
+
+      const link = screen.getByRole("link", { name: "Access Course Materials" })
+      expect(link).toHaveAttribute("href", `/courses/o/${ocwSlug}`)
+      expect(link.getAttribute("href")).not.toContain("utm_")
+    })
+
+    it("uses external URL with UTM params when flag is OFF for OCW course", () => {
+      mockUseFeatureFlagEnabled.mockReturnValue(false)
+      const resource = ocwResource({ resource_type: ResourceTypeEnum.Course })
+
+      renderWithProviders(
+        <CallToActionSection
+          imgConfig={IMG_CONFIG}
+          resource={resource}
+          shareUrl="https://learn.mit.edu/test"
+        />,
+      )
+
+      const link = screen.getByRole("link", { name: "Access Course Materials" })
+      const href = link.getAttribute("href")
+      expect(href).toContain("ocw.mit.edu")
+      expect(href).toContain("utm_source=mit-learn")
+      expect(href).toContain("utm_medium=referral")
+    })
+
+    it("does not transform non-OCW course URL when only OcwProductPages flag is ON", () => {
+      mockUseFeatureFlagEnabled.mockImplementation(
+        (flag) => flag === FeatureFlags.OcwProductPages,
+      )
+      const resource = factories.learningResources.resource({
+        platform: { code: PlatformEnum.Xpro },
+        resource_type: ResourceTypeEnum.Course,
+        url: "https://xpro.mit.edu/courses/some-course/",
+      })
+
+      renderWithProviders(
+        <CallToActionSection
+          imgConfig={IMG_CONFIG}
+          resource={resource}
+          shareUrl="https://learn.mit.edu/test"
+        />,
+      )
+
+      const link = screen.getByRole("link", { name: "Learn More" })
+      const href = link.getAttribute("href")
+      expect(href).toContain("xpro.mit.edu")
+      expect(href).not.toContain("/courses/o/")
+    })
+
+    it("transforms OCW non-course URL when flag is ON", () => {
+      mockUseFeatureFlagEnabled.mockImplementation(
+        (flag) => flag === FeatureFlags.OcwProductPages,
+      )
+      const resource = ocwResource({
+        resource_type: ResourceTypeEnum.Video,
+        resource_category: "Lecture Video",
+        url: `${ocwUrl}resources/abc-def`,
+      })
+
+      renderWithProviders(
+        <CallToActionSection
+          imgConfig={IMG_CONFIG}
+          resource={resource}
+          shareUrl="https://learn.mit.edu/test"
+        />,
+      )
+
+      const link = screen.getByRole("link", {
+        name: "Watch Video",
+      })
+      const href = link.getAttribute("href")
+      expect(href).toContain(`/courses/o/${ocwSlug}/resources/abc-def`)
+      expect(href).not.toContain("ocw.mit.edu")
+      expect(href).not.toContain("utm_")
+    })
+  })
+
+  describe("PostHog integration", () => {
+    it("calls posthog.capture when CTA link is clicked", () => {
+      const originalPostHogKey = process.env.NEXT_PUBLIC_POSTHOG_API_KEY
+      process.env.NEXT_PUBLIC_POSTHOG_API_KEY = "test-key"
+
+      const resource = factories.learningResources.resource({
+        resource_type: ResourceTypeEnum.Course,
+        url: "https://example.com/course",
+      })
+
+      renderWithProviders(
+        <CallToActionSection
+          imgConfig={IMG_CONFIG}
+          resource={resource}
+          shareUrl="https://learn.mit.edu/test"
+        />,
+      )
+
+      const link = screen.getByRole("link", { name: "Learn More" })
+      link.click()
+
+      expect(mockCapturePostHog).toHaveBeenCalledWith("cta_clicked", {
+        resource,
+        label: "Learn More",
+      })
+
+      // Restore original value
+      if (originalPostHogKey) {
+        process.env.NEXT_PUBLIC_POSTHOG_API_KEY = originalPostHogKey
+      } else {
+        delete process.env.NEXT_PUBLIC_POSTHOG_API_KEY
+      }
+    })
+  })
+})

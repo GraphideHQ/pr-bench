@@ -1,0 +1,151 @@
+/**
+ * Dialog / modal overlay.
+ * @element bq-dialog
+ * @prop {boolean} open
+ * @prop {string}  title
+ * @prop {string}  size        - sm | md | lg | xl | full
+ * @prop {boolean} dismissible - Show close button
+ * @slot        - Dialog body
+ * @slot footer - Dialog footer actions
+ * @fires bq-close
+ */
+import type { ComponentDefinition } from '@bquery/bquery/component';
+import { component, css, html } from '@bquery/bquery/component';
+import { escapeHtml } from '@bquery/bquery/security';
+import { t } from '../../i18n/index.js';
+import { bind, host, release } from '../../utils/component.js';
+import type { OverlayFocusState } from '../../utils/dom.js';
+import {
+  cleanupOverlayFocus,
+  createAnimatedClose,
+  uniqueId,
+  updateOverlayFocus,
+} from '../../utils/dom.js';
+import { iconCss } from '../../utils/icons.js';
+import { baseStyles, focusRing, reset } from '../../utils/styles.js';
+
+type BqDialogProps = {
+  open: boolean;
+  title: string;
+  size: string;
+  dismissible: boolean;
+};
+type BqDialogState = { titleId: string };
+const NORMAL_DURATION = '200ms';
+
+const definition: ComponentDefinition<BqDialogProps, BqDialogState> = {
+  props: {
+    open: { type: Boolean, default: false },
+    title: { type: String, default: '' },
+    size: { type: String, default: 'md' },
+    dismissible: { type: Boolean, default: true },
+  },
+  state: {
+    titleId: '',
+  },
+  styles: css`
+    ${baseStyles}
+    ${reset}
+    ${focusRing}
+    ${iconCss('x')}
+    :host { display: block; }
+    :host(:not([open])) .overlay { display: none; }
+    .overlay {
+      position: fixed; inset: 0; z-index: var(--bq-z-modal,400);
+      background: var(--bq-overlay-backdrop,rgba(15,23,42,0.5));
+      display: flex; align-items: center; justify-content: center;
+      padding: var(--bq-space-4,1rem);
+      animation: fadeIn var(--bq-duration-normal,200ms) var(--bq-easing-decelerate);
+    }
+    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    .dialog {
+      background: var(--bq-surface-overlay,#fff); border-radius: var(--bq-radius-2xl,1rem);
+      box-shadow: var(--bq-shadow-xl); width: 100%;
+      max-height: calc(100vh - 4rem); display: flex; flex-direction: column;
+      animation: scaleIn var(--bq-duration-normal,200ms) var(--bq-easing-spring);
+      font-family: var(--bq-font-family-sans); overflow: hidden;
+    }
+    @keyframes scaleIn { from { transform: scale(0.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+    :host([data-closing]) .overlay { animation: dlgFadeOut var(--bq-duration-normal,200ms) var(--bq-easing-accelerate) forwards; }
+    :host([data-closing]) .dialog { animation: dlgScaleOut var(--bq-duration-normal,200ms) var(--bq-easing-accelerate) forwards; }
+    @keyframes dlgFadeOut { to { opacity: 0; } }
+    @keyframes dlgScaleOut { to { transform: scale(0.95); opacity: 0; } }
+    .dialog[data-size="sm"] { max-width: 28rem; }
+    .dialog[data-size="md"] { max-width: 36rem; }
+    .dialog[data-size="lg"] { max-width: 48rem; }
+    .dialog[data-size="xl"] { max-width: 64rem; }
+    .dialog[data-size="full"] { max-width: 100vw; max-height: 100vh; border-radius: 0; }
+    .header { display: flex; align-items: center; justify-content: space-between; padding: var(--bq-space-5,1.25rem) var(--bq-space-6,1.5rem); border-bottom: 1px solid var(--bq-border-base,#e2e8f0); flex-shrink: 0; }
+    .header-title { font-size: var(--bq-font-size-lg,1.125rem); font-weight: var(--bq-font-weight-semibold,600); color: var(--bq-text-base,#0f172a); margin: 0; flex: 1; }
+    .close-btn { display: inline-flex; align-items: center; justify-content: center; width: 2rem; height: 2rem; background: none; border: none; cursor: pointer; color: var(--bq-text-muted,#475569); border-radius: var(--bq-radius-md,0.375rem); font-size: 1rem; flex-shrink: 0; transition: background var(--bq-duration-fast); }
+    .close-btn:hover { background: var(--bq-bg-muted,#f1f5f9); color: var(--bq-text-base,#0f172a); }
+    .close-btn .icon, .close-btn { --bq-icon-size: 1.125rem; }
+    .close-btn:focus-visible { outline: 2px solid transparent; box-shadow: var(--bq-focus-ring); }
+    .body { padding: var(--bq-space-6,1.5rem); overflow-y: auto; flex: 1; color: var(--bq-text-muted,#475569); font-size: var(--bq-font-size-md,1rem); line-height: var(--bq-line-height-relaxed,1.625); }
+    .footer { padding: var(--bq-space-4,1rem) var(--bq-space-6,1.5rem); border-top: 1px solid var(--bq-border-base,#e2e8f0); display: flex; align-items: center; justify-content: flex-end; gap: var(--bq-space-3,0.75rem); flex-shrink: 0; background: var(--bq-bg-subtle,#f8fafc); }
+    @media (prefers-reduced-motion: reduce) {
+      .overlay, .dialog { animation: none !important; }
+      .close-btn { transition: none; }
+    }
+  `,
+  connected() {
+    const self = host<BqDialogState>(this);
+    const scope = bind(self);
+    if (!self.getState<string>('titleId'))
+      self.setState('titleId', uniqueId('bq-dlg-title'));
+
+    const close = createAnimatedClose({
+      host: self,
+      scope,
+      panelSelector: '.overlay',
+      fallbackDuration: NORMAL_DURATION,
+    });
+
+    scope.on(document, 'keydown', (e) => {
+      if ((e as KeyboardEvent).key === 'Escape' && self.hasAttribute('open'))
+        close();
+    });
+    scope.on(self.shadowRoot, 'click', (e) => {
+      if ((e.target as Element).classList.contains('overlay')) close();
+    });
+    scope.on(self.shadowRoot, 'click', (e) => {
+      if ((e.target as Element).closest('.close-btn')) close();
+    });
+  },
+  disconnected() {
+    cleanupOverlayFocus(this as unknown as OverlayFocusState);
+    release(this);
+  },
+  updated() {
+    updateOverlayFocus(this, this as unknown as OverlayFocusState, '.dialog');
+  },
+  render({ props, state }) {
+    const titleId = state.titleId || 'bq-dlg-title';
+    return html`
+      <div part="overlay" class="overlay" role="presentation">
+        <div
+          part="dialog"
+          class="dialog"
+          data-size="${escapeHtml(props.size)}"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="${escapeHtml(titleId)}"
+          tabindex="-1"
+        >
+          <div class="header" part="header">
+            <h2 class="header-title" id="${escapeHtml(titleId)}" part="title">
+              ${escapeHtml(props.title)}
+            </h2>
+            ${props.dismissible
+              ? `<button class="close-btn" type="button" aria-label="${t('dialog.close')}" part="close"><span class="icon" data-icon="x" aria-hidden="true"></span></button>`
+              : ''}
+          </div>
+          <div class="body" part="body"><slot></slot></div>
+          <div class="footer" part="footer"><slot name="footer"></slot></div>
+        </div>
+      </div>
+    `;
+  },
+};
+
+component<BqDialogProps, BqDialogState>('bq-dialog', definition);

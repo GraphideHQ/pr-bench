@@ -1,0 +1,2755 @@
+"""Tests for Canvas ETL functionality"""
+
+import zipfile
+from datetime import timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+from defusedxml import ElementTree
+from freezegun import freeze_time
+
+from learning_resources.constants import (
+    TUTOR_PROBLEM_TYPE,
+    TUTOR_SOLUTION_TYPE,
+    LearningResourceType,
+    PlatformType,
+)
+from learning_resources.etl.canvas import (
+    run_for_canvas_archive,
+    sync_canvas_archive,
+    transform_canvas_content_files,
+    transform_canvas_problem_files,
+)
+from learning_resources.etl.canvas_utils import (
+    _compact_element,
+    canvas_course_checksum,
+    canvas_course_folder,
+    get_published_items,
+    is_file_published,
+    parse_canvas_files,
+    parse_canvas_settings,
+    parse_files_meta,
+    parse_module_meta,
+    parse_web_content,
+)
+from learning_resources.etl.constants import ETLSource
+from learning_resources.etl.loaders import load_content_files
+from learning_resources.etl.olx import get_edx_module_id
+from learning_resources.etl.utils import process_olx_path
+from learning_resources.factories import (
+    ContentFileFactory,
+    LearningResourceFactory,
+    LearningResourcePlatformFactory,
+    LearningResourceRunFactory,
+    TutorProblemFileFactory,
+)
+from learning_resources.models import ContentFile, LearningResource
+from main.utils import now_in_utc
+
+pytestmark = pytest.mark.django_db
+
+
+DEFAULT_SETTINGS_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <course identifier="gfef28ec71f16246c57edfeef25b26a54"
+    xmlns="http://canvas.instructure.com/xsd/cccv1p0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://canvas.instructure.com/xsd/cccv1p0
+    https://canvas.instructure.com/xsd/cccv1p0.xsd">
+        <title>Test Course Title</title>
+        <course_code>TEST-101</course_code>
+        <other_field>Other Value</other_field>
+    </course>
+"""
+
+DEFAULT_MODULE_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <modules xmlns="http://canvas.instructure.com/xsd/cccv1p0">
+        <module>
+            <title>Module 1</title>
+            <items>
+                <item>
+                    <workflow_state>active</workflow_state>
+                    <title>Item 1</title>
+                    <identifierref>RES1</identifierref>
+                    <content_type>resource</content_type>
+                </item>
+                <item>
+                    <workflow_state>unpublished</workflow_state>
+                    <title>Item 2</title>
+                    <identifierref>RES2</identifierref>
+                    <content_type>resource</content_type>
+                </item>
+            </items>
+        </module>
+    </modules>
+"""
+
+DEFAULT_MANIFEST_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+        <resources>
+            <resource identifier="RES1" type="webcontent">
+                <file href="file1.html"/>
+            </resource>
+            <resource identifier="RES2" type="webcontent">
+                <file href="file2.html"/>
+            </resource>
+        </resources>
+        <organizations>
+            <organization>
+                <item identifierref="RES1">
+                    <title>Item 1</title>
+                </item>
+                <item identifierref="RES2">
+                    <title>Item 2</title>
+                </item>
+            </organization>
+        </organizations>
+    </manifest>
+"""
+
+
+@pytest.fixture
+def sample_pdf_content():
+    return Path("test_pdfs/notes.pdf").read_bytes()
+
+
+@pytest.fixture(autouse=True)
+def canvas_platform():
+    """Fixture for the canvas platform"""
+    return LearningResourcePlatformFactory.create(code=PlatformType.canvas.name)
+
+
+@pytest.fixture
+def canvas_settings_zip(tmp_path):
+    # Create a minimal XML for course_settings.xml
+    xml_content = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <course>
+        <title>Test Course Title</title>
+        <course_code>TEST-101</course_code>
+        <other_field>Other Value</other_field>
+    </course>
+    """
+    zip_path = tmp_path / "test_canvas_course.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("course_settings/course_settings.xml", xml_content)
+    return zip_path
+
+
+def test_parse_canvas_settings_returns_expected_dict(canvas_settings_zip):
+    """
+    Test that parse_canvas_settings returns a dictionary with expected attributes
+    """
+    attrs = parse_canvas_settings(canvas_settings_zip)
+    assert attrs["title"] == "Test Course Title"
+    assert attrs["course_code"] == "TEST-101"
+    assert attrs["other_field"] == "Other Value"
+
+
+def test_parse_canvas_settings_missing_fields(tmp_path):
+    """
+    Test that parse_canvas_settings handles missing fields gracefully
+    """
+    xml_content = b"""<course><title>Only Title</title></course>"""
+    zip_path = tmp_path / "test_canvas_course2.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("course_settings/course_settings.xml", xml_content)
+    attrs = parse_canvas_settings(zip_path)
+    assert attrs["title"] == "Only Title"
+    assert "course_code" not in attrs
+
+
+def test_parse_canvas_settings_handles_namespaces(tmp_path):
+    """
+    Test that parse_canvas_settings can handle XML with namespaces
+    """
+    xml_content = b"""<ns0:course xmlns:ns0="http://example.com">
+        <ns0:title>Namespaced Title</ns0:title>
+        <ns0:course_code>NS-101</ns0:course_code>
+    </ns0:course>"""
+    zip_path = tmp_path / "test_canvas_course4.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("course_settings/course_settings.xml", xml_content)
+    attrs = parse_canvas_settings(zip_path)
+    assert attrs["title"] == "Namespaced Title"
+    assert attrs["course_code"] == "NS-101"
+
+
+@pytest.mark.parametrize(
+    ("prefix", "key", "expected"),
+    [
+        ("canvas/course_content", "canvas/course_content/12345/a.imscc", "12345"),
+        ("canvas/course_content/", "canvas/course_content/12345/a.imscc", "12345"),
+        ("canvas/", "canvas/1/a.imscc", "1"),
+        # a folder whose name is spelled with characters from the prefix must
+        # survive - str.lstrip would eat it, str.removeprefix does not
+        ("canvas/course_content", "canvas/course_content/course/a.imscc", "course"),
+    ],
+)
+def test_canvas_course_folder(settings, prefix, key, expected):
+    """canvas_course_folder should strip the bucket prefix, not a character set"""
+    settings.CANVAS_COURSE_BUCKET_PREFIX = prefix
+    assert canvas_course_folder(key) == expected
+
+
+@pytest.mark.django_db
+def test_run_for_canvas_archive_unpublishes_course_code_orphans(tmp_path, mocker):
+    """
+    A course whose code changed leaves a resource behind under its old readable
+    id. The S3 listing can't see that, so the course's own sync must clean it up.
+    """
+    mocker.patch(
+        "learning_resources.etl.canvas.parse_canvas_settings",
+        return_value={"title": "Test Course", "course_code": "NEW101"},
+    )
+    mocker.patch(
+        "learning_resources.etl.canvas_utils.parse_context_xml",
+        return_value={"course_id": "123", "canvas_domain": "mit.edu"},
+    )
+    mock_unpublished_actions = mocker.patch(
+        "learning_resources.etl.canvas.resource_unpublished_actions"
+    )
+    orphan = LearningResourceFactory.create(
+        readable_id="123-OLD101",
+        etl_source=ETLSource.canvas.name,
+        resource_type=LearningResourceType.course.name,
+        published=True,
+        test_mode=True,
+    )
+    # another folder's course, and another source sharing the prefix, both stay
+    other_course = LearningResourceFactory.create(
+        readable_id="1234-OTHER",
+        etl_source=ETLSource.canvas.name,
+        resource_type=LearningResourceType.course.name,
+    )
+    other_source = LearningResourceFactory.create(
+        readable_id="123-XPRO",
+        etl_source=ETLSource.xpro.name,
+        resource_type=LearningResourceType.course.name,
+    )
+
+    run_for_canvas_archive(
+        tmp_path / "archive.zip",
+        course_folder="123",
+        checksum="abc123",
+        overwrite=True,
+    )
+
+    assert not LearningResource.objects.get(id=orphan.id).published
+    assert LearningResource.objects.filter(readable_id="123-NEW101").exists()
+    assert LearningResource.objects.filter(id=other_course.id).exists()
+    assert LearningResource.objects.filter(id=other_source.id).exists()
+    assert mock_unpublished_actions.call_count == 1
+
+
+@pytest.mark.django_db
+def test_run_for_canvas_archive_keeps_orphans_without_course_code(tmp_path, mocker):
+    """
+    An archive missing course_settings.xml has no course code to compare against,
+    so it must not treat the folder's real resource as an orphan and delete it.
+    """
+    mocker.patch(
+        "learning_resources.etl.canvas.parse_canvas_settings",
+        return_value={},
+    )
+    mocker.patch(
+        "learning_resources.etl.canvas_utils.parse_context_xml",
+        return_value={"course_id": "123", "canvas_domain": "mit.edu"},
+    )
+    mock_unpublished_actions = mocker.patch(
+        "learning_resources.etl.canvas.resource_unpublished_actions"
+    )
+    existing = LearningResourceFactory.create(
+        readable_id="123-REAL101",
+        etl_source=ETLSource.canvas.name,
+        resource_type=LearningResourceType.course.name,
+        published=True,
+        test_mode=True,
+    )
+
+    run_for_canvas_archive(
+        tmp_path / "archive.zip",
+        course_folder="123",
+        checksum="abc123",
+        overwrite=True,
+    )
+
+    existing.refresh_from_db()
+    assert existing.published is True
+    assert existing.test_mode is True
+    assert mock_unpublished_actions.call_count == 0
+
+
+@pytest.mark.django_db
+def test_run_for_canvas_archive_creates_resource_and_run(tmp_path, mocker):
+    """
+    Test that run_for_canvas_archive creates a LearningResource and Run
+    when given a valid canvas archive.
+    """
+    course_folder = "test"
+    mocker.patch(
+        "learning_resources.etl.canvas.parse_canvas_settings",
+        return_value={"title": "Test Course", "course_code": "TEST101"},
+    )
+    mocker.patch(
+        "learning_resources.etl.canvas_utils.parse_context_xml",
+        return_value={"course_id": "123", "canvas_domain": "mit.edu"},
+    )
+
+    # No resource exists yet
+    zip_path = tmp_path / "archive.zip"
+
+    _, run = run_for_canvas_archive(
+        zip_path, course_folder=course_folder, checksum="abc123", overwrite=True
+    )
+    resource = LearningResource.objects.get(readable_id=f"{course_folder}-TEST101")
+    assert resource.title == "Test Course"
+    assert resource.etl_source == ETLSource.canvas.name
+    assert resource.resource_type == LearningResourceType.course.name
+    assert resource.platform.code == PlatformType.canvas.name
+    assert run is not None
+    assert run.learning_resource == resource
+    # checksum is only saved after a successful content load in
+    # sync_canvas_archive, never by run_for_canvas_archive
+    assert run.checksum is None
+
+
+@pytest.mark.django_db
+def test_run_for_canvas_archive_creates_run_if_none_exists(tmp_path, mocker):
+    """
+    Test that run_for_canvas_archive creates a Run if no runs exist for the resource.
+    """
+    course_folder = "test"
+    mocker.patch(
+        "learning_resources.etl.canvas.parse_canvas_settings",
+        return_value={"title": "Test Course", "course_code": "TEST104"},
+    )
+    mocker.patch(
+        "learning_resources.etl.canvas_utils.parse_context_xml",
+        return_value={"course_id": "123", "canvas_domain": "mit.edu"},
+    )
+    # Create resource with no runs
+    resource = LearningResourceFactory.create(
+        readable_id=f"{course_folder}-TEST104",
+        title="Test Course",
+        etl_source=ETLSource.canvas.name,
+        resource_type=LearningResourceType.course.name,
+        published=False,
+    )
+    resource.runs.all().delete()
+    assert resource.runs.count() == 0
+    course_archive_path = tmp_path / "archive4.zip"
+    course_archive_path.write_text("dummy")
+    _, run = run_for_canvas_archive(
+        course_archive_path,
+        course_folder=course_folder,
+        checksum="checksum104",
+        overwrite=True,
+    )
+    assert run is not None
+    assert run.learning_resource == resource
+    assert run.checksum is None
+
+
+def make_canvas_zip(
+    tmp_path,
+    settings_xml=DEFAULT_SETTINGS_XML,
+    module_xml=DEFAULT_MODULE_XML,
+    manifest_xml=DEFAULT_MANIFEST_XML,
+    files=None,
+):
+    """
+    Create a zip file with module_meta.xml, imsmanifest.xml, and additional files.
+    `files` is a list of tuples: (filename, content_bytes)
+    """
+    files = files or []
+    zip_path = tmp_path / "canvas_course.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        if settings_xml:
+            zf.writestr("course_settings/course_settings.xml", settings_xml)
+        if module_xml:
+            zf.writestr("course_settings/module_meta.xml", module_xml)
+        if manifest_xml:
+            zf.writestr("imsmanifest.xml", manifest_xml)
+        for filename, content in files:
+            zf.writestr(filename, content)
+    return zip_path
+
+
+def test_parse_module_meta_returns_active_and_unpublished(tmp_path):
+    """
+    Test that parse_module_meta returns active and unpublished items
+    """
+    module_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <modules xmlns="http://canvas.instructure.com/xsd/cccv1p0">
+      <module identifier="g31fce32d15019702eb75d5664798a877">
+        <title>Module 1</title>
+        <items>
+          <item>
+            <workflow_state>active</workflow_state>
+            <title>Item 1</title>
+            <identifierref>RES1</identifierref>
+            <content_type>resource</content_type>
+          </item>
+          <item>
+            <workflow_state>unpublished</workflow_state>
+            <title>Item 2</title>
+            <identifierref>RES2</identifierref>
+            <content_type>resource</content_type>
+          </item>
+        </items>
+      </module>
+    </modules>
+    """
+    manifest_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+      <resources>
+        <resource identifier="RES1" type="webcontent">
+          <file href="file1.html"/>
+        </resource>
+        <resource identifier="RES2" type="webcontent">
+          <file href="file2.html"/>
+        </resource>
+      </resources>
+      <organizations>
+        <organization>
+          <item identifierref="RES1">
+            <title>Item 1</title>
+          </item>
+          <item identifierref="RES2">
+            <title>Item 2</title>
+          </item>
+        </organization>
+      </organizations>
+    </manifest>
+    """
+    zip_path = make_canvas_zip(
+        tmp_path, module_xml=module_xml, manifest_xml=manifest_xml
+    )
+    result = parse_module_meta(zip_path)
+    assert "active" in result
+    assert "unpublished" in result
+
+    assert any(
+        item["title"] == "Item 1" and item["path"].name == "file1.html"
+        for item in result["active"]
+    )
+    assert any(
+        item["title"] == "Item 2" and item["path"].name == "file2.html"
+        for item in result["unpublished"]
+    )
+
+
+def test_parse_module_meta_handles_missing_identifierref(tmp_path):
+    """
+    Test that parse_module_meta doesnt fail in case of missing identifierref
+    """
+    module_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <modules xmlns="http://canvas.instructure.com/xsd/cccv1p0">
+      <module>
+        <title>Module 2</title>
+        <items>
+          <item>
+            <workflow_state>active</workflow_state>
+            <title>Item No Ref</title>
+            <content_type>resource</content_type>
+          </item>
+        </items>
+      </module>
+    </modules>
+    """
+    manifest_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+      <resources></resources>
+      <organizations>
+        <organization>
+          <item>
+            <title>Item No Ref</title>
+          </item>
+        </organization>
+      </organizations>
+    </manifest>
+    """
+    zip_path = make_canvas_zip(
+        tmp_path, module_xml=module_xml, manifest_xml=manifest_xml
+    )
+    result = parse_module_meta(zip_path)
+    assert "active" in result
+    assert len(result["active"]) == 0
+    assert len(result["unpublished"]) == 0
+
+
+def test_transform_canvas_content_files_removes_unpublished_content(mocker, tmp_path):
+    """
+    Content files no longer published in the export are unpublished by
+    load_content_files, whose content_files_loaded hook purges the indexes
+    """
+
+    # Setup: create a fake run with some content files
+    resource = LearningResourceFactory.create(
+        etl_source=ETLSource.canvas.name, is_course=True, create_runs=False
+    )
+    run = LearningResourceRunFactory.create(learning_resource=resource)
+
+    published_path = "/test/published/file1.html"
+    unpublished_path = "/test/unpublished/file2.html"
+    unpublished_cf = ContentFileFactory.create(
+        run=run, published=True, key=get_edx_module_id(unpublished_path, run)
+    )
+    module_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <modules xmlns="http://canvas.instructure.com/xsd/cccv1p0">
+      <module>
+        <title>Module 1</title>
+        <items>
+          <item>
+            <workflow_state>active</workflow_state>
+            <title>Item 1</title>
+            <identifierref>RES1</identifierref>
+            <content_type>resource</content_type>
+          </item>
+          <item>
+            <workflow_state>unpublished</workflow_state>
+            <title>Item 2</title>
+            <identifierref>RES2</identifierref>
+            <content_type>resource</content_type>
+          </item>
+        </items>
+      </module>
+    </modules>
+    """
+    manifest_xml = bytes(
+        f"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+      <resources>
+        <resource identifier="RES1" type="webcontent">
+          <file href="{published_path}"/>
+        </resource>
+        <resource identifier="RES2" type="webcontent">
+          <file href="{unpublished_path}"/>
+        </resource>
+      </resources>
+      <organizations>
+        <organization>
+          <item identifierref="RES1">
+            <title>Item 1</title>
+          </item>
+          <item identifierref="RES2">
+            <title>Item 2</title>
+          </item>
+        </organization>
+      </organizations>
+    </manifest>
+    """,
+        "utf-8",
+    )
+    zip_path = tmp_path / "canvas_course.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("course_settings/module_meta.xml", module_xml)
+        zf.writestr("imsmanifest.xml", manifest_xml)
+        zf.writestr(published_path, "content")
+        zf.writestr(unpublished_path, "content")
+    mocker.patch(
+        "learning_resources.etl.utils.extract_text_metadata",
+        return_value={"content": "test"},
+    )
+
+    loaded_actions = mocker.patch(
+        "learning_resources.etl.loaders.content_files_loaded_actions"
+    )
+
+    load_content_files(
+        run,
+        transform_canvas_content_files(
+            Path(zip_path), run, url_config={}, overwrite=True
+        ),
+    )
+
+    unpublished_cf.refresh_from_db()
+    assert unpublished_cf.published is False
+    loaded_actions.assert_called_once_with(run=run)
+
+
+def test_transform_canvas_content_files_retains_failed_files(mocker, tmp_path):
+    """A file whose extraction raises is reported in failed_keys, rows untouched"""
+    resource = LearningResourceFactory.create(etl_source=ETLSource.canvas.name)
+    run = LearningResourceRunFactory.create(learning_resource=resource)
+
+    published_path = "/test/published/file1.html"
+    unpublished_path = "/test/unpublished/file2.html"
+    failing_cf = ContentFileFactory.create(
+        run=run, published=True, key=get_edx_module_id(published_path, run)
+    )
+    unpublished_cf = ContentFileFactory.create(
+        run=run, published=True, key=get_edx_module_id(unpublished_path, run)
+    )
+    module_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <modules xmlns="http://canvas.instructure.com/xsd/cccv1p0">
+      <module>
+        <title>Module 1</title>
+        <items>
+          <item>
+            <workflow_state>active</workflow_state>
+            <title>Item 1</title>
+            <identifierref>RES1</identifierref>
+            <content_type>resource</content_type>
+          </item>
+          <item>
+            <workflow_state>unpublished</workflow_state>
+            <title>Item 2</title>
+            <identifierref>RES2</identifierref>
+            <content_type>resource</content_type>
+          </item>
+        </items>
+      </module>
+    </modules>
+    """
+    manifest_xml = bytes(
+        f"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+      <resources>
+        <resource identifier="RES1" type="webcontent">
+          <file href="{published_path}"/>
+        </resource>
+        <resource identifier="RES2" type="webcontent">
+          <file href="{unpublished_path}"/>
+        </resource>
+      </resources>
+      <organizations>
+        <organization>
+          <item identifierref="RES1">
+            <title>Item 1</title>
+          </item>
+          <item identifierref="RES2">
+            <title>Item 2</title>
+          </item>
+        </organization>
+      </organizations>
+    </manifest>
+    """,
+        "utf-8",
+    )
+    zip_path = tmp_path / "canvas_course.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("course_settings/module_meta.xml", module_xml)
+        zf.writestr("imsmanifest.xml", manifest_xml)
+        zf.writestr(published_path, "content")
+        zf.writestr(unpublished_path, "content")
+
+    mocker.patch(
+        "learning_resources.etl.utils._extract_content",
+        side_effect=FileNotFoundError("ocr output missing"),
+    )
+
+    failed_keys = []
+    results = list(
+        transform_canvas_content_files(
+            Path(zip_path), run, url_config={}, overwrite=True, failed_keys=failed_keys
+        )
+    )
+
+    assert results == []
+    assert failed_keys == [failing_cf.key]
+    assert ContentFile.objects.get(id=failing_cf.id).published is True
+    assert ContentFile.objects.get(id=unpublished_cf.id).published is True
+
+
+@pytest.mark.parametrize("overwrite", [True, False])
+@pytest.mark.parametrize("existing_file", [True, False])
+def test_transform_canvas_problem_files_pdf_calls_pdf_to_markdown(  # noqa: PLR0913
+    tmp_path, mocker, settings, overwrite, existing_file, sample_pdf_content
+):
+    """
+    Test that transform_canvas_problem_files calls _pdf_to_markdown for PDF files.
+    if overwrite is True or there is no existing file. Tikka should not be called
+    """
+
+    settings.CANVAS_TUTORBOT_FOLDER = "tutorbot/"
+    settings.OCR_MODEL = "fake-model"
+
+    pdf_filename = "problemset1/problem.pdf"
+
+    zip_path = make_canvas_zip(
+        tmp_path, files=[(f"tutorbot/{pdf_filename}", sample_pdf_content)]
+    )
+
+    # return a file with pdf extension
+    fake_file_data = {
+        "run": "run",
+        "content_type": "application/pdf",
+        "archive_checksum": "checksum",
+        "source_path": f"tutorbot/{pdf_filename}",
+        "file_extension": ".pdf",
+    }
+
+    mocker.patch(
+        "learning_resources.etl.utils.documents_from_olx",
+        return_value=iter([[mocker.Mock(), fake_file_data]]),
+    )
+
+    # Patch _pdf_to_markdown to return a known value
+    pdf_to_md = mocker.patch(
+        "learning_resources.etl.utils._pdf_to_markdown",
+        return_value="markdown content from pdf",
+    )
+
+    tika = mocker.patch(
+        "learning_resources.etl.utils.extract_text_metadata",
+    )
+
+    run = LearningResourceRunFactory.create()
+
+    if existing_file:
+        TutorProblemFileFactory.create(
+            run=run,
+            type="problem",
+            archive_checksum="checksum",
+            source_path=f"tutorbot/{pdf_filename}",
+            content="existing content",
+            file_name="problem1.pdf",
+        )
+
+    results = list(transform_canvas_problem_files(zip_path, run, overwrite=overwrite))
+
+    if overwrite or not existing_file:
+        pdf_to_md.assert_called_once()
+    else:
+        pdf_to_md.assert_not_called()
+
+    tika.assert_not_called()
+
+    assert (
+        results[0]["content"] == "markdown content from pdf"
+        if overwrite or not existing_file
+        else "existing content"
+    )
+    assert results[0]["problem_title"] == "problemset1"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("overwrite", [True, False])
+@pytest.mark.parametrize("existing_file", [True, False])
+def test_transform_canvas_problem_files_non_pdf_does_not_call_pdf_to_markdown(
+    tmp_path, mocker, settings, overwrite, existing_file
+):
+    """
+    Test that transform_canvas_problem_files does not call _pdf_to_markdown but calles tika for
+    non-PDF files. Niether tika or _pdf_to_markdown should be called if overwrite is false and
+    there is an existing file.
+    """
+    settings.CANVAS_TUTORBOT_FOLDER = "tutorbot/"
+    settings.OCR_MODEL = "fake-model"
+    csv_filename = "problemset2/problem.csv"
+    csv_content = "a,b,c\n1,2,3"
+    zip_path = make_canvas_zip(
+        tmp_path, files=[(f"tutorbot/{csv_filename}", csv_content)]
+    )
+
+    fake_file_data = {
+        "run": "run",
+        "content_type": "application/csv",
+        "archive_checksum": "checksum",
+        "source_path": f"tutorbot/{csv_filename}",
+        "file_extension": ".csv",
+    }
+
+    mocker.patch(
+        "learning_resources.etl.utils.documents_from_olx",
+        return_value=iter([[mocker.Mock(), fake_file_data]]),
+    )
+
+    pdf_to_md = mocker.patch("learning_resources.etl.utils._pdf_to_markdown")
+
+    tika = mocker.patch(
+        "learning_resources.etl.utils.extract_text_metadata",
+        return_value={"content": csv_content},
+    )
+
+    run = LearningResourceRunFactory.create()
+
+    if existing_file:
+        TutorProblemFileFactory.create(
+            run=run,
+            type="problem",
+            archive_checksum="checksum",
+            source_path=f"tutorbot/{csv_filename}",
+            content="existing content",
+            file_name="problem2.csv",
+        )
+
+    results = list(transform_canvas_problem_files(zip_path, run, overwrite=overwrite))
+
+    pdf_to_md.assert_not_called()
+    if overwrite or not existing_file:
+        tika.assert_called_once()
+    else:
+        tika.assert_not_called()
+    assert (
+        results[0]["content"] == csv_content
+        if overwrite or not existing_file
+        else "existing content"
+    )
+    assert results[0]["problem_title"] == "problemset2"
+
+
+@pytest.mark.django_db
+def test_transform_canvas_problem_files_ingests_py_files(tmp_path, mocker, settings):
+    """
+    Python problem and solution files in the tutorbot folder should be ingested
+    as tutor problem files, classified by filename.
+    """
+    settings.CANVAS_TUTORBOT_FOLDER = "tutorbot/"
+    problem_code = "def problem():\n    pass\n"
+    solution_code = "def solution():\n    return 42\n"
+    zip_path = make_canvas_zip(
+        tmp_path,
+        files=[
+            ("tutorbot/problemset1/pset1.py", problem_code),
+            ("tutorbot/problemset1/pset1_solution.py", solution_code),
+        ],
+    )
+
+    mocker.patch(
+        "learning_resources.etl.utils.extract_text_metadata",
+        side_effect=lambda data, **_: {"content": data.decode("utf-8")},
+    )
+
+    run = LearningResourceRunFactory.create()
+
+    results = {
+        result["file_name"]: result
+        for result in transform_canvas_problem_files(zip_path, run, overwrite=True)
+    }
+
+    assert set(results) == {"pset1.py", "pset1_solution.py"}
+    assert results["pset1.py"]["type"] == TUTOR_PROBLEM_TYPE
+    assert results["pset1_solution.py"]["type"] == TUTOR_SOLUTION_TYPE
+    assert results["pset1.py"]["content"] == problem_code.strip()
+    assert results["pset1_solution.py"]["content"] == solution_code.strip()
+    for result in results.values():
+        assert result["problem_title"] == "problemset1"
+        assert result["file_extension"] == ".py"
+
+
+@pytest.mark.django_db
+def test_transform_canvas_content_files_url_assignment(mocker, tmp_path):
+    """
+    Test that transform_canvas_content_files assigns URLs based on url_config.
+    """
+    run = MagicMock()
+    run.id = 1
+    url_config = {"/folder/file1.html": {"url": "https://cdn.example.com/file1.html"}}
+    # Patch process_olx_path to yield content_data with source_path
+    mock_content_data = [
+        {"source_path": "data/folder/file1.html", "key": "file1"},
+    ]
+    mocker.patch(
+        "learning_resources.etl.canvas.process_olx_path",
+        return_value=mock_content_data,
+    )
+    mocker.patch(
+        "learning_resources.etl.canvas_utils.parse_module_meta",
+        return_value={"active": [], "unpublished": []},
+    )
+    # Use a real zip file
+    course_zipfile = make_canvas_zip(
+        tmp_path, files=[("folder/file1.html", "fake content")]
+    )
+    # Patch published_items to always match
+    mocker.patch(
+        "learning_resources.etl.canvas.get_edx_module_id", return_value="file1"
+    )
+
+    results = list(
+        transform_canvas_content_files(
+            Path(course_zipfile),
+            run=run,
+            url_config=url_config,
+            overwrite=False,
+        )
+    )
+    file1 = next(item for item in results if item["key"] == "file1")
+    assert file1["url"] == "https://cdn.example.com/file1.html"
+
+
+@pytest.mark.parametrize(
+    ("file_meta", "expected"),
+    [
+        # Test case: File is explicitly hidden
+        ({"hidden": "true", "locked": "false"}, False),
+        # Test case: File is explicitly locked
+        ({"hidden": "false", "locked": "true"}, False),
+        # Test case: File is neither hidden nor locked, visibility is "inherit"
+        ({"hidden": "false", "locked": "false", "visibility": "inherit"}, True),
+        # Test case: File is neither hidden nor locked, visibility is "course"
+        ({"hidden": "false", "locked": "false", "visibility": "course"}, True),
+        # Test case: File is neither hidden nor locked, visibility is "institution"
+        ({"hidden": "false", "locked": "false", "visibility": "institution"}, True),
+        # Test case: File is neither hidden nor locked, visibility is "public"
+        ({"hidden": "false", "locked": "false", "visibility": "public"}, True),
+        # Test case: File is neither hidden nor locked, visibility is unknown
+        ({"hidden": "false", "locked": "false", "visibility": "unknown"}, False),
+        # Test case: File is neither hidden nor locked, unlock_at is in the future
+        (
+            {
+                "hidden": "false",
+                "locked": "false",
+                "unlock_at": (now_in_utc() + timedelta(days=1)).isoformat(),
+            },
+            False,
+        ),
+        # Test case: File is neither hidden nor locked, unlock_at is in the past
+        (
+            {
+                "hidden": "false",
+                "locked": "false",
+                "unlock_at": (now_in_utc() - timedelta(days=1)).isoformat(),
+            },
+            True,
+        ),
+        # Test case: File is neither hidden nor locked, lock_at is in the future
+        (
+            {
+                "hidden": "false",
+                "locked": "false",
+                "lock_at": (now_in_utc() + timedelta(days=1)).isoformat(),
+            },
+            True,
+        ),
+        # Test case: File is neither hidden nor locked, lock_at is in the past
+        (
+            {
+                "hidden": "false",
+                "locked": "false",
+                "lock_at": (now_in_utc() - timedelta(days=1)).isoformat(),
+            },
+            False,
+        ),
+        # Test case: File is neither hidden nor locked, unlock_at and lock_at are valid
+        (
+            {
+                "hidden": "false",
+                "locked": "false",
+                "unlock_at": (now_in_utc() - timedelta(days=1)).isoformat(),
+                "lock_at": (now_in_utc() + timedelta(days=1)).isoformat(),
+            },
+            True,
+        ),
+        # Test case: File is neither hidden nor locked, unlock_at is in the future, lock_at is in the past
+        (
+            {
+                "hidden": "false",
+                "locked": "false",
+                "unlock_at": (now_in_utc() + timedelta(days=1)).isoformat(),
+                "lock_at": (now_in_utc() - timedelta(days=1)).isoformat(),
+            },
+            False,
+        ),
+        # Test case: File is neither hidden nor locked, unlock_at and lock_at are invalid
+        (
+            {
+                "hidden": "false",
+                "locked": "false",
+                "unlock_at": "invalid_date",
+                "lock_at": "invalid_date",
+            },
+            True,
+        ),
+    ],
+)
+def test_is_file_published(file_meta, expected):
+    """
+    Test is_file_published for all conditions in file metadata
+    """
+    assert is_file_published(file_meta) == expected
+
+
+def test_published_module_and_files_meta_content_ingestion(mocker, tmp_path):
+    """
+    Test published files from files_meta and module_meta are retained
+    """
+
+    module_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <modules xmlns="http://canvas.instructure.com/xsd/cccv1p0">
+      <module>
+        <title>Module 1</title>
+        <items>
+          <item>
+            <workflow_state>active</workflow_state>
+            <title>Item 1</title>
+            <identifierref>RES1</identifierref>
+            <content_type>resource</content_type>
+          </item>
+          <item>
+            <workflow_state>unpublished</workflow_state>
+            <title>Item 2</title>
+            <identifierref>RES2</identifierref>
+            <content_type>resource</content_type>
+          </item>
+        </items>
+      </module>
+    </modules>
+    """
+
+    files_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <fileMeta xmlns="http://canvas.instructure.com/xsd/cccv1p0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://canvas.instructure.com/xsd/cccv1p0 https://canvas.instructure.com/xsd/cccv1p0.xsd">
+    <files>
+    <file identifier="RES3">
+      <category>uncategorized</category>
+    </file>
+    <file identifier="RES4">
+      <locked>true</locked>
+      <category>uncategorized</category>
+    </file>
+    </files>
+    </fileMeta>
+    """
+    manifest_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+      <resources>
+        <resource identifier="RES1" type="webcontent">
+          <file href="file1.html"/>
+        </resource>
+        <resource identifier="RES2" type="webcontent">
+          <file href="file2.html"/>
+        </resource>
+        <resource identifier="RES3" type="webcontent">
+          <file href="file3.html"/>
+        </resource>
+        <resource identifier="RES4" type="webcontent">
+          <file href="file4.html"/>
+        </resource>
+      </resources>
+      <organizations>
+        <organization>
+          <item identifierref="RES1">
+            <title>Item 1</title>
+          </item>
+          <item identifierref="RES2">
+            <title>Item 2</title>
+          </item>
+
+        </organization>
+      </organizations>
+    </manifest>
+    """
+
+    mocker.patch(
+        "learning_resources.etl.utils.extract_text_metadata",
+        return_value={"content": "TEXT"},
+    )
+    zip_path = make_canvas_zip(
+        tmp_path,
+        module_xml=module_xml,
+        manifest_xml=manifest_xml,
+        files=[
+            ("course_settings/files_meta.xml", files_xml),
+            ("file1.html", b"<html/>"),
+            ("file2html", b"<html/>"),
+            ("file3.html", b"<html/>"),
+            ("file4.html", b"<html/>"),
+        ],
+    )
+    run = LearningResourceRunFactory.create()
+    stale_contentfile = ContentFileFactory.create(run=run)
+    results = list(
+        transform_canvas_content_files(
+            zip_path, run=run, url_config={}, overwrite=False
+        )
+    )
+    result_paths = [result["source_path"] for result in results]
+    assert len(results) == 2
+    assert "/file1.html" in result_paths
+    assert "/file3.html" in result_paths
+    # the transform leaves stale rows to load_content_files
+    stale_contentfile.refresh_from_db()
+    assert stale_contentfile.published is True
+
+
+@pytest.mark.parametrize(
+    ("element", "expected"),
+    [
+        # Test case: Element with no children, only text
+        (
+            ElementTree.fromstring("""<tag>Sample Text</tag>"""),
+            "Sample Text",
+        ),
+        # Test case: Element with children, nested structure
+        (
+            ElementTree.fromstring(
+                """<parent>
+                <child1>Child 1 Text</child1>
+                <child2>
+                    <subchild>Subchild Text</subchild>
+                </child2>
+            </parent>
+        """
+            ),
+            {
+                "child1": "Child 1 Text",
+                "child2": {"subchild": "Subchild Text"},
+            },
+        ),
+        # Test case: Element with mixed text and children
+        (
+            ElementTree.fromstring(
+                """<mixed>Parent Text<child>Child Text</child></mixed>"""
+            ),
+            {
+                "child": "Child Text",
+            },
+        ),
+    ],
+)
+def test_compact_element(element, expected):
+    """
+    Test _compact_element function with nested tags.
+    """
+    result = _compact_element(element)
+    assert result == expected
+
+
+def test_parse_web_content_returns_active_and_unpublished(tmp_path):
+    """
+    Test that parse_web_content returns active and unpublished items
+    """
+    manifest_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+      <resources>
+        <resource identifier="RES1" type="webcontent" href="file1.html">
+          <file href="file1.html"/>
+        </resource>
+        <resource identifier="RES2" type="webcontent" href="file2.html">
+          <file href="file2.html"/>
+        </resource>
+      </resources>
+    </manifest>
+    """
+    html_content_active = b"""<html>
+    <head><title>Active Content</title><meta name="workflow_state" content="active"></head>
+    <body>Content</body>
+    </html>
+    """
+    html_content_unpublished = b"""<html>
+    <head><title>Unpublished Content</title><meta name="workflow_state" content="unpublished"></head>
+    <body>Content</body>
+    </html>
+    """
+    zip_path = tmp_path / "canvas_course.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("imsmanifest.xml", manifest_xml)
+        zf.writestr("file1.html", html_content_active)
+        zf.writestr("file2.html", html_content_unpublished)
+
+    result = parse_web_content(zip_path)
+    assert "active" in result
+    assert "unpublished" in result
+
+    assert any(
+        item["title"] == "Active Content" and item["path"] == "file1.html"
+        for item in result["active"]
+    )
+    assert any(
+        item["title"] == "Unpublished Content" and item["path"] == "file2.html"
+        for item in result["unpublished"]
+    )
+
+
+def test_parse_web_content_handles_missing_workflow_state(tmp_path):
+    """
+    Test that parse_web_content handles missing workflow_state gracefully
+    """
+    manifest_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+      <resources>
+        <resource identifier="RES1" type="webcontent" href="file1.html">
+          <file href="file1.html"/>
+        </resource>
+      </resources>
+    </manifest>
+    """
+    html_content = b"""<html>
+    <head><title>No Workflow State</title></head>
+    <body>Content</body>
+    </html>
+    """
+    zip_path = tmp_path / "canvas_course.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("imsmanifest.xml", manifest_xml)
+        zf.writestr("file1.html", html_content)
+
+    result = parse_web_content(zip_path)
+    assert "active" in result
+    assert "unpublished" in result
+    assert len(result["active"]) == 0
+    assert len(result["unpublished"]) == 1
+    assert result["unpublished"][0]["title"] == "No Workflow State"
+    assert result["unpublished"][0]["path"] == "file1.html"
+
+
+def test_parse_web_content_excludes_instructor_only_content(tmp_path):
+    """
+    Test that parse_web_content excludes content intended for Instructors only
+    """
+    manifest_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+      <resources>
+        <resource identifier="RES1" type="webcontent" href="file1.html">
+          <file href="file1.html"/>
+          <metadata>
+            <lom>
+              <educational>
+                <intendedEndUserRole>
+                  <value>Instructor</value>
+                </intendedEndUserRole>
+              </educational>
+            </lom>
+          </metadata>
+        </resource>
+      </resources>
+    </manifest>
+    """
+    html_content = b"""<html>
+    <head><title>Instructor Only Content</title><meta name="workflow_state" content="active"></head>
+    <body>Content</body>
+    </html>
+    """
+    zip_path = tmp_path / "canvas_course.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("imsmanifest.xml", manifest_xml)
+        zf.writestr("file1.html", html_content)
+
+    result = parse_web_content(zip_path)
+    assert "active" in result
+    assert "unpublished" in result
+    assert len(result["active"]) == 0
+    assert len(result["unpublished"]) == 1
+    assert result["unpublished"][0]["title"] == "Instructor Only Content"
+    assert result["unpublished"][0]["path"] == "file1.html"
+
+
+def test_parse_files_meta_excludes_tutorbot_folder(tmp_path, settings):
+    """
+    Test that parse_files_meta explicitly excludes files in the tutorbot folder
+    even if they are marked as published in the files_meta.xml.
+    """
+    settings.CANVAS_TUTORBOT_FOLDER = "web_resources/ai/tutor/"
+    files_meta_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <files xmlns="http://canvas.instructure.com/xsd/cccv1p0">
+      <file identifier="file1">
+        <display_name>Published File</display_name>
+        <hidden>false</hidden>
+        <locked>false</locked>
+        <path>web_resources/ai/tutor/tutorfile.html</path>
+      </file>
+      <file identifier="file2">
+        <display_name>Regular File</display_name>
+        <hidden>false</hidden>
+        <locked>false</locked>
+        <path>regular_folder/file2.html</path>
+      </file>
+    </files>
+    """
+    manifest_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+      <resources>
+        <resource identifier="file1" type="webcontent">
+          <file href="web_resources/ai/tutor/tutorfile.html"/>
+        </resource>
+        <resource identifier="file2" type="webcontent">
+          <file href="regular_folder/file2.html"/>
+        </resource>
+      </resources>
+    </manifest>
+    """
+    zip_path = tmp_path / "canvas_course.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("course_settings/files_meta.xml", files_meta_xml)
+        zf.writestr("imsmanifest.xml", manifest_xml)
+
+    result = parse_files_meta(zip_path)
+
+    # Ensure the file in the tutorbot folder is excluded
+    assert len(result["active"]) == 1
+    assert result["active"][0]["path"].name == "file2.html"
+    assert len(result["unpublished"]) == 1
+    assert result["unpublished"][0]["path"].name == "tutorfile.html"
+
+
+def test_embedded_files_from_html(tmp_path, mocker, sample_pdf_content):
+    """
+    Test that _embedded_files_from_html processes files embedded in HTML content
+    even if they are not in modules_meta.xml or files_meta.xml.
+    """
+    html_content = """
+    <html>
+    <head><meta name="workflow_state" content="active"/></head>
+        <body>
+            <a href="$IMS-CC-FILEBASE$/file1.pdf">Embedded File 1</a>
+        </body>
+    </html>
+    """
+    module_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <modules xmlns="http://canvas.instructure.com/xsd/cccv1p0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    >
+      <module>
+
+        <title>Module 1</title>
+        <items>
+          <item identifier="RES3">
+            <workflow_state>active</workflow_state>
+            <title>Item 1</title>
+            <hidden>false</hidden>
+             <locked>false</locked>
+            <identifierref>RES3</identifierref>
+            <content_type>resource</content_type>
+          </item>
+        </items>
+      </module>
+    </modules>
+    """
+    manifest_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+      <resources>
+        <resource identifier="RES1" type="webcontent"  href="web_resources/file1.pdf">
+          <file href="web_resources/file1.pdf"/>
+        </resource>
+        <resource identifier="RES2" type="webcontent" href="web_resources/file2.html">
+          <file href="web_resources/file2.html"/>
+        </resource>
+        <resource identifier="RES3" type="webcontent" href="web_resources/html_page.html">
+          <file href="web_resources/html_page.html"/>
+        </resource>
+      </resources>
+    </manifest>
+    """
+    zip_path = make_canvas_zip(
+        tmp_path, module_xml=module_xml, manifest_xml=manifest_xml
+    )
+    with zipfile.ZipFile(zip_path, "a") as zf:
+        zf.writestr("web_resources/file1.pdf", sample_pdf_content)
+        zf.writestr("web_resources/file2.html", "content of file2")
+        zf.writestr("web_resources/html_page.html", html_content)
+
+    result = parse_web_content(zip_path)
+
+    assert "web_resources/file1.pdf" in result["active"][0]["embedded_files"]
+
+    mocker.patch(
+        "learning_resources.etl.utils.extract_text_metadata",
+        return_value={"content": "test"},
+    )
+
+    # Create a fake zipfile with the published file
+    run = LearningResourceRunFactory.create()
+    files = list(
+        transform_canvas_content_files(
+            Path(zip_path), run, url_config={}, overwrite=True
+        )
+    )
+
+    assert any(file["source_path"] == "web_resources/html_page.html" for file in files)
+
+
+def test_ingest_syllabus(tmp_path, mocker):
+    """
+    Test that if the course has a special "syllabus" file
+    that it is marked as active, it gets ingested.
+    """
+    syllabus_html = """
+    <html>
+    <head><meta name="workflow_state" content="active"/></head>
+        <body>
+            Syllabus
+        </body>
+    </html>
+    """
+
+    manifest_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+      <resources>
+        <resource identifier="RES1" type="webcontent" intendeduse="syllabus" href="web_resources/syllabus.html">
+          <file href="web_resources/file1.pdf"/>
+        </resource>
+      </resources>
+    </manifest>
+    """
+    zip_path = make_canvas_zip(
+        tmp_path,
+        manifest_xml=manifest_xml,
+        files=[("web_resources/syllabus.html", syllabus_html)],
+    )
+
+    result = parse_web_content(zip_path)
+    assert any(
+        item["path"] == "web_resources/syllabus.html" for item in result["active"]
+    )
+
+
+def test_syllabus_not_ingested_when_hidden(tmp_path, mocker):
+    """
+    Test that if the course has a special "syllabus" file
+    that it is marked as active, it gets ingested.
+    """
+    syllabus_html = """
+    <html>
+    <head><meta name="workflow_state" content="active"/></head>
+        <body>
+            Syllabus
+        </body>
+    </html>
+    """
+
+    manifest_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+      <resources>
+        <resource identifier="syllabus" type="webcontent" intendeduse="syllabus" href="web_resources/syllabus.html">
+          <file href="web_resources/file1.pdf"/>
+        </resource>
+      </resources>
+    </manifest>
+    """
+    settings_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <course identifier="gfef28ec71f16246c57edfeef25b26a54"
+    xmlns="http://canvas.instructure.com/xsd/cccv1p0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://canvas.instructure.com/xsd/cccv1p0
+    https://canvas.instructure.com/xsd/cccv1p0.xsd">
+        <title>Test Course Title</title>
+        <course_code>TEST-101</course_code>
+        <other_field>Other Value</other_field>
+        <public_syllabus>false</public_syllabus>
+        <public_syllabus_to_auth>false</public_syllabus_to_auth>
+    </course>
+    """
+    zip_path = make_canvas_zip(
+        tmp_path,
+        manifest_xml=manifest_xml,
+        settings_xml=settings_xml,
+        files=[
+            ("web_resources/syllabus.html", syllabus_html),
+        ],
+    )
+
+    result = parse_web_content(zip_path)
+    assert not any(
+        item["path"] == "web_resources/syllabus.html" for item in result["active"]
+    )
+
+
+def test_get_url_config_assignments_and_pages(mocker, tmp_path):
+    """
+    Test that _get_url_config correctly maps assignments and pages to URLs using their titles.
+    """
+    hmtl_page_title = "html page"
+
+    url_config = {
+        hmtl_page_title: {"url": "https://example.com/htmlpage"},
+        "/file1.html": {"url": "https://example.com/file1"},
+    }
+
+    run = LearningResourceRunFactory.create()
+
+    html_content = f"""
+    <html>
+    <head><meta name="workflow_state" content="active"/><title>{hmtl_page_title}</title></head>
+        <body>
+
+        </body>
+    </html>
+    """
+    module_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <modules xmlns="http://canvas.instructure.com/xsd/cccv1p0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    >
+      <module>
+        <title>Module 1</title>
+        <items>
+          <item>
+            <workflow_state>active</workflow_state>
+            <title>Item 1</title>
+            <hidden>false</hidden>
+             <locked>false</locked>
+            <identifierref>RES1</identifierref>
+            <content_type>resource</content_type>
+          </item>
+        </items>
+      </module>
+    </modules>
+    """
+    manifest_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+      <resources>
+      <resource identifier="RES1" identifierref="RES1" type="webcontent" href="web_resources/file1.html">
+          <file href="web_resources/file1.html"/>
+        </resource>
+        <resource identifier="RES2" type="webcontent" href="web_resources/file2.html">
+          <file href="web_resources/file2.html"/>
+        </resource>
+        <resource identifier="RES3" type="webcontent" href="web_resources/html_page.html">
+          <file href="web_resources/html_page.html"/>
+        </resource>
+      </resources>
+      <organizations>
+        <organization>
+          <item identifierref="RES1">
+            <title>module 1</title>
+          </item>
+
+        </organization>
+      </organizations>
+    </manifest>
+    """
+
+    zip_path = make_canvas_zip(
+        tmp_path,
+        module_xml=module_xml,
+        manifest_xml=manifest_xml,
+        files=[
+            ("web_resources/file1.html", "content of file1"),
+            ("web_resources/file2.html", "content of file2"),
+            ("web_resources/html_page.html", html_content),
+        ],
+    )
+    mocker.patch(
+        "learning_resources.etl.utils.extract_text_metadata",
+        return_value={"content": "test"},
+    )
+    results = list(
+        transform_canvas_content_files(
+            Path(zip_path),
+            run=run,
+            url_config=url_config,
+            overwrite=False,
+        )
+    )
+    results = list(results)
+    list(
+        zip(
+            [result["content_title"] for result in results],
+            [result["url"] for result in results],
+        )
+    )
+    results = dict(
+        zip(
+            [result["content_title"] for result in results],
+            [result["url"] for result in results],
+        )
+    )
+    assert results["html page"] == "https://example.com/htmlpage"
+    assert results["Item 1"] == "https://example.com/file1"
+
+
+def test_get_published_items_for_unpublshed_file(tmp_path):
+    html_content = """
+    <html>
+    <head><meta name="workflow_state" content="active"/></head>
+        <body>
+            <a href="$IMS-CC-FILEBASE$/file1.pdf">Embedded File 1</a>
+        </body>
+    </html>
+    """
+    module_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <modules xmlns="http://canvas.instructure.com/xsd/cccv1p0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    >
+      <module>
+
+        <title>Module 1</title>
+        <items>
+          <item identifier="RES3">
+            <workflow_state>active</workflow_state>
+            <title>Item 1</title>
+            <hidden>false</hidden>
+             <locked>false</locked>
+            <identifierref>RES3</identifierref>
+            <content_type>resource</content_type>
+          </item>
+        </items>
+      </module>
+    </modules>
+    """
+    manifest_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+      <resources>
+        <resource identifier="RES1" type="webcontent"  href="web_resources/file1.pdf">
+          <file href="web_resources/file1.pdf"/>
+        </resource>
+        <resource identifier="RES2" type="webcontent" href="web_resources/file2.html">
+          <file href="web_resources/file2.html"/>
+        </resource>
+        <resource identifier="RES3" type="webcontent" href="web_resources/html_page.html">
+          <file href="web_resources/html_page.html"/>
+        </resource>
+      </resources>
+    </manifest>
+    """
+    zip_path = make_canvas_zip(
+        tmp_path,
+        module_xml=module_xml,
+        manifest_xml=manifest_xml,
+        files=[
+            ("web_resources/file1.pdf", "content of file1"),
+            ("web_resources/file2.html", "content of file2"),
+            ("web_resources/html_page.html", html_content),
+        ],
+    )
+    url_config = {
+        "/html_page.html": {
+            "url": "https://cdn.example.com/",
+            "locked": True,
+        },
+    }
+    published = [item.name for item in get_published_items(zip_path, url_config)]
+    url_config = {
+        "/html_page.html": {
+            "url": "https://cdn.example.com/",
+            "hidden": True,
+        },
+    }
+    published.extend([item.name for item in get_published_items(zip_path, url_config)])
+    assert "html_page.html" not in published
+
+
+def test_get_published_items_for_unpublshed_parent_folder(mocker, tmp_path):
+    html_content = """
+    <html>
+    <head><meta name="workflow_state" content="active"/></head>
+        <body>
+            <a href="$IMS-CC-FILEBASE$/file1.pdf">Embedded File 1</a>
+        </body>
+    </html>
+    """
+    module_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <modules xmlns="http://canvas.instructure.com/xsd/cccv1p0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    >
+      <module>
+
+        <title>Module 1</title>
+        <items>
+          <item identifier="RES3">
+            <workflow_state>active</workflow_state>
+            <title>Item 1</title>
+            <hidden>false</hidden>
+             <locked>false</locked>
+            <identifierref>RES3</identifierref>
+            <content_type>resource</content_type>
+          </item>
+        </items>
+      </module>
+    </modules>
+    """
+    manifest_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+      <resources>
+        <resource identifier="RES1" type="webcontent"  href="web_resources/file1.pdf">
+          <file href="web_resources/file1.pdf"/>
+        </resource>
+        <resource identifier="RES2" type="webcontent" href="web_resources/file2.html">
+          <file href="web_resources/file2.html"/>
+        </resource>
+        <resource identifier="RES3" type="webcontent" href="web_resources/html_page.html">
+          <file href="web_resources/html_page.html"/>
+        </resource>
+      </resources>
+    </manifest>
+    """
+    zip_path = make_canvas_zip(
+        tmp_path,
+        module_xml=module_xml,
+        manifest_xml=manifest_xml,
+        files=[
+            ("web_resources/file1.pdf", "content of file1"),
+            ("web_resources/file2.html", "content of file2"),
+            ("web_resources/html_page.html", html_content),
+        ],
+    )
+
+    url_config = {
+        "/html_page.html": {
+            "url": "https://cdn.example.com/",
+            "published": True,
+            "folder": {
+                "hidden": True,
+            },
+        },
+    }
+    published = [item.name for item in get_published_items(zip_path, url_config)]
+    assert "html_page.html" not in published
+
+
+def test_get_published_items_with_hidden_file_section(mocker, tmp_path):
+    """
+    Test that if the files section in the navbar is hidden,
+    no files are considered published even if they are marked as published
+    """
+    manifest_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+      <resources>
+        <resource identifier="RES1" type="webcontent"  href="web_resources/file1.pdf">
+          <file href="web_resources/file1.pdf"/>
+        </resource>
+        <resource identifier="RES2" type="webcontent" href="web_resources/file2.html">
+          <file href="web_resources/file2.html"/>
+        </resource>
+        <resource identifier="RES3" type="webcontent" href="web_resources/html_page.html">
+          <file href="web_resources/html_page.html"/>
+        </resource>
+      </resources>
+    </manifest>
+    """
+    files_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+        <fileMeta xmlns="http://canvas.instructure.com/xsd/cccv1p0"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://canvas.instructure.com/xsd/cccv1p0 https://canvas.instructure.com/xsd/cccv1p0.xsd">
+        <files>
+        <file identifier="RES1">
+          <category>uncategorized</category>
+        </file>
+        <file identifier="RES2">
+          <category>uncategorized</category>
+        </file>
+        <file identifier="RES3">
+          <category>uncategorized</category>
+        </file>
+        </files>
+        </fileMeta>
+    """
+    zip_path = make_canvas_zip(
+        tmp_path,
+        manifest_xml=manifest_xml,
+        files=[
+            ("course_settings/files_meta.xml", files_xml),
+            ("web_resources/file1.pdf", "content of file1"),
+            ("web_resources/file2.html", "content of file2"),
+            ("web_resources/html_page.html", ""),
+        ],
+    )
+
+    url_config = {
+        "/html_page.html": {
+            "url": "https://cdn.example.com/",
+            "published": True,
+        },
+        "/file2.html": {
+            "url": "https://cdn.example.com/file2.html",
+            "published": True,
+        },
+        "/file3.html": {
+            "url": "https://cdn.example.com/file2.html",
+            "published": True,
+        },
+        "/visible_attachment_module.txt": {
+            "url": "https://cdn.example.com/visible_attachment_module.txt",
+            "published": True,
+        },
+    }
+    published = [item.name for item in get_published_items(zip_path, url_config)]
+    assert sorted(published) == sorted(["html_page.html", "file2.html", "file1.pdf"])
+
+    # hide the files section in the navbar
+    settings_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+        <course identifier="gfef28ec71f16246c57edfeef25b26a54"
+        xmlns="http://canvas.instructure.com/xsd/cccv1p0"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://canvas.instructure.com/xsd/cccv1p0
+        https://canvas.instructure.com/xsd/cccv1p0.xsd">
+            <title>Test Course Title</title>
+            <tab_configuration>[{"id":0},{"id":11, "hidden":true}]</tab_configuration>
+            <course_code>TEST-101</course_code>
+            <other_field>Other Value</other_field>
+        </course>
+    """
+
+    zip_path = make_canvas_zip(
+        tmp_path,
+        settings_xml=settings_xml,
+        manifest_xml=manifest_xml,
+        files=[
+            ("course_settings/files_meta.xml", files_xml),
+            ("web_resources/file1.pdf", "content of file1"),
+            ("web_resources/file2.html", "content of file2"),
+            ("web_resources/html_page.html", ""),
+        ],
+    )
+    published = [item.name for item in get_published_items(zip_path, url_config)]
+    assert len(published) == 0
+
+
+def test_get_published_items_for_unpublshed_but_embedded(mocker, tmp_path):
+    """
+    An embedded file that is unpublished (locked) is excluded, but one that is
+    only "available with link" (hidden, not locked) is still ingested because a
+    student can reach it through the linking page.
+    """
+    html_content = """
+    <html>
+    <head><meta name="workflow_state" content="active"/></head>
+        <body>
+            <a href="$IMS-CC-FILEBASE$/file1.pdf">Embedded File 1</a>
+        </body>
+    </html>
+    """
+    module_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <modules xmlns="http://canvas.instructure.com/xsd/cccv1p0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    >
+      <module xmlns="http://canvas.instructure.com/xsd/cccv1p0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://canvas.instructure.com/xsd/cccv1p0 https://canvas.instructure.com/xsd/cccv1p0.xsd">
+
+        <title>Module 1</title>
+        <workflow_state>active</workflow_state>
+        <items>
+
+          <item identifier="RES1">
+          <workflow_state>active</workflow_state>
+
+            <title>Item 2</title>
+            <hidden>false</hidden>
+             <locked>false</locked>
+            <identifierref>RES1</identifierref>
+            <content_type>resource</content_type>
+          </item>
+
+        </items>
+      </module>
+      <module xmlns="http://canvas.instructure.com/xsd/cccv1p0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://canvas.instructure.com/xsd/cccv1p0 https://canvas.instructure.com/xsd/cccv1p0.xsd">
+
+        <title>Module 2</title>
+
+        <items>
+
+          <item identifier="RES2">
+            <workflow_state>active</workflow_state>
+            <title>Item 2</title>
+            <hidden>false</hidden>
+             <locked>false</locked>
+            <identifierref>RES2</identifierref>
+            <content_type>resource</content_type>
+          </item>
+
+        </items>
+      </module>
+
+
+    </modules>
+    """
+    manifest_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1" xmlns:lom="http://ltsc.ieee.org/xsd/imsccv1p1/LOM/resource" xmlns:lomimscc="http://ltsc.ieee.org/xsd/imsccv1p1/LOM/manifest" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1 http://www.imsglobal.org/profile/cc/ccv1p1/ccv1p1_imscp_v1p2_v1p0.xsd http://ltsc.ieee.org/xsd/imsccv1p1/LOM/resource http://www.imsglobal.org/profile/cc/ccv1p1/LOM/ccv1p1_lomresource_v1p0.xsd http://ltsc.ieee.org/xsd/imsccv1p1/LOM/manifest http://www.imsglobal.org/profile/cc/ccv1p1/LOM/ccv1p1_lommanifest_v1p0.xsd">
+      <resources>
+        <resource identifier="RES1" type="webcontent"  href="web_resources/file1.pdf">
+          <file href="web_resources/file1.pdf"/>
+        </resource>
+        <item identifierref="RES2" type="attachment" href="web_resources/visible_attachment_module.txt">
+          <file href="web_resources/file2.html"/>
+        </item>
+        <resource identifier="RES2" type="attachment" href="web_resources/visible_attachment_module.txt">
+          <file href="web_resources/visible_attachment_module.txt"/>
+        </resource>
+        <resource identifier="RES3" type="webcontent" href="web_resources/html_page.html">
+          <file href="web_resources/html_page.html"/>
+        </resource>
+      </resources>
+    </manifest>
+    """
+    zip_path = make_canvas_zip(
+        tmp_path,
+        module_xml=module_xml,
+        manifest_xml=manifest_xml,
+        files=[
+            ("web_resources/file1.pdf", "content of file1"),
+            ("web_resources/file2.html", "content of file2"),
+            (
+                "web_resources/visible_attachment_module.txt",
+                "content of visible_attachment_module",
+            ),
+            ("web_resources/html_page.html", html_content),
+        ],
+    )
+    # unpublished (locked) embedded file -> excluded even though it is linked
+    # from an active page: a student cannot open a locked file
+    locked_config = {
+        "/file1.pdf": {
+            "url": "https://cdn.example.com/file1.pdf",
+            "locked": True,
+            "hidden": True,
+        },
+    }
+    published = get_published_items(zip_path, locked_config)
+    assert Path("web_resources/file1.pdf").resolve() not in published
+
+    # "available with link" (hidden but not locked) embedded file -> ingested,
+    # since the linking page makes it reachable
+    hidden_config = {
+        "/file1.pdf": {
+            "url": "https://cdn.example.com/file1.pdf",
+            "hidden": True,
+        },
+    }
+    published = get_published_items(zip_path, hidden_config)
+    assert Path("web_resources/file1.pdf").resolve() in published
+
+
+def test_get_published_items_excludes_embedded_tutor_files(tmp_path, settings):
+    """
+    A tutor problem file embedded in an active page is not ingested as a content
+    file - tutor files are ingested separately as problem files.
+    """
+    settings.CANVAS_TUTORBOT_FOLDER = "web_resources/ai/tutor/"
+    html_content = """
+    <html>
+    <head><meta name="workflow_state" content="active"/></head>
+        <body>
+            <a href="$IMS-CC-FILEBASE$/ai/tutor/problem.pdf">Embedded problem</a>
+        </body>
+    </html>
+    """
+    manifest_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+      <resources>
+        <resource identifier="RES3" type="webcontent" href="web_resources/html_page.html">
+          <file href="web_resources/html_page.html"/>
+        </resource>
+      </resources>
+    </manifest>
+    """
+    zip_path = make_canvas_zip(
+        tmp_path,
+        module_xml=None,
+        manifest_xml=manifest_xml,
+        files=[
+            ("web_resources/html_page.html", html_content),
+            ("web_resources/ai/tutor/problem.pdf", "problem"),
+        ],
+    )
+    published = get_published_items(zip_path, {})
+    assert Path("web_resources/ai/tutor/problem.pdf").resolve() not in published
+
+
+def test_get_published_items_for_attachment_module(mocker, tmp_path):
+    """
+    Test that modules of "file attachment" type are included in published items
+    """
+    html_content = """
+    <html>
+    <head><meta name="workflow_state" content="active"/></head>
+        <body>
+            <a href="$IMS-CC-FILEBASE$/file1.pdf">Embedded File 1</a>
+        </body>
+    </html>
+    """
+    # hide the files section in the navbar
+    settings_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+        <course identifier="gfef28ec71f16246c57edfeef25b26a54"
+        xmlns="http://canvas.instructure.com/xsd/cccv1p0"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://canvas.instructure.com/xsd/cccv1p0
+        https://canvas.instructure.com/xsd/cccv1p0.xsd">
+            <title>Test Course Title</title>
+            <tab_configuration>[{"id":0},{"id":11, "hidden":true}]</tab_configuration>
+            <course_code>TEST-101</course_code>
+            <other_field>Other Value</other_field>
+        </course>
+    """
+    module_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <modules xmlns="http://canvas.instructure.com/xsd/cccv1p0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    >
+      <module xmlns="http://canvas.instructure.com/xsd/cccv1p0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://canvas.instructure.com/xsd/cccv1p0 https://canvas.instructure.com/xsd/cccv1p0.xsd">
+
+        <title>Module 1</title>
+        <workflow_state>active</workflow_state>
+        <items>
+
+          <item identifier="RES1">
+          <workflow_state>active</workflow_state>
+
+            <title>Item 2</title>
+            <hidden>false</hidden>
+             <locked>false</locked>
+            <identifierref>RES1</identifierref>
+            <content_type>resource</content_type>
+          </item>
+
+        </items>
+      </module>
+      <module xmlns="http://canvas.instructure.com/xsd/cccv1p0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://canvas.instructure.com/xsd/cccv1p0 https://canvas.instructure.com/xsd/cccv1p0.xsd">
+
+        <title>Module 2</title>
+
+        <items>
+
+          <item identifier="RES2">
+            <workflow_state>active</workflow_state>
+            <title>Item 2</title>
+            <hidden>false</hidden>
+             <locked>false</locked>
+            <identifierref>RES2</identifierref>
+            <content_type>resource</content_type>
+          </item>
+
+        </items>
+      </module>
+
+
+    </modules>
+    """
+    manifest_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1" xmlns:lom="http://ltsc.ieee.org/xsd/imsccv1p1/LOM/resource" xmlns:lomimscc="http://ltsc.ieee.org/xsd/imsccv1p1/LOM/manifest" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1 http://www.imsglobal.org/profile/cc/ccv1p1/ccv1p1_imscp_v1p2_v1p0.xsd http://ltsc.ieee.org/xsd/imsccv1p1/LOM/resource http://www.imsglobal.org/profile/cc/ccv1p1/LOM/ccv1p1_lomresource_v1p0.xsd http://ltsc.ieee.org/xsd/imsccv1p1/LOM/manifest http://www.imsglobal.org/profile/cc/ccv1p1/LOM/ccv1p1_lommanifest_v1p0.xsd">
+      <resources>
+        <resource identifier="RES1" type="webcontent"  href="web_resources/file1.pdf">
+          <file href="web_resources/file1.pdf"/>
+        </resource>
+        <item identifierref="RES2" type="attachment" href="web_resources/visible_attachment_module.txt">
+          <file href="web_resources/file2.html"/>
+        </item>
+        <resource identifier="RES2" type="attachment" href="web_resources/visible_attachment_module.txt">
+          <file href="web_resources/visible_attachment_module.txt"/>
+        </resource>
+        <resource identifier="RES3" type="webcontent" href="web_resources/html_page.html">
+          <file href="web_resources/html_page.html"/>
+        </resource>
+      </resources>
+    </manifest>
+    """
+    zip_path = make_canvas_zip(
+        tmp_path,
+        module_xml=module_xml,
+        manifest_xml=manifest_xml,
+        settings_xml=settings_xml,
+        files=[
+            ("web_resources/file1.pdf", "content of file1"),
+            ("web_resources/file2.html", "content of file2"),
+            (
+                "web_resources/visible_attachment_module.txt",
+                "content of visible_attachment_module",
+            ),
+            ("web_resources/html_page.html", html_content),
+        ],
+    )
+    url_config = {
+        "/file1.pdf": {
+            "url": "https://cdn.example.com/file1.pdf",
+            "locked": True,
+            "hidden": True,
+        },
+    }
+    published = get_published_items(zip_path, url_config)
+    assert Path("web_resources/visible_attachment_module.txt").resolve() in published
+
+
+def test_get_published_items_ingests_file_absent_from_files_meta(tmp_path):
+    """
+    An ordinary published file that Canvas omits from files_meta.xml (because it
+    has no non-default metadata) is still ingested via the manifest inventory.
+    """
+    manifest_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+      <resources>
+        <resource identifier="RES1" type="webcontent" href="web_resources/Syllabus/syllabus.docx">
+          <file href="web_resources/Syllabus/syllabus.docx"/>
+        </resource>
+      </resources>
+    </manifest>
+    """
+    # no module_meta.xml and no files_meta.xml: the file is reachable only via
+    # the manifest, exactly like the orphaned syllabus docx in course 2198.
+    zip_path = make_canvas_zip(
+        tmp_path,
+        module_xml=None,
+        manifest_xml=manifest_xml,
+        files=[("web_resources/Syllabus/syllabus.docx", "syllabus body")],
+    )
+    published = get_published_items(zip_path, {})
+    assert Path("web_resources/Syllabus/syllabus.docx").resolve() in published
+
+
+def test_get_published_items_excludes_file_in_locked_folder(tmp_path):
+    """
+    A file that is not individually locked but lives in a locked (or hidden)
+    folder is not ingested, even when it is absent from files_meta.xml.
+    """
+    manifest_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+      <resources>
+        <resource identifier="RES1" type="webcontent" href="web_resources/secret/hidden.pdf">
+          <file href="web_resources/secret/hidden.pdf"/>
+        </resource>
+        <resource identifier="RES2" type="webcontent" href="web_resources/open/shown.pdf">
+          <file href="web_resources/open/shown.pdf"/>
+        </resource>
+      </resources>
+    </manifest>
+    """
+    files_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <fileMeta xmlns="http://canvas.instructure.com/xsd/cccv1p0">
+      <folders>
+        <folder path="secret">
+          <locked>true</locked>
+        </folder>
+      </folders>
+    </fileMeta>
+    """
+    zip_path = make_canvas_zip(
+        tmp_path,
+        module_xml=None,
+        manifest_xml=manifest_xml,
+        files=[
+            ("course_settings/files_meta.xml", files_xml),
+            ("web_resources/secret/hidden.pdf", "hidden"),
+            ("web_resources/open/shown.pdf", "shown"),
+        ],
+    )
+    published = get_published_items(zip_path, {})
+    assert Path("web_resources/open/shown.pdf").resolve() in published
+    assert Path("web_resources/secret/hidden.pdf").resolve() not in published
+
+
+def test_get_published_items_subfolder_file_respects_hidden_file_section(tmp_path):
+    """
+    A file in a web_resources subfolder is excluded when the Files navigation
+    section is hidden (it would not be reachable by students).
+    """
+    manifest_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+      <resources>
+        <resource identifier="RES1" type="webcontent" href="web_resources/materials/notes.pdf">
+          <file href="web_resources/materials/notes.pdf"/>
+        </resource>
+      </resources>
+    </manifest>
+    """
+    files = [("web_resources/materials/notes.pdf", "notes")]
+    notes_path = Path("web_resources/materials/notes.pdf").resolve()
+
+    # files section visible (default settings) -> ingested
+    visible_zip = make_canvas_zip(
+        tmp_path, module_xml=None, manifest_xml=manifest_xml, files=files
+    )
+    assert notes_path in get_published_items(visible_zip, {})
+
+    # files section hidden -> excluded (re-uses tmp_path, overwriting the zip)
+    settings_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+        <course xmlns="http://canvas.instructure.com/xsd/cccv1p0">
+            <title>Test Course Title</title>
+            <tab_configuration>[{"id":0},{"id":11, "hidden":true}]</tab_configuration>
+            <course_code>TEST-101</course_code>
+        </course>
+    """
+    hidden_zip = make_canvas_zip(
+        tmp_path,
+        settings_xml=settings_xml,
+        module_xml=None,
+        manifest_xml=manifest_xml,
+        files=files,
+    )
+    assert notes_path not in get_published_items(hidden_zip, {})
+
+
+def test_parse_canvas_files_skips_html_and_tutor_files(tmp_path, settings):
+    """
+    parse_canvas_files enumerates webcontent files but skips HTML pages (handled
+    by parse_web_content) and tutor problem files (ingested separately).
+    """
+    settings.CANVAS_TUTORBOT_FOLDER = "web_resources/ai/tutor/"
+    manifest_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+      <resources>
+        <resource identifier="RES1" type="webcontent" href="web_resources/doc.pdf">
+          <file href="web_resources/doc.pdf"/>
+        </resource>
+        <resource identifier="RES2" type="webcontent" href="web_resources/page.html">
+          <file href="web_resources/page.html"/>
+        </resource>
+        <resource identifier="RES3" type="webcontent" href="web_resources/ai/tutor/Unit1/problem.docx">
+          <file href="web_resources/ai/tutor/Unit1/problem.docx"/>
+        </resource>
+      </resources>
+    </manifest>
+    """
+    zip_path = make_canvas_zip(tmp_path, module_xml=None, manifest_xml=manifest_xml)
+    result = parse_canvas_files(zip_path)
+    active_paths = {str(item["path"]) for item in result["active"]}
+    assert active_paths == {"web_resources/doc.pdf"}
+
+
+def test_ingestion_finishes_with_missing_xml_files(
+    tmp_path, mocker, sample_pdf_content
+):
+    """
+    Test that canvas course ingestion succeeds even if some config XML files are missing
+    """
+    mocker.patch(
+        "learning_resources.etl.canvas_utils.parse_context_xml",
+        return_value={"course_id": "123", "canvas_domain": "mit.edu"},
+    )
+    manifest_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+      <resources>
+        <resource identifier="RES1" type="webcontent"  href="web_resources/file1.pdf">
+          <file href="web_resources/file1.pdf"/>
+        </resource>
+        <resource identifier="RES2" type="webcontent" href="web_resources/file2.html">
+          <file href="web_resources/file2.html"/>
+        </resource>
+        <resource identifier="RES3" type="webcontent" href="web_resources/html_page.html">
+          <file href="web_resources/html_page.html"/>
+        </resource>
+      </resources>
+    </manifest>
+    """
+    files_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+        <fileMeta xmlns="http://canvas.instructure.com/xsd/cccv1p0"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://canvas.instructure.com/xsd/cccv1p0 https://canvas.instructure.com/xsd/cccv1p0.xsd">
+        <files>
+        <file identifier="RES1">
+          <category>uncategorized</category>
+        </file>
+        <file identifier="RES2">
+          <category>uncategorized</category>
+        </file>
+        <file identifier="RES3">
+          <category>uncategorized</category>
+        </file>
+        </files>
+        </fileMeta>
+    """
+    zip_path = make_canvas_zip(
+        tmp_path,
+        manifest_xml=manifest_xml,
+        files=[
+            ("course_settings/files_meta.xml", files_xml),
+            ("web_resources/file1.pdf", sample_pdf_content),
+            ("web_resources/file2.html", "content of file2"),
+            ("web_resources/html_page.html", ""),
+        ],
+    )
+    mocker.patch(
+        "learning_resources.etl.utils.extract_text_metadata",
+        return_value={"content": "test"},
+    )
+    _, run = run_for_canvas_archive(
+        zip_path, tmp_path, checksum="abc123", overwrite=True
+    )
+    content_results = list(
+        transform_canvas_content_files(
+            Path(zip_path), run, url_config={}, overwrite=True
+        )
+    )
+    assert run is not None
+    assert len(content_results) > 0
+
+
+@pytest.mark.parametrize("overwrite", [True, False])
+@pytest.mark.parametrize("existing_file", [True, False])
+def test_transform_canvas_problem_files_pdf_calls_llm_for_ocr(  # noqa: PLR0913
+    tmp_path, mocker, settings, overwrite, existing_file, sample_pdf_content
+):
+    """
+    Test that transform_canvas_problem_files calls _pdf_to_markdown for PDF files.
+    if overwrite is True or there is no existing file. Tikka should not be called
+    """
+
+    settings.CANVAS_TUTORBOT_FOLDER = "tutorbot/"
+    settings.OCR_MODEL = "test model"
+
+    pdf_filename = "problemset1/problem.pdf"
+
+    zip_path = make_canvas_zip(
+        tmp_path, files=[(f"tutorbot/{pdf_filename}", sample_pdf_content)]
+    )
+
+    # return a file with pdf extension
+    fake_file_data = {
+        "run": "run",
+        "content_type": "application/pdf",
+        "archive_checksum": "checksum",
+        "source_path": f"tutorbot/{pdf_filename}",
+        "file_extension": ".pdf",
+    }
+
+    mocker.patch(
+        "learning_resources.etl.utils.documents_from_olx",
+        return_value=iter([[mocker.Mock(), fake_file_data]]),
+    )
+
+    # Patch _pdf_to_markdown to return a known value
+    pdf_to_md = mocker.patch(
+        "learning_resources.etl.utils._pdf_to_markdown",
+        return_value="markdown content from pdf",
+    )
+
+    tika = mocker.patch(
+        "learning_resources.etl.utils.extract_text_metadata",
+    )
+
+    run = LearningResourceRunFactory.create()
+
+    if existing_file:
+        TutorProblemFileFactory.create(
+            run=run,
+            type="problem",
+            archive_checksum="checksum",
+            source_path=f"tutorbot/{pdf_filename}",
+            content="existing content",
+            file_name="problem1.pdf",
+        )
+
+    results = list(transform_canvas_problem_files(zip_path, run, overwrite=overwrite))
+
+    if overwrite or not existing_file:
+        pdf_to_md.assert_called_once()
+    else:
+        pdf_to_md.assert_not_called()
+
+    tika.assert_not_called()
+
+    assert (
+        results[0]["content"] == "markdown content from pdf"
+        if overwrite or not existing_file
+        else "existing content"
+    )
+    assert results[0]["problem_title"] == "problemset1"
+
+
+def test_empty_pdf_is_skipped(tmp_path):
+    """Empty PDF files should be handled gracefully, not raise an exception."""
+    empty_pdf = tmp_path / "empty.pdf"
+    empty_pdf.write_bytes(b"")
+
+    # Should not raise EmptyFileError
+    result = list(
+        process_olx_path(
+            str(empty_pdf), LearningResourceRunFactory.create(), overwrite=True
+        )
+    )
+    assert result == []
+
+
+LOCK_FILES_XML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
+<fileMeta xmlns="http://canvas.instructure.com/xsd/cccv1p0">
+<files>
+<file identifier="RES3">
+  <display_name>{display_name}</display_name>
+  <unlock_at>{unlock_at}</unlock_at>
+  <category>uncategorized</category>
+</file>
+</files>
+</fileMeta>
+"""
+
+LOCK_MANIFEST_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
+<manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+  <resources>
+    <resource identifier="RES3" type="webcontent">
+      <file href="web_resources/file3.html"/>
+    </resource>
+  </resources>
+</manifest>
+"""
+
+
+def make_timed_lock_zip(  # noqa: PLR0913
+    tmp_path,
+    unlock_at,
+    name="lock_course.zip",
+    settings_xml=DEFAULT_SETTINGS_XML,
+    manifest_xml=LOCK_MANIFEST_XML,
+    display_name="file3",
+    content=b"<html>one</html>",
+):
+    """Course archive with one file whose visibility is gated by unlock_at"""
+    zip_path = tmp_path / name
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("course_settings/course_settings.xml", settings_xml)
+        zf.writestr(
+            "course_settings/files_meta.xml",
+            LOCK_FILES_XML_TEMPLATE.format(
+                unlock_at=unlock_at, display_name=display_name
+            ).encode(),
+        )
+        zf.writestr("imsmanifest.xml", manifest_xml)
+        zf.writestr("web_resources/file3.html", content)
+    return zip_path
+
+
+UNLOCKED = "2001-01-01T00:00:00"
+
+
+def test_canvas_course_checksum_ignores_export_noise(tmp_path):
+    """
+    Archives differing only in imsmanifest.xml bytes and course_settings/*
+    bytes AND size must produce the same digest — Canvas rewrites these on
+    every no-op export (verified across 13 prod course pairs).
+    """
+    a = make_timed_lock_zip(tmp_path, UNLOCKED, name="a.zip")
+    b = make_timed_lock_zip(
+        tmp_path,
+        UNLOCKED,
+        name="b.zip",
+        settings_xml=DEFAULT_SETTINGS_XML + b"<!-- export noise, new size -->",
+        manifest_xml=LOCK_MANIFEST_XML.replace(b"<resources>", b"<resources >"),
+    )
+    assert canvas_course_checksum(a, {}) == canvas_course_checksum(b, {})
+
+
+def test_canvas_course_checksum_detects_same_size_content_edit(tmp_path):
+    """
+    A content member with identical name and size but different bytes must
+    change the digest — parity with the per-file archive_checksum gate that
+    the archive-level skip would otherwise shadow.
+    """
+    a = make_timed_lock_zip(
+        tmp_path, UNLOCKED, name="a.zip", content=b"<html>one</html>"
+    )
+    b = make_timed_lock_zip(
+        tmp_path, UNLOCKED, name="b.zip", content=b"<html>two</html>"
+    )
+    assert canvas_course_checksum(a, {}) != canvas_course_checksum(b, {})
+
+
+def test_canvas_course_checksum_independent_of_member_order(tmp_path):
+    """Zip directory order must not affect the digest"""
+    members = [
+        ("web_resources/x.html", b"xx"),
+        ("web_resources/y.html", b"yy"),
+        ("course_settings/course_settings.xml", DEFAULT_SETTINGS_XML),
+    ]
+    digests = []
+    for name, order in (("a.zip", members), ("b.zip", members[::-1])):
+        with zipfile.ZipFile(tmp_path / name, "w") as zf:
+            for member, content in order:
+                zf.writestr(member, content)
+        digests.append(canvas_course_checksum(tmp_path / name, {}))
+    assert digests[0] == digests[1]
+
+
+def test_canvas_course_checksum_sensitive_to_url_config(tmp_path):
+    """
+    url_config (from the .metadata.json sidecar) feeds ContentFile urls; a
+    changed url must change the digest even when the archive is unchanged.
+    """
+    zip_path = make_timed_lock_zip(tmp_path, UNLOCKED)
+    with_url = {"/file3.html": {"url": "https://mit.edu/f/1"}}
+    reminted = {"/file3.html": {"url": "https://mit.edu/f/2"}}
+    assert canvas_course_checksum(zip_path, with_url) != canvas_course_checksum(
+        zip_path, reminted
+    )
+
+
+def test_canvas_course_checksum_sensitive_to_display_name(tmp_path):
+    """
+    A same-length display_name change lives in the excluded files_meta.xml;
+    the publish-set component must still catch it (it feeds content_title).
+    """
+    a = make_timed_lock_zip(tmp_path, UNLOCKED, name="a.zip", display_name="fileA")
+    b = make_timed_lock_zip(tmp_path, UNLOCKED, name="b.zip", display_name="fileB")
+    assert canvas_course_checksum(a, {}) != canvas_course_checksum(b, {})
+
+
+def test_canvas_course_checksum_changes_when_lock_boundary_passes(tmp_path):
+    """
+    The same archive must produce a different checksum once a timed lock
+    boundary passes — publish status depends on wall-clock time, and the gate
+    must reprocess when it flips.
+    """
+    zip_path = make_timed_lock_zip(tmp_path, "2026-09-01T00:00:00")
+    with freeze_time("2026-08-15"):
+        while_locked = canvas_course_checksum(zip_path, {})
+    with freeze_time("2026-09-15"):
+        after_unlock = canvas_course_checksum(zip_path, {})
+    assert while_locked != after_unlock
+
+
+def test_canvas_course_checksum_is_cwd_independent(tmp_path, monkeypatch):
+    """Checksum must not embed the worker process's working directory"""
+    zip_path = make_timed_lock_zip(tmp_path, "2001-01-01T00:00:00")
+    digest = canvas_course_checksum(zip_path, {})
+    other_cwd = tmp_path / "elsewhere"
+    other_cwd.mkdir()
+    monkeypatch.chdir(other_cwd)
+    assert canvas_course_checksum(zip_path, {}) == digest
+
+
+@pytest.fixture
+def sync_mocks(mocker, tmp_path):
+    """Bucket/url_config/loader mocks for sync_canvas_archive"""
+    zip_path = make_timed_lock_zip(tmp_path, "2001-01-01T00:00:00")
+
+    def fake_download(key, dest):
+        Path(dest).write_bytes(zip_path.read_bytes())
+
+    bucket = MagicMock()
+    bucket.download_file.side_effect = fake_download
+    mocker.patch("learning_resources.etl.canvas.canvas_url_config", return_value={})
+    mocker.patch(
+        "learning_resources.etl.utils.extract_text_metadata",
+        return_value={"content": "TEXT"},
+    )
+    mocker.patch(
+        "learning_resources.etl.canvas_utils.parse_context_xml",
+        return_value={"course_id": "123", "canvas_domain": "mit.edu"},
+    )
+    load_content = mocker.patch("learning_resources.etl.loaders.load_content_files")
+    load_problems = mocker.patch("learning_resources.etl.loaders.load_problem_files")
+    return SimpleNamespace(
+        bucket=bucket, load_content=load_content, load_problems=load_problems
+    )
+
+
+def _canvas_run(readable_id):
+    return LearningResource.objects.get(readable_id=readable_id).runs.first()
+
+
+def test_sync_canvas_archive_skips_unchanged_archive(sync_mocks):
+    """A second sync of an unchanged archive must not reload content"""
+    readable_id = sync_canvas_archive(
+        sync_mocks.bucket, "canvas/course_content/1/abc.imscc", overwrite=False
+    )
+    assert sync_mocks.load_content.call_count == 1
+    first_checksum = _canvas_run(readable_id).checksum
+    assert first_checksum
+
+    sync_canvas_archive(
+        sync_mocks.bucket, "canvas/course_content/1/abc.imscc", overwrite=False
+    )
+    assert sync_mocks.load_content.call_count == 1
+    assert _canvas_run(readable_id).checksum == first_checksum
+
+
+@pytest.mark.parametrize(
+    ("published", "reloaded"),
+    [(True, False), (False, True)],
+    ids=["published_rows", "all_rows_unpublished"],
+)
+def test_sync_canvas_archive_reloads_unpublished_run(sync_mocks, published, reloaded):
+    """
+    An unchanged archive is skipped unless every row of its run is unpublished,
+    which a bulk deindex does and the export never does
+    """
+    readable_id = sync_canvas_archive(
+        sync_mocks.bucket, "canvas/course_content/1/abc.imscc", overwrite=False
+    )
+    ContentFileFactory.create_batch(
+        2, run=_canvas_run(readable_id), published=published
+    )
+
+    sync_canvas_archive(
+        sync_mocks.bucket, "canvas/course_content/1/abc.imscc", overwrite=False
+    )
+    assert sync_mocks.load_content.call_count == (2 if reloaded else 1)
+
+
+def test_sync_canvas_archive_saves_checksum_only_after_successful_load(sync_mocks):
+    """
+    A failed load must leave the checksum unset so the next sync retries
+    instead of silently skipping content that was never ingested.
+    """
+    sync_mocks.load_content.side_effect = Exception("load failed")
+    with pytest.raises(Exception, match="load failed"):
+        sync_canvas_archive(
+            sync_mocks.bucket, "canvas/course_content/1/abc.imscc", overwrite=False
+        )
+    resource = LearningResource.objects.get(etl_source=ETLSource.canvas.name)
+    assert resource.runs.first().checksum is None
+
+    sync_mocks.load_content.side_effect = None
+    sync_canvas_archive(
+        sync_mocks.bucket, "canvas/course_content/1/abc.imscc", overwrite=False
+    )
+    assert sync_mocks.load_content.call_count == 2
+    assert resource.runs.first().checksum
+
+
+def test_sync_canvas_archive_retries_when_nothing_loads(sync_mocks):
+    """
+    load_content_files returning [] (all files failed without raising) must
+    NOT save the checksum — the next sync retries instead of skipping content
+    that was never ingested.
+    """
+    sync_mocks.load_content.return_value = []
+    readable_id = sync_canvas_archive(
+        sync_mocks.bucket, "canvas/course_content/1/abc.imscc", overwrite=False
+    )
+    assert _canvas_run(readable_id).checksum is None
+
+    sync_mocks.load_content.return_value = [1]
+    sync_canvas_archive(
+        sync_mocks.bucket, "canvas/course_content/1/abc.imscc", overwrite=False
+    )
+    assert sync_mocks.load_content.call_count == 2
+    assert _canvas_run(readable_id).checksum
+
+
+def test_sync_canvas_archive_retries_when_problem_files_fail(mocker, sync_mocks):
+    """
+    Tutor problem files yielded but none loaded (load_problem_file swallows
+    per-file errors and returns None) must NOT save the checksum, so the next
+    sync retries.
+    """
+    mocker.patch(
+        "learning_resources.etl.canvas.transform_canvas_problem_files",
+        side_effect=lambda *_args, **_kwargs: iter(
+            [{"source_path": "tutorbot/p1/problem.pdf"}]
+        ),
+    )
+    sync_mocks.load_problems.return_value = [None]
+    readable_id = sync_canvas_archive(
+        sync_mocks.bucket, "canvas/course_content/1/abc.imscc", overwrite=False
+    )
+    assert _canvas_run(readable_id).checksum is None
+
+    sync_mocks.load_problems.return_value = [7]
+    sync_canvas_archive(
+        sync_mocks.bucket, "canvas/course_content/1/abc.imscc", overwrite=False
+    )
+    assert _canvas_run(readable_id).checksum
+
+
+def test_sync_canvas_archive_saves_checksum_for_legitimately_empty_course(
+    mocker, sync_mocks, tmp_path
+):
+    """
+    A course with nothing published yields no payloads and loads nothing;
+    that's not a failure — save the checksum so it isn't reprocessed weekly.
+    (The publish-set digest component unfreezes it if anything is published.)
+    """
+    locked_zip = make_timed_lock_zip(
+        tmp_path, "2099-01-01T00:00:00", name="all_locked.zip"
+    )
+
+    def fake_download(key, dest):
+        Path(dest).write_bytes(locked_zip.read_bytes())
+
+    sync_mocks.bucket.download_file.side_effect = fake_download
+    sync_mocks.load_content.return_value = []
+    readable_id = sync_canvas_archive(
+        sync_mocks.bucket, "canvas/course_content/1/abc.imscc", overwrite=False
+    )
+    assert _canvas_run(readable_id).checksum
+
+
+def test_sync_canvas_archive_keeps_rows_when_export_goes_empty(sync_mocks, tmp_path):
+    """
+    An export that drops to no files keeps its rows published, so the next
+    unchanged sync skips instead of treating the run as stale forever
+    """
+    key = "canvas/course_content/1/abc.imscc"
+    readable_id = sync_canvas_archive(sync_mocks.bucket, key, overwrite=False)
+    rows = ContentFileFactory.create_batch(
+        2, run=_canvas_run(readable_id), published=True
+    )
+    locked_zip = make_timed_lock_zip(
+        tmp_path, "2099-01-01T00:00:00", name="all_locked.zip"
+    )
+    sync_mocks.bucket.download_file.side_effect = lambda _key, dest: Path(
+        dest
+    ).write_bytes(locked_zip.read_bytes())
+    sync_mocks.load_content.return_value = []
+
+    sync_canvas_archive(sync_mocks.bucket, key, overwrite=False)
+    sync_canvas_archive(sync_mocks.bucket, key, overwrite=False)
+
+    assert sync_mocks.load_content.call_count == 2
+    assert all(ContentFile.objects.get(id=row.id).published for row in rows)
+
+
+TWO_FILE_MANIFEST_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
+<manifest xmlns="http://www.imsglobal.org/xsd/imsccv1p1/imscp_v1p1">
+  <resources>
+    <resource identifier="RES3" type="webcontent">
+      <file href="web_resources/file3.html"/>
+    </resource>
+    <resource identifier="RES4" type="webcontent">
+      <file href="web_resources/file4.pdf"/>
+    </resource>
+  </resources>
+</manifest>
+"""
+
+
+def test_sync_canvas_archive_partial_failure_retains_and_stamps(
+    mocker, tmp_path, sync_mocks
+):
+    """One raising file: others yield, failed record survives the transform's
+    delete pass, failed_keys reaches load_content_files, checksum is stamped
+    """
+    two_file_zip = make_timed_lock_zip(
+        tmp_path,
+        "2001-01-01T00:00:00",
+        name="two_files.zip",
+        manifest_xml=TWO_FILE_MANIFEST_XML,
+    )
+    with zipfile.ZipFile(two_file_zip, "a") as zf:
+        zf.writestr("web_resources/file4.pdf", b"%PDF-fake")
+
+    def fake_download(_key, dest):
+        Path(dest).write_bytes(two_file_zip.read_bytes())
+
+    sync_mocks.bucket.download_file.side_effect = fake_download
+
+    # first sync materializes the resource/run (loaders are mocked, so no rows)
+    key = "canvas/course_content/1/abc.imscc"
+    readable_id = sync_canvas_archive(sync_mocks.bucket, key, overwrite=False)
+    run = _canvas_run(readable_id)
+    failing_key = get_edx_module_id(str(Path("abc") / "web_resources/file4.pdf"), run)
+    existing = ContentFileFactory.create(run=run, key=failing_key, published=True)
+
+    def fake_extract(document, metadata, olx_path, key, **kwargs):
+        if "file4.pdf" in metadata["source_path"]:
+            msg = "converter output missing"
+            raise FileNotFoundError(msg)
+        return {"content": "TEXT", "content_title": ""}
+
+    mocker.patch(
+        "learning_resources.etl.utils._extract_content", side_effect=fake_extract
+    )
+
+    sync_canvas_archive(sync_mocks.bucket, key, overwrite=True)
+
+    assert ContentFile.objects.filter(id=existing.id).exists()
+    assert sync_mocks.load_content.call_args.kwargs["failed_keys"] == [failing_key]
+    assert _canvas_run(readable_id).checksum
+
+
+def test_sync_canvas_archive_total_failure_does_not_stamp_checksum(mocker, sync_mocks):
+    """Every file raising: checksum NOT stamped, so next sync retries"""
+    # a bare MagicMock return is truthy and would satisfy content_loaded via
+    # content_files_ids, bypassing the gate under test
+    sync_mocks.load_content.return_value = []
+    mocker.patch(
+        "learning_resources.etl.utils._extract_content",
+        side_effect=FileNotFoundError("converter output missing"),
+    )
+
+    readable_id = sync_canvas_archive(
+        sync_mocks.bucket, "canvas/course_content/1/abc.imscc", overwrite=False
+    )
+
+    assert _canvas_run(readable_id).checksum is None
+
+
+def test_sync_canvas_archive_partial_problem_failure_still_stamps(mocker, sync_mocks):
+    """A course whose only tutor problem file fails extraction must still stamp
+    the checksum when content files loaded — retry happens on archive change,
+    not every sync
+    """
+
+    def fake_problems(_path, _run, *, overwrite, failed_source_paths=None):
+        failed_source_paths.append("tutorbot/p1/broken.pdf")
+        return iter([])
+
+    mocker.patch(
+        "learning_resources.etl.canvas.transform_canvas_problem_files",
+        side_effect=fake_problems,
+    )
+    sync_mocks.load_problems.return_value = []
+
+    readable_id = sync_canvas_archive(
+        sync_mocks.bucket, "canvas/course_content/1/abc.imscc", overwrite=False
+    )
+
+    assert _canvas_run(readable_id).checksum

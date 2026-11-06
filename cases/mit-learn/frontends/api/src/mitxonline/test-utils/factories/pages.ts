@@ -1,0 +1,356 @@
+import { faker } from "@faker-js/faker/locale/en"
+import { mergeOverrides } from "ol-test-utilities"
+import type { PartialFactory, Factory } from "ol-test-utilities"
+import type {
+  FeatureImage,
+  CoursePageItem,
+  PriceItem,
+  Faculty,
+  CoursePageList,
+  V2Course,
+  ProgramPageItem,
+  FAQItem,
+  TestimonialItem,
+} from "@mitodl/mitxonline-api-axios/v2"
+import { UniqueEnforcer } from "enforce-unique"
+import { program } from "./programs"
+
+const makeHTMLParagraph = (num: number) => {
+  return Array.from(
+    { length: num },
+    () => `<p>${faker.lorem.paragraph()}</p>`,
+  ).join("\n\n")
+}
+const makeHTMLList = (num: number) => {
+  return `<ul>\n${Array.from(
+    { length: num },
+    () => `  <li>${faker.lorem.sentence()}</li>`,
+  ).join("\n")}\n</ul>`
+}
+
+const featureImage: Factory<FeatureImage> = (override) => {
+  return {
+    height: faker.number.int({ min: 100, max: 1000 }),
+    image_url: faker.internet.url(),
+    title: faker.lorem.words(3),
+    width: faker.number.int({ min: 100, max: 1000 }),
+    ...override,
+  }
+}
+
+const priceItem: Factory<PriceItem> = (override) => {
+  return {
+    id: faker.string.uuid(),
+    type: "price_details",
+    value: { link: "", text: "$99.00" },
+    ...override,
+  }
+}
+
+const uniqueFacultyId = new UniqueEnforcer()
+const faculty: Factory<Faculty> = (override) => {
+  return {
+    feature_image_src: faker.image.url({ width: 640, height: 480 }),
+    id: uniqueFacultyId.enforce(() => faker.number.int()),
+    instructor_bio_long: makeHTMLParagraph(2),
+    instructor_bio_short: faker.lorem.sentences(2),
+    instructor_name: faker.person.fullName(),
+    instructor_title: faker.person.jobTitle(),
+    ...override,
+  }
+}
+
+const uniqueFaqId = new UniqueEnforcer()
+const faqItem: Factory<FAQItem> = (override) => {
+  return {
+    id: uniqueFaqId.enforce(() => faker.number.int()),
+    question: `${faker.lorem.sentence().replace(/\.$/, "")}?`,
+    answer: makeHTMLParagraph(1),
+    ...override,
+  }
+}
+
+const uniqueTestimonialId = new UniqueEnforcer()
+const testimonialItem: Factory<TestimonialItem> = (override) => {
+  return {
+    id: uniqueTestimonialId.enforce(() => faker.number.int()),
+    quote: faker.lorem.sentences(2),
+    name: faker.person.fullName(),
+    title: faker.person.jobTitle(),
+    date_published: faker.date.past().toISOString().slice(0, 10),
+    image_src: faker.image.avatar(),
+    ...override,
+  }
+}
+
+const uniqueCourseId = new UniqueEnforcer()
+
+const v2Course: PartialFactory<V2Course> = (overrides = {}) => {
+  const defaults: V2Course = {
+    id: uniqueCourseId.enforce(() => faker.number.int()),
+    title: faker.lorem.words(3),
+    readable_id: faker.lorem.slug(),
+    certificate_available: faker.datatype.boolean(),
+    page: {
+      feature_image_src: faker.image.avatar(),
+      page_url: faker.internet.url(),
+      description: faker.lorem.paragraph(),
+      live: faker.datatype.boolean(),
+      length: `${faker.number.int({ min: 1, max: 12 })} weeks`,
+      effort: `${faker.number.int({ min: 1, max: 10 })} hours/week`,
+      financial_assistance_form_url: faker.internet.url(),
+      instructors: [
+        {
+          name: faker.person.fullName(),
+          bio: faker.lorem.paragraph(),
+        },
+        {
+          name: faker.person.fullName(),
+          bio: faker.lorem.paragraph(),
+        },
+      ],
+      current_price: faker.number.int({ min: 0, max: 1000 }),
+    },
+    availability: faker.helpers.arrayElement(["anytime", "dated"]),
+    min_weekly_hours: `${faker.number.int({ min: 1, max: 5 })} hours`,
+    max_weekly_hours: `${faker.number.int({ min: 6, max: 10 })} hours`,
+    certificate_type: faker.lorem.word(),
+    required_prerequisites: faker.datatype.boolean(),
+    duration: `${faker.number.int({ min: 1, max: 12 })} weeks`,
+    min_weeks: faker.number.int({ min: 1, max: 4 }),
+    max_weeks: faker.number.int({ min: 5, max: 12 }),
+    time_commitment: `${faker.number.int({ min: 1, max: 10 })} hours/week`,
+    topics: [
+      {
+        name: faker.lorem.word(),
+      },
+    ],
+    departments: [
+      {
+        name: faker.company.name(),
+      },
+    ],
+    programs: [],
+    min_price: faker.number.int({ min: 0, max: 1000 }),
+    max_price: faker.number.int({ min: 1000, max: 2000 }),
+    include_in_learn_catalog: faker.datatype.boolean(),
+    ingest_content_files_for_ai: faker.datatype.boolean(),
+    next_run_id: faker.number.int(),
+    possible_variant_sets: [],
+  }
+  return mergeOverrides<V2Course>(defaults, overrides)
+}
+
+const uniquePageId = new UniqueEnforcer()
+const coursePageItem: PartialFactory<CoursePageItem> = (override) => {
+  const defaults: CoursePageItem = {
+    about: makeHTMLParagraph(3),
+    certificate_page: null,
+    course_details: v2Course(),
+    description: faker.lorem.sentences(2),
+    effort: `${faker.number.int({ min: 1, max: 10 })} hours per week`,
+    faculty: Array.from({ length: faker.number.int({ min: 1, max: 3 }) }, () =>
+      faculty(),
+    ),
+    faculty_section_title: "About the Faculty",
+    faq_url: faker.internet.url(),
+    faqs: Array.from({ length: 3 }, () => faqItem()),
+    testimonials: Array.from({ length: 3 }, () => testimonialItem()),
+    feature_image: featureImage(),
+    id: uniquePageId.enforce(() => faker.number.int()),
+    include_in_learn_catalog: faker.datatype.boolean(),
+    ingest_content_files_for_ai: faker.datatype.boolean(),
+    hubspot_form_id: faker.datatype.boolean() ? faker.string.uuid() : "",
+    length: `${faker.number.int({ min: 1, max: 12 })} weeks`,
+    max_price: `${faker.number.int({ min: 50, max: 500 })}`,
+    max_weekly_hours: `${faker.number.int({ min: 1, max: 20 })}`,
+    show_course_outline: true,
+    max_weeks: faker.number.int({ min: 1, max: 12 }),
+    meta: {
+      alias_of: null,
+      detail_url: faker.internet.url(),
+      first_published_at: faker.date.past().toISOString(),
+      html_url: faker.internet.url(),
+      last_published_at: faker.date.recent().toISOString(),
+      live: true,
+      locale: "en-us",
+      search_description: faker.lorem.sentence(),
+      seo_title: faker.lorem.sentence(),
+      show_in_menus: false,
+      slug: faker.lorem.slug(),
+      type: "cms.CertificatePage",
+    },
+    min_price: `${faker.number.int({ min: 0, max: 49 })}`,
+    min_weekly_hours: `${faker.number.int({ min: 1, max: 20 })}`,
+    min_weeks: faker.number.int({ min: 1, max: 12 }),
+    prerequisites: makeHTMLList(2),
+    price: [priceItem()],
+    title: faker.lorem.words(3),
+    topic_list: [
+      {
+        name: faker.lorem.word(),
+        parent: faker.lorem.word(),
+      },
+    ],
+    video_url: faker.internet.url(),
+    what_you_learn: makeHTMLList(5),
+    how_youll_learn: [
+      {
+        key: "learn_by_doing",
+        icon: "IconComputerBulb",
+        title: "Learn by doing",
+        text: "Apply what you learn with interactive exercises, projects, and real-world case studies.",
+      },
+      {
+        key: "realworld_learning",
+        icon: "IconConnectedPeople",
+        title: "Real-world learning",
+        text: "Engage with real-world scenarios and examples to understand how concepts apply in practice.",
+      },
+      {
+        key: "learn_from_others",
+        icon: "IconConnectedPeople",
+        title: "Learn from others",
+        text: "Collaborate with peers and learn from their perspectives through group projects and discussions.",
+      },
+      {
+        key: "learn_on_demand",
+        icon: "IconComputerBulb",
+        title: "Learn on demand",
+        text: "Access course materials anytime, anywhere, and learn at your own pace.",
+      },
+    ],
+  }
+  return mergeOverrides<CoursePageItem>(defaults, override)
+}
+
+const coursePageList: PartialFactory<CoursePageList> = (override) => {
+  const defaults: CoursePageList = {
+    meta: { total_count: 1 },
+    items: [coursePageItem()],
+  }
+  return mergeOverrides<CoursePageList>(defaults, override)
+}
+
+const programPageItem: PartialFactory<ProgramPageItem> = (override) => {
+  const defaults: ProgramPageItem = {
+    id: uniquePageId.enforce(() => faker.number.int()),
+    meta: {
+      alias_of: null,
+      detail_url: faker.internet.url(),
+      first_published_at: faker.date.past().toISOString(),
+      html_url: faker.internet.url(),
+      last_published_at: faker.date.recent().toISOString(),
+      live: true,
+      locale: "en-us",
+      search_description: faker.lorem.sentence(),
+      seo_title: faker.lorem.sentence(),
+      show_in_menus: false,
+      slug: faker.lorem.slug(),
+      type: "cms.ProgramPage",
+    },
+    title: faker.lorem.words(3),
+    description: makeHTMLParagraph(1),
+    length: `${faker.number.int({ min: 1, max: 4 })} terms (${faker.number.int({ min: 6, max: 24 })} months)`,
+    effort: `${faker.number.int({ min: 5, max: 20 })} hours per week`,
+    min_weekly_hours: `${faker.number.int({ min: 5, max: 10 })}`,
+    max_weekly_hours: `${faker.number.int({ min: 11, max: 20 })}`,
+    min_weeks: faker.number.int({ min: 24, max: 48 }),
+    max_weeks: faker.number.int({ min: 48, max: 96 }),
+    price: [
+      priceItem({
+        value: {
+          text: `$${faker.number.int({ min: 250, max: 1000 })} - $${faker.number.int({ min: 1000, max: 5000 })} per course`,
+          link: "",
+        },
+      }),
+    ],
+    min_price: `${faker.number.int({ min: 1000, max: 2500 })}`,
+    max_price: `${faker.number.int({ min: 2500, max: 10000 })}`,
+    hubspot_form_id: faker.datatype.boolean() ? faker.string.uuid() : "",
+    prerequisites: makeHTMLParagraph(1),
+    faq_url: faker.internet.url(),
+    faqs: Array.from({ length: 3 }, () => faqItem()),
+    testimonials: Array.from({ length: 3 }, () => testimonialItem()),
+    about: makeHTMLParagraph(3),
+    what_you_learn: makeHTMLList(5),
+    how_youll_learn: [
+      {
+        key: "learn_by_doing",
+        icon: "IconComputerBulb",
+        title: "Learn by doing",
+        text: "Apply what you learn with interactive exercises, projects, and real-world case studies.",
+      },
+      {
+        key: "realworld_learning",
+        icon: "IconConnectedPeople",
+        title: "Real-world learning",
+        text: "Engage with real-world scenarios and examples to understand how concepts apply in practice.",
+      },
+      {
+        key: "learn_from_others",
+        icon: "IconConnectedPeople",
+        title: "Learn from others",
+        text: "Collaborate with peers and learn from their perspectives through group projects and discussions.",
+      },
+      {
+        key: "learn_on_demand",
+        icon: "IconComputerBulb",
+        title: "Learn on demand",
+        text: "Access course materials anytime, anywhere, and learn at your own pace.",
+      },
+    ],
+    feature_image: featureImage(),
+    video_url: faker.datatype.boolean() ? faker.internet.url() : null,
+    faculty_section_title: "Meet your instructors",
+    faculty: Array.from({ length: faker.number.int({ min: 2, max: 6 }) }, () =>
+      faculty(),
+    ),
+    certificate_page: {
+      id: faker.number.int({ min: 100, max: 200 }),
+      meta: {
+        alias_of: null,
+        detail_url: faker.internet.url(),
+        first_published_at: faker.date.past().toISOString(),
+        html_url: faker.internet.url(),
+        last_published_at: faker.date.recent().toISOString(),
+        live: true,
+        locale: "en-us",
+        search_description: faker.lorem.sentence(),
+        seo_title: faker.lorem.sentence(),
+        show_in_menus: false,
+        slug: faker.lorem.slug(),
+        type: "cms.CertificatePage",
+      },
+      title: `Certificate For ${faker.lorem.words(3)}`,
+      product_name: faker.lorem.words(3),
+      CEUs: "",
+      overrides: [],
+      signatory_items: Array.from(
+        { length: faker.number.int({ min: 3, max: 5 }) },
+        () => ({
+          name: faker.person.fullName(),
+          title_1: faker.person.jobTitle(),
+          title_2: faker.person.jobTitle(),
+          title_3: "",
+          organization: "Massachusetts Institute of Technology",
+          signature_image: faker.image.url({
+            width: 200,
+            height: 100,
+          }),
+        }),
+      ),
+    },
+    program_details: program(override?.program_details ?? {}),
+  }
+  return mergeOverrides<ProgramPageItem>(defaults, override)
+}
+
+export {
+  coursePageItem,
+  coursePageList,
+  faculty,
+  faqItem,
+  testimonialItem,
+  programPageItem,
+}

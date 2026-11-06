@@ -1,0 +1,545 @@
+"""Tests for ETL pipelines"""
+
+from contextlib import contextmanager
+from datetime import UTC, datetime
+from importlib import reload
+from unittest.mock import patch
+
+import pytest
+from moto import mock_aws
+
+from learning_resources.conftest import OCW_TEST_PREFIX, setup_s3_ocw
+from learning_resources.constants import (
+    OCW_CONTENT_CATEGORY_OPEN_TEXTBOOKS,
+    LearningResourceType,
+    OfferedBy,
+    PlatformType,
+)
+from learning_resources.etl import pipelines
+from learning_resources.etl.constants import (
+    CourseLoaderConfig,
+    ETLSource,
+    ProgramLoaderConfig,
+)
+from learning_resources.etl.exceptions import ExtractException
+from learning_resources.etl.ownership import CONTENT_FILE, Pipeline
+from learning_resources.factories import ETLSourceOwnershipFactory
+from learning_resources.models import LearningResource
+
+# Every pipeline checks ETLSourceOwnership before it extracts.
+pytestmark = pytest.mark.django_db
+
+
+@contextmanager
+def reload_mocked_pipeline(*patchers):
+    """Create a context that is rolled back after executing the pipeline"""
+    mocks = [patcher.start() for patcher in patchers]
+
+    reload(pipelines)
+
+    yield mocks
+
+    for patcher in patchers:
+        patcher.stop()
+
+    reload(pipelines)
+
+
+def test_mitxonline_programs_etl():
+    """Verify that mitxonline programs etl pipeline executes correctly"""
+    with reload_mocked_pipeline(
+        patch("learning_resources.etl.mitxonline.extract_programs", autospec=True),
+        patch("learning_resources.etl.mitxonline.transform_programs", autospec=False),
+        patch("learning_resources.etl.loaders.load_programs", autospec=True),
+    ) as patches:
+        mock_extract, mock_transform, mock_load_programs = patches
+        result = pipelines.mitxonline_programs_etl()
+
+    mock_extract.assert_called_once_with()
+
+    # each of these should be called with the return value of the extract
+    mock_transform.assert_called_once_with(mock_extract.return_value)
+
+    # load_courses should be called *only* with the return value of transform
+    mock_load_programs.assert_called_once_with(
+        ETLSource.mitxonline.name,
+        mock_transform.return_value,
+        config=ProgramLoaderConfig(
+            courses=CourseLoaderConfig(fetch_only=True), prune=True
+        ),
+    )
+
+    assert result == mock_load_programs.return_value
+
+
+def test_mitxonline_courses_etl():
+    """Verify that mitxonline courses etl pipeline executes correctly"""
+    with reload_mocked_pipeline(
+        patch("learning_resources.etl.mitxonline.extract_courses", autospec=True),
+        patch("learning_resources.etl.mitxonline.transform_courses", autospec=False),
+        patch("learning_resources.etl.loaders.load_courses", autospec=True),
+    ) as patches:
+        mock_extract, mock_transform, mock_load_courses = patches
+        result = pipelines.mitxonline_courses_etl()
+
+    mock_extract.assert_called_once_with()
+
+    # each of these should be called with the return value of the extract
+    mock_transform.assert_called_once_with(mock_extract.return_value)
+
+    # load_courses should be called *only* with the return value of transform
+    mock_load_courses.assert_called_once_with(
+        ETLSource.mitxonline.name,
+        mock_transform.return_value,
+        config=CourseLoaderConfig(prune=True),
+    )
+
+    assert result == mock_load_courses.return_value
+
+
+def test_oll_etl():
+    """Verify that OLL etl pipeline executes correctly"""
+    with reload_mocked_pipeline(
+        patch("learning_resources.etl.oll.extract", autospec=True),
+        patch("learning_resources.etl.oll.transform", autospec=False),
+        patch("learning_resources.etl.loaders.load_courses", autospec=True),
+    ) as patches:
+        mock_extract, mock_transform, mock_load_courses = patches
+        result = pipelines.oll_etl()
+
+    mock_extract.assert_called_once_with()
+    mock_transform.assert_called_once_with(mock_extract.return_value)
+    mock_load_courses.assert_called_once_with(
+        PlatformType.oll.name,
+        mock_transform.return_value,
+        config=CourseLoaderConfig(prune=True),
+    )
+
+    assert result == mock_load_courses.return_value
+
+
+def test_xpro_programs_etl():
+    """Verify that xpro programs etl pipeline executes correctly"""
+    with reload_mocked_pipeline(
+        patch("learning_resources.etl.xpro.extract_programs", autospec=True),
+        patch("learning_resources.etl.xpro.transform_programs", autospec=True),
+        patch("learning_resources.etl.loaders.load_programs", autospec=True),
+    ) as patches:
+        mock_extract, mock_transform, mock_load_programs = patches
+        result = pipelines.xpro_programs_etl()
+
+    mock_extract.assert_called_once_with()
+    mock_transform.assert_called_once_with(mock_extract.return_value)
+    mock_load_programs.assert_called_once_with(
+        ETLSource.xpro.name,
+        mock_transform.return_value,
+        config=ProgramLoaderConfig(
+            courses=CourseLoaderConfig(fetch_only=True), prune=True
+        ),
+    )
+
+    assert result == mock_load_programs.return_value
+
+
+def test_xpro_courses_etl():
+    """Verify that xpro courses etl pipeline executes correctly"""
+    with reload_mocked_pipeline(
+        patch("learning_resources.etl.xpro.extract_courses", autospec=True),
+        patch("learning_resources.etl.xpro.transform_courses", autospec=True),
+        patch("learning_resources.etl.loaders.load_courses", autospec=True),
+    ) as patches:
+        mock_extract, mock_transform, mock_load_courses = patches
+        result = pipelines.xpro_courses_etl()
+
+    mock_extract.assert_called_once_with()
+    mock_transform.assert_called_once_with(mock_extract.return_value)
+    mock_load_courses.assert_called_once_with(
+        ETLSource.xpro.name,
+        mock_transform.return_value,
+        config=CourseLoaderConfig(prune=True),
+    )
+
+    assert result == mock_load_courses.return_value
+
+
+def test_podcast_etl():
+    """Verify that podcast etl pipeline executes correctly"""
+
+    with reload_mocked_pipeline(
+        patch("learning_resources.etl.podcast.extract", autospec=True),
+        patch("learning_resources.etl.podcast.transform", autospec=True),
+        patch("learning_resources.etl.loaders.load_podcasts", autospec=True),
+    ) as patches:
+        mock_extract, mock_transform, mock_load_podcasts = patches
+        result = pipelines.podcast_etl()
+
+    mock_extract.assert_called_once_with(tracked_ids=[])
+    mock_transform.assert_called_once_with(mock_extract.return_value)
+    mock_load_podcasts.assert_called_once_with(
+        mock_transform.return_value, tracked_ids=[]
+    )
+
+    assert result == mock_load_podcasts.return_value
+
+
+@mock_aws
+@pytest.mark.django_db
+@pytest.mark.parametrize("skip_content_files", [True, False])
+@pytest.mark.parametrize("create_hidden_ocw_learning_materials", [True, False])
+def test_ocw_courses_etl(
+    settings, mocker, skip_content_files, create_hidden_ocw_learning_materials
+):
+    """Test ocw_courses_etl"""
+    setup_s3_ocw(settings)
+
+    settings.CREATE_HIDDEN_OCW_LEARNING_MATERIALS = create_hidden_ocw_learning_materials
+
+    mocker.patch(
+        "learning_resources.etl.ocw.extract_text_metadata",
+        return_value={"content": "TEXT"},
+    )
+    mocker.patch("learning_resources.etl.pipelines.loaders.resource_upserted_actions")
+    mock_cf_actions = mocker.patch(
+        "learning_resources.etl.pipelines.loaders.content_files_loaded_actions"
+    )
+    mock_calc_score = mocker.patch(
+        "learning_resources.etl.loaders.calculate_completeness"
+    )
+
+    pipelines.ocw_courses_etl(
+        url_paths=[OCW_TEST_PREFIX],
+        force_overwrite=True,
+        start_timestamp=datetime(2020, 12, 15, tzinfo=UTC),
+        skip_content_files=skip_content_files,
+    )
+
+    resource = LearningResource.objects.filter(
+        resource_type=LearningResourceType.course.name
+    ).first()
+    assert resource.readable_id == "16.01+fall_2005"
+    assert [num["value"] for num in resource.course.course_numbers] == [
+        "16.01",
+        "16.02",
+        "16.03",
+        "16.04",
+    ]
+    assert resource.platform.code == PlatformType.ocw.name
+    assert resource.offered_by.code == OfferedBy.ocw.name
+    assert resource.departments.first().department_id == "16"
+    assert resource.resource_tags.count() == 5
+    run = resource.runs.first()
+    assert run.instructors.count() == 10
+    assert run.run_id == "97db384ef34009a64df7cb86cf701979"
+    assert run.content_files.count() == (0 if skip_content_files else 5)
+    assert mock_cf_actions.call_count == (0 if skip_content_files else 1)
+    assert mock_calc_score.call_count == (0 if skip_content_files else 1)
+
+    learning_materials = LearningResource.objects.filter(
+        resource_type__in=[
+            LearningResourceType.video.name,
+            LearningResourceType.document.name,
+        ]
+    )
+
+    # Open Textbook resources are always created regardless of
+    # CREATE_HIDDEN_OCW_LEARNING_MATERIALS. Activity Assignments are only created
+    # when CREATE_HIDDEN_OCW_LEARNING_MATERIALS is True.
+    if skip_content_files:
+        assert learning_materials.count() == 0
+    elif create_hidden_ocw_learning_materials:
+        assert learning_materials.count() == 2
+    else:
+        assert learning_materials.count() == 1
+
+    if not skip_content_files:
+        textbook = learning_materials.get(title="Textbook Title")
+        assert textbook.platform.code == PlatformType.ocw.name
+        assert textbook.offered_by.code == OfferedBy.ocw.name
+        assert list(textbook.resource_tags.values_list("name", flat=True)) == [
+            "Open Textbooks"
+        ]
+        assert textbook.resource_category == OCW_CONTENT_CATEGORY_OPEN_TEXTBOOKS
+
+    if not skip_content_files and create_hidden_ocw_learning_materials:
+        activity = learning_materials.get(title="Resource Title")
+        assert (
+            activity.readable_id
+            == "97db384ef34009a64df7cb86cf701979-courses/16-01-unified-engineering-i-ii-iii-iv-fall-2005-spring-2006/resources/resource/"
+        )
+        assert activity.platform.code == PlatformType.ocw.name
+        assert activity.offered_by.code == OfferedBy.ocw.name
+        assert list(activity.resource_tags.values_list("name", flat=True)) == [
+            "Activity Assignments"
+        ]
+        assert activity.resource_category == "Practice & Assignment"
+
+
+@mock_aws
+@pytest.mark.django_db
+@pytest.mark.parametrize("content_file_ids", [None, []])
+def test_ocw_courses_etl_no_content_files_ingested(settings, mocker, content_file_ids):
+    """Learning materials should be left alone if no content files were ingested"""
+    setup_s3_ocw(settings)
+
+    mocker.patch("learning_resources.etl.pipelines.loaders.resource_upserted_actions")
+    mock_load_content_files = mocker.patch(
+        "learning_resources.etl.pipelines.loaders.load_content_files",
+        return_value=content_file_ids,
+    )
+    mock_load_learning_materials = mocker.patch(
+        "learning_resources.etl.pipelines.loaders.load_learning_materials"
+    )
+
+    pipelines.ocw_courses_etl(
+        url_paths=[OCW_TEST_PREFIX],
+        force_overwrite=True,
+        start_timestamp=datetime(2020, 12, 15, tzinfo=UTC),
+        skip_content_files=False,
+    )
+
+    mock_load_content_files.assert_called_once()
+    mock_load_learning_materials.assert_not_called()
+
+
+@mock_aws
+@pytest.mark.parametrize("owner", list(Pipeline))
+def test_ocw_courses_etl_loads_content_files_only_while_legacy_owns_them(
+    settings, mocker, owner
+):
+    """OCW content files cut over on their own key, apart from the course"""
+    setup_s3_ocw(settings)
+    ETLSourceOwnershipFactory.create(
+        etl_source=ETLSource.ocw.name, resource_type=CONTENT_FILE, owner=owner
+    )
+    mocker.patch("learning_resources.etl.pipelines.loaders.resource_upserted_actions")
+    mock_transform_content_files = mocker.patch(
+        "learning_resources.etl.ocw.transform_content_files"
+    )
+    mock_load_content_files = mocker.patch(
+        "learning_resources.etl.pipelines.loaders.load_content_files",
+        return_value=[],
+    )
+
+    pipelines.ocw_courses_etl(
+        url_paths=[OCW_TEST_PREFIX],
+        force_overwrite=True,
+        start_timestamp=datetime(2020, 12, 15, tzinfo=UTC),
+        skip_content_files=False,
+    )
+
+    assert LearningResource.objects.filter(readable_id="16.01+fall_2005").exists()
+    legacy = owner == Pipeline.LEGACY
+    assert mock_transform_content_files.called is legacy
+    assert mock_load_content_files.called is legacy
+
+
+@mock_aws
+@pytest.mark.django_db
+def test_ocw_courses_etl_no_data(settings, mocker):
+    """Test ocw_courses_etl when no S3 data is present"""
+
+    setup_s3_ocw(settings)
+    mock_log = mocker.patch("learning_resources.etl.pipelines.log.info")
+
+    s3_path = "fake_path"
+    pipelines.ocw_courses_etl(
+        url_paths=[s3_path],
+        force_overwrite=True,
+        start_timestamp=datetime(2020, 12, 15, tzinfo=UTC),
+    )
+    mock_log.assert_called_once_with("No course data found for %s", s3_path)
+
+
+@mock_aws
+@pytest.mark.django_db
+def test_ocw_courses_etl_exception(settings, mocker):
+    """Test ocw_courses_etl when bad data raises an exception"""
+
+    mock_log = mocker.patch("learning_resources.etl.pipelines.log.exception")
+    mocker.patch(
+        "learning_resources.etl.pipelines.ocw.extract_course", side_effect=[Exception]
+    )
+    url_paths = ["courses/1", "courses/2", "courses/3"]
+    with pytest.raises(ExtractException) as ex:
+        pipelines.ocw_courses_etl(
+            url_paths=url_paths,
+            force_overwrite=True,
+            start_timestamp=datetime(2020, 12, 15, tzinfo=UTC),
+        )
+    assert str(ex.value) == "Some OCW urls raised errors: {exception}".format(
+        exception=",".join(url_paths)
+    )
+    for path in url_paths:
+        mock_log.assert_any_call("Error encountered parsing OCW json for %s", path)
+
+
+def test_sloan_courses_etl():
+    """Verify that sloan courses etl pipeline executes correctly"""
+    with reload_mocked_pipeline(
+        patch("learning_resources.etl.sloan.extract", autospec=True),
+        patch("learning_resources.etl.sloan.transform_courses", autospec=True),
+        patch("learning_resources.etl.loaders.load_courses", autospec=True),
+    ) as patches:
+        mock_extract, mock_transform, mock_load_courses = patches
+        result = pipelines.sloan_courses_etl()
+
+    mock_extract.assert_called_once_with()
+    mock_transform.assert_called_once_with(mock_extract.return_value)
+    mock_load_courses.assert_called_once_with(
+        ETLSource.see.name,
+        mock_transform.return_value,
+        config=CourseLoaderConfig(prune=True),
+    )
+
+    assert result == mock_load_courses.return_value
+
+
+def test_mitpe_etl(mocker):
+    """Verify that the professional education etl pipeline executes correctly"""
+    mocker.patch("learning_resources.etl.mitpe.extract")
+    mock_transform = mocker.patch(
+        "learning_resources.etl.mitpe.transform",
+        return_value=(
+            [{"a": "b"}, {"c": "d"}],
+            [{"e": "f"}, {"g": "h"}],
+        ),
+    )
+    mock_load_courses = mocker.patch("learning_resources.etl.loaders.load_courses")
+    mock_load_programs = mocker.patch("learning_resources.etl.loaders.load_programs")
+    results = pipelines.mitpe_etl()
+    mock_load_courses.assert_called_once_with(
+        ETLSource.mitpe.name,
+        mock_transform.return_value[0],
+        config=CourseLoaderConfig(prune=True),
+    )
+    mock_load_programs.assert_called_once_with(
+        ETLSource.mitpe.name,
+        mock_transform.return_value[1],
+        config=ProgramLoaderConfig(prune=True, courses=CourseLoaderConfig()),
+    )
+    assert results == (mock_load_courses.return_value, mock_load_programs.return_value)
+
+
+def test_posthog_etl():
+    """Verify that posthog etl pipeline executes correctly"""
+
+    with reload_mocked_pipeline(
+        patch(
+            "learning_resources.etl.posthog.posthog_extract_lrd_view_events",
+            autospec=True,
+        ),
+        patch(
+            "learning_resources.etl.posthog.posthog_transform_lrd_view_events",
+            autospec=True,
+        ),
+        patch(
+            "learning_resources.etl.posthog.load_posthog_lrd_view_events", autospec=True
+        ),
+    ) as patches:
+        mock_extract, mock_transform, mock_load_events = patches
+        result = pipelines.posthog_etl()
+
+    mock_extract.assert_called_once_with()
+    mock_transform.assert_called_once_with(mock_extract.return_value)
+    mock_load_events.assert_called_once_with(mock_transform.return_value)
+
+    assert result == mock_load_events.return_value
+
+
+COURSE = LearningResourceType.course.name
+PROGRAM = LearningResourceType.program.name
+OWNED_PIPELINES = [
+    (
+        "mitxonline_courses_etl",
+        "mitxonline.extract_courses",
+        ETLSource.mitxonline,
+        [COURSE],
+    ),
+    (
+        "mitxonline_programs_etl",
+        "mitxonline.extract_programs",
+        ETLSource.mitxonline,
+        [PROGRAM],
+    ),
+    ("xpro_courses_etl", "xpro.extract_courses", ETLSource.xpro, [COURSE]),
+    ("xpro_programs_etl", "xpro.extract_programs", ETLSource.xpro, [PROGRAM]),
+    ("oll_etl", "oll.extract", ETLSource.oll, [COURSE]),
+    ("sloan_courses_etl", "sloan.extract", ETLSource.see, [COURSE]),
+    ("ovs_etl", "ovs.extract", ETLSource.ovs, [LearningResourceType.video.name]),
+    (
+        "podcast_etl",
+        "podcast.extract",
+        ETLSource.podcast,
+        [LearningResourceType.podcast_episode.name],
+    ),
+    ("mitpe_etl", "mitpe.extract", ETLSource.mitpe, [COURSE, PROGRAM]),
+    (
+        "mit_climate_etl",
+        "mit_climate.extract_articles",
+        ETLSource.mit_climate,
+        [LearningResourceType.document.name],
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("pipeline", "extract", "etl_source", "resource_types"), OWNED_PIPELINES
+)
+def test_pipeline_does_not_extract_what_legacy_does_not_own(
+    pipeline, extract, etl_source, resource_types
+):
+    """A pipeline whose source was cut over returns before it extracts anything"""
+    for resource_type in resource_types:
+        ETLSourceOwnershipFactory.create(
+            etl_source=etl_source.name,
+            resource_type=resource_type,
+            owner=Pipeline.WEBHOOK,
+        )
+
+    with reload_mocked_pipeline(
+        patch(f"learning_resources.etl.{extract}", autospec=True)
+    ) as (mock_extract,):
+        result = getattr(pipelines, pipeline)()
+
+    mock_extract.assert_not_called()
+    assert not any(result) if isinstance(result, tuple) else result == []
+
+
+@pytest.mark.parametrize(
+    ("webhook_owned", "loads_courses", "loads_programs"),
+    [(COURSE, False, True), (PROGRAM, True, False)],
+)
+def test_mitpe_etl_loads_only_the_types_legacy_owns(
+    mocker, webhook_owned, loads_courses, loads_programs
+):
+    """MIT PE extracts both types at once and loads whichever one legacy still owns"""
+    ETLSourceOwnershipFactory.create(
+        etl_source=ETLSource.mitpe.name,
+        resource_type=webhook_owned,
+        owner=Pipeline.WEBHOOK,
+    )
+    mocker.patch("learning_resources.etl.mitpe.extract")
+    mocker.patch("learning_resources.etl.mitpe.transform", return_value=([], []))
+    mock_load_courses = mocker.patch("learning_resources.etl.loaders.load_courses")
+    mock_load_programs = mocker.patch("learning_resources.etl.loaders.load_programs")
+
+    courses, programs = pipelines.mitpe_etl()
+
+    assert mock_load_courses.called is loads_courses
+    assert mock_load_programs.called is loads_programs
+    assert courses == (mock_load_courses.return_value if loads_courses else [])
+    assert programs == (mock_load_programs.return_value if loads_programs else [])
+
+
+def test_ocw_courses_etl_skips_when_legacy_does_not_own_courses(mocker):
+    """The ocw-studio webhook loads nothing once OCW courses are owned elsewhere"""
+    ETLSourceOwnershipFactory.create(
+        etl_source=ETLSource.ocw.name, resource_type=COURSE, owner=Pipeline.WAREHOUSE
+    )
+    mock_extract = mocker.patch("learning_resources.etl.ocw.extract_course")
+    mock_boto = mocker.patch("learning_resources.etl.pipelines.boto3")
+
+    pipelines.ocw_courses_etl(url_paths=["courses/a/"], force_overwrite=False)
+
+    mock_boto.resource.assert_not_called()
+    mock_extract.assert_not_called()

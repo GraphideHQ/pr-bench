@@ -1,0 +1,205 @@
+name: CI
+
+on:
+  # release/** so a release branch (protocol v2 lands on release/v2 before
+  # one PR takes it to main at the flip) gets the same checks as main.
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+    branches: [main, "release/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    env:
+      PYTHONUTF8: "1"
+      FUGAL_SKIP_BENCHMARKS: mmlu,math,gsm8k,humaneval,livecode,gpqa,ifeval,aime
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --locked --extra dev
+
+      - name: Check security invariants
+        run: uv run python scripts/check_safety_invariants.py
+
+      - name: Smoke-test real Bittensor Axon annotations
+        run: uv run python scripts/check_bittensor_axon.py
+
+      - name: Run unit and regression tests
+        run: uv run pytest -q
+
+      - name: Run integration suite
+        run: uv run python tests/test_integration.py
+
+      - name: Run grader attack suite
+        run: uv run python -m fugal_subnet.attacks.run_attacks
+
+      - name: Run adversarial miner suite (I2, I6)
+        run: uv run python -m fugal_subnet.attacks.run_miner_attacks
+
+      # I8/I3. Every case here verified against production code before the
+      # attestation was bound to what it claims to prove. The attacker is
+      # modelled as owning real Intel TDX hardware, so DCAP genuinely passes
+      # and only the bindings can stop them.
+      - name: Run adversarial TEE suite (I8, I3)
+        run: uv run python -m fugal_subnet.attacks.run_tee_attacks
+
+      # I1. --perturb unpins kernel dispatch and thread counts to stand in for
+      # a second host; the thread lever is what makes it bite on one runner.
+      - name: Check scoring determinism (I1)
+        run: |
+          uv run python scripts/check_determinism.py
+          uv run python scripts/check_determinism.py --perturb
+
+  quality:
+    name: Lint, audit, and package
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONUTF8: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --locked --extra dev
+
+      - name: Lint
+        run: uv run ruff check fugal_subnet neurons scripts tests
+
+      - name: Audit installed Python dependencies
+        run: uv run pip-audit --local --skip-editable
+
+      - name: Build wheel and source distribution
+        run: uv build
+
+  tee-verifier:
+    name: Attack suites with the DCAP verifier installed
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The main `test` job installs --extra dev, so dcap-qvl is ABSENT there and
+    # verify_dcap raises ImportError instead of running. That is a different code
+    # path, and two tests once "passed" in CI purely because the library was
+    # missing — one of them an attack test that therefore never attempted its
+    # attack. Running the suites in both environments is what makes a green tick
+    # mean the code was exercised rather than skipped.
+    env:
+      PYTHONUTF8: "1"
+      FUGAL_SKIP_BENCHMARKS: mmlu,math,gsm8k,humaneval,livecode,gpqa,ifeval,aime
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+
+      - name: Install with the TEE verifier
+        run: uv sync --locked --extra dev --extra tee
+
+      - name: Confirm the verifier is actually present
+        # Without this the job silently degrades into a duplicate of `test`.
+        run: uv run python -c "import dcap_qvl; print('dcap-qvl present')"
+
+      - name: Unit and regression tests
+        run: uv run pytest -q
+
+      - name: Adversarial TEE suite against the real DCAP path
+        run: uv run python -m fugal_subnet.attacks.run_tee_attacks
+
+      - name: Adversarial miner suite
+        run: uv run python -m fugal_subnet.attacks.run_miner_attacks
+
+  container:
+    name: Docker build smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build locked image
+        run: docker build --tag fugal-subnet:ci .
+
+      - name: Smoke-test installed commands
+        run: |
+          docker run --rm fugal-subnet:ci -m neurons.validator --help
+          docker run --rm fugal-subnet:ci -m neurons.miner --help
+
+  success-contract:
+    name: Shared success contract conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: subnet
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - run: python subnet/scripts/check_success_vendor.py --materialize-core
+      - run: pip install numpy
+      - name: Both modules reproduce core fixtures
+        run: python subnet/scripts/check_success_fixtures.py
+      - name: Install CPU embedding dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers huggingface_hub httpx
+      - name: Fetch the pinned reference backbone
+        run: python subnet/tests/core_snapshot/scripts/fetch_backbone.py
+      - name: Exported subnet fixture reproduces core serving
+        run: |
+          python subnet/tests/core_snapshot/verify/verify_success_contract.py --subnet subnet \
+            --backbone subnet/tests/core_snapshot/artifacts/Qwen3-0.6B \
+            --head subnet/tests/fixtures/success_bundle/head.npz \
+            --prices subnet/tests/fixtures/success_bundle/prices.json
+
+      - name: Actual backbone wrappers agree across repositories
+        run: |
+          python subnet/scripts/check_success_embeddings.py \
+            --core subnet/tests/core_snapshot \
+            --backbone subnet/tests/core_snapshot/artifacts/Qwen3-0.6B

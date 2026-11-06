@@ -1,0 +1,1963 @@
+/**
+ * @jest-environment @happy-dom/jest-environment
+ *
+ * Using the Happy DOM environment as the editor accesses DOM APIs and uses contenteditable
+ * elements not supported by JSDOM, the default environment in Jest.
+ */
+import React from "react"
+import { screen, waitFor, fireEvent, within } from "@testing-library/react"
+import userEvent from "@testing-library/user-event"
+import { setMockResponse, factories, urls, makeRequest } from "api/test-utils"
+import { NewsEditor } from "./NewsEditor"
+import type { WebsiteContent } from "api/v1"
+import type { JSONContent } from "@tiptap/react"
+import { renderWithProviders } from "@/test-utils"
+
+/**
+ * Publishing now asks for confirmation, so a draft -> published save takes a
+ * second click. Only the transition is confirmed: re-saving an already
+ * published item still saves straight away, so this is only needed where the
+ * item starts out as a draft.
+ */
+const confirmPublish = async () => {
+  await userEvent.click(
+    await screen.findByRole("button", { name: /^Yes, Publish/ }),
+  )
+}
+
+jest.mock("posthog-js/react", () => ({
+  useFeatureFlagEnabled: () => true,
+  usePostHog: () => ({}),
+}))
+
+/**
+ * Far enough out that no draft saves itself while a test works: a background
+ * write landing mid-interaction updates the toolbar outside `act`, which
+ * failed these suites intermittently. The autosave test sets its own.
+ */
+const AUTOSAVE_OFF = 10 * 60 * 1000
+
+/** What production uses; the autosave test waits this out deliberately. */
+const AUTOSAVE_DELAY_MS = 2000
+
+const mockOnSave = jest.fn()
+
+describe("NewsEditor - Content Editing and Saving", () => {
+  beforeEach(() => {
+    mockOnSave.mockClear()
+    jest.clearAllMocks()
+  })
+
+  const setupEditor = async (
+    content: JSONContent,
+    articleId = 100,
+    title = "Test Article",
+    autosaveDelayMs = AUTOSAVE_OFF,
+  ) => {
+    const user = factories.user.user({
+      is_authenticated: true,
+      is_article_editor: true,
+    })
+    setMockResponse.get(urls.userMe.get(), user)
+
+    const newsItem = factories.websiteContent.websiteContent({
+      id: articleId,
+      title,
+      content,
+      is_published: false,
+      /**
+       * These tests are about saving content, and each passes its own `content`
+       * whose banner subheading is empty -- so there is nothing to infer a
+       * description from and publishing would stop to ask. An override settles
+       * it. The editor reads the override, not the resolved field, because it
+       * infers from the document it is holding rather than the saved one.
+       */
+      seo_description_override: "A description for search results.",
+    })
+    setMockResponse.get(urls.websiteContent.details(articleId), newsItem)
+
+    renderWithProviders(
+      <NewsEditor
+        autosaveDelayMs={autosaveDelayMs}
+        newsItem={newsItem}
+        onSave={mockOnSave}
+      />,
+      {
+        user,
+      },
+    )
+
+    await screen.findByTestId("editor")
+    return newsItem
+  }
+
+  describe("Editing title in banner heading", () => {
+    test("can edit banner heading and save successfully", async () => {
+      const initialContent: JSONContent = {
+        type: "doc",
+        content: [
+          {
+            type: "banner",
+            content: [
+              {
+                type: "heading",
+                attrs: { level: 1 },
+                content: [{ type: "text", text: "Original Title" }],
+              },
+              {
+                type: "paragraph",
+                content: [],
+              },
+            ],
+          },
+          {
+            type: "byline",
+          },
+          {
+            type: "paragraph",
+            content: [],
+          },
+        ],
+      }
+
+      const article = await setupEditor(initialContent, 200, "Original Title")
+
+      const updatedArticle = {
+        ...article,
+        title: "Updated Title",
+        content: {
+          type: "doc",
+          content: [
+            {
+              type: "banner",
+              content: [
+                {
+                  type: "heading",
+                  attrs: { level: 1, textAlign: null },
+                  content: [{ type: "text", text: "Updated Title" }],
+                },
+                {
+                  type: "paragraph",
+                  attrs: {
+                    textAlign: null,
+                  },
+                },
+              ],
+            },
+            {
+              type: "byline",
+              attrs: { authorName: null },
+            },
+            {
+              type: "paragraph",
+              attrs: {
+                textAlign: null,
+              },
+            },
+          ],
+        },
+      }
+      setMockResponse.patch(
+        urls.websiteContent.details(article.id),
+        updatedArticle,
+      )
+
+      // Awaited: under load the editor's content mounts after its container.
+      const heading = await screen.findByRole("heading", { level: 1 })
+      await userEvent.click(heading)
+
+      await userEvent.keyboard("{Control>}a{/Control}{Delete}")
+      await userEvent.type(heading, "Updated Title")
+
+      const updateButton = await screen.findByRole(
+        "button",
+        { name: /Update|Publish/ },
+        { timeout: 3000 },
+      )
+
+      await userEvent.click(updateButton)
+      await confirmPublish()
+
+      expect(makeRequest).toHaveBeenCalledWith({
+        method: "patch",
+        url: urls.websiteContent.details(article.id),
+        body: expect.objectContaining({
+          content: updatedArticle.content,
+          is_published: true,
+          title: updatedArticle.title,
+          author_name: "",
+        }),
+      })
+
+      expect(mockOnSave).toHaveBeenCalled()
+    })
+  })
+
+  describe("Editing paragraph content", () => {
+    test("can edit paragraph text and save successfully", async () => {
+      const initialContent: JSONContent = {
+        type: "doc",
+        content: [
+          {
+            type: "banner",
+            content: [
+              {
+                type: "heading",
+                attrs: { level: 1 },
+                content: [{ type: "text", text: "Article Title" }],
+              },
+              {
+                type: "paragraph",
+                content: [],
+              },
+            ],
+          },
+          {
+            type: "byline",
+          },
+          {
+            type: "paragraph",
+            content: [{ type: "text", text: "Original paragraph text" }],
+          },
+        ],
+      }
+
+      const article = await setupEditor(initialContent, 201, "Article Title")
+
+      const paragraph = screen.getByText("Original paragraph text")
+      await userEvent.click(paragraph)
+      await userEvent.keyboard("{Control>}a{/Control}")
+      await userEvent.type(paragraph, " with some more text")
+
+      const updateButton = await screen.findByRole("button", {
+        name: /Update|Publish/,
+      })
+
+      await waitFor(
+        () => {
+          expect(updateButton).not.toBeDisabled()
+        },
+        { timeout: 3000 },
+      )
+
+      const updatedArticle = {
+        ...article,
+        content: {
+          type: "doc",
+          content: [
+            {
+              type: "banner",
+              content: [
+                {
+                  type: "heading",
+                  attrs: { level: 1, textAlign: null },
+                  content: [{ type: "text", text: "Article Title" }],
+                },
+                {
+                  type: "paragraph",
+                  attrs: {
+                    textAlign: null,
+                  },
+                },
+              ],
+            },
+            {
+              type: "byline",
+              attrs: { authorName: null },
+            },
+            {
+              type: "paragraph",
+              content: [
+                {
+                  type: "text",
+                  text: "Original paragraph text with some more text",
+                },
+              ],
+              attrs: {
+                textAlign: null,
+              },
+            },
+          ],
+        },
+      }
+      setMockResponse.patch(
+        urls.websiteContent.details(article.id),
+        updatedArticle,
+      )
+
+      await userEvent.click(updateButton)
+      await confirmPublish()
+
+      expect(makeRequest).toHaveBeenCalledWith({
+        method: "patch",
+        url: urls.websiteContent.details(article.id),
+        body: expect.objectContaining({
+          content: updatedArticle.content,
+          is_published: true,
+          title: updatedArticle.title,
+          author_name: "",
+        }),
+      })
+    })
+  })
+
+  describe("Save button states", () => {
+    test("save button is disabled when title is empty", async () => {
+      // Suppress act() warnings from MutationObserver updates in vendor code
+      const consoleError = jest
+        .spyOn(console, "error")
+        .mockImplementation((message) => {
+          if (typeof message === "string" && message.includes("act(...)")) {
+            return
+          }
+          console.warn(message)
+        })
+
+      const initialContent: JSONContent = {
+        type: "doc",
+        content: [
+          {
+            type: "banner",
+            content: [
+              {
+                type: "heading",
+                attrs: { level: 1 },
+                content: [{ type: "text", text: "Title" }],
+              },
+              {
+                type: "paragraph",
+                content: [],
+              },
+            ],
+          },
+          {
+            type: "byline",
+          },
+          {
+            type: "paragraph",
+            content: [{ type: "text", text: "Content" }],
+          },
+        ],
+      }
+
+      await setupEditor(initialContent, 207, "Title")
+
+      const updateButton = screen.getByRole("button", {
+        name: /Update|Publish/,
+      })
+      expect(updateButton).not.toBeDisabled()
+
+      // Wait for heading to be available
+      let heading: Element
+      await waitFor(() => {
+        const editor = screen.getByTestId("editor")
+        const h1 = editor.querySelector("h1")
+        expect(h1).toBeTruthy()
+        heading = h1!
+      })
+
+      await userEvent.click(heading!)
+      await userEvent.keyboard("{Control>}a{/Control}")
+      await userEvent.keyboard("{Delete}")
+
+      await waitFor(() => {
+        expect(updateButton).toBeDisabled()
+      })
+
+      consoleError.mockRestore()
+    })
+
+    test("save button is enabled when a title is set", async () => {
+      const initialContent: JSONContent = {
+        type: "doc",
+        content: [
+          {
+            type: "banner",
+            content: [
+              {
+                type: "heading",
+                attrs: { level: 1 },
+                content: [],
+              },
+              {
+                type: "paragraph",
+                content: [],
+              },
+            ],
+          },
+          {
+            type: "byline",
+          },
+          {
+            type: "paragraph",
+            content: [{ type: "text", text: "Content" }],
+          },
+        ],
+      }
+
+      await setupEditor(initialContent, 206, "")
+
+      const updateButton = screen.getByRole("button", {
+        name: /Update|Publish/,
+      })
+      expect(updateButton).toBeDisabled()
+
+      // Find the empty heading placeholder or the editor area
+      const editor = screen.getByTestId("editor")
+      const heading =
+        editor.querySelector("h1") || editor.querySelector("[data-placeholder]")
+      if (!heading) throw new Error("Heading element not found")
+
+      await userEvent.click(heading)
+      await userEvent.type(heading, "Article Title")
+
+      await waitFor(() => {
+        expect(updateButton).not.toBeDisabled()
+      })
+    })
+  })
+
+  describe("Autosaving a draft", () => {
+    test("a news draft saves itself once typing stops", async () => {
+      const initialContent: JSONContent = {
+        type: "doc",
+        content: [
+          {
+            type: "banner",
+            content: [
+              {
+                type: "heading",
+                attrs: { level: 1 },
+                content: [{ type: "text", text: "Title" }],
+              },
+              {
+                type: "paragraph",
+                content: [],
+              },
+            ],
+          },
+          {
+            type: "byline",
+          },
+          {
+            type: "paragraph",
+            content: [{ type: "text", text: "Content" }],
+          },
+        ],
+      }
+
+      const newsItem = await setupEditor(
+        initialContent,
+        208,
+        "Title",
+        AUTOSAVE_DELAY_MS,
+      )
+
+      const paragraph = screen.getByText("Content")
+      await userEvent.click(paragraph)
+      await userEvent.keyboard("{Control>}a{/Control}")
+      await userEvent.type(paragraph, "Updated content")
+
+      const updatedNewsItem = {
+        ...newsItem,
+        content: expect.objectContaining({
+          type: "doc",
+        }),
+        is_published: false,
+      }
+      setMockResponse.patch(
+        urls.websiteContent.details(newsItem.id),
+        updatedNewsItem,
+      )
+
+      // No button to press: a draft writes itself once typing stops.
+      expect(screen.queryByRole("button", { name: "Save as Draft" })).toBe(null)
+
+      await waitFor(
+        () => {
+          expect(makeRequest).toHaveBeenCalledWith({
+            method: "patch",
+            url: urls.websiteContent.details(newsItem.id),
+            body: expect.objectContaining({
+              is_published: false,
+              author_name: "",
+            }),
+          })
+        },
+        { timeout: 6000 },
+      )
+    }, 15000)
+  })
+
+  describe("Error handling during save", () => {
+    test("shows error message when save fails", async () => {
+      const initialContent: JSONContent = {
+        type: "doc",
+        content: [
+          {
+            type: "banner",
+            content: [
+              {
+                type: "heading",
+                attrs: { level: 1 },
+                content: [{ type: "text", text: "Title" }],
+              },
+              {
+                type: "paragraph",
+                content: [],
+              },
+            ],
+          },
+          {
+            type: "byline",
+          },
+          {
+            type: "paragraph",
+            content: [{ type: "text", text: "Content" }],
+          },
+        ],
+      }
+
+      const article = await setupEditor(initialContent, 209, "Title")
+
+      setMockResponse.patch(
+        urls.websiteContent.details(article.id),
+        { detail: "Server error" },
+        { code: 500 },
+      )
+
+      const paragraph = screen.getByText("Content")
+      await userEvent.click(paragraph)
+      await userEvent.keyboard("{Control>}a{/Control}")
+      await userEvent.type(paragraph, "Updated content")
+
+      const updateButton = await screen.findByRole("button", {
+        name: /Update|Publish/,
+      })
+      expect(updateButton).not.toBeDisabled()
+
+      await userEvent.click(updateButton)
+
+      const errorText = screen.queryByText(
+        /Mock Error|An error occurred while saving|Server error/i,
+      )
+      if (errorText) {
+        expect(errorText).toBeInTheDocument()
+      } else {
+        const alert = screen.queryByRole("alert")
+        if (alert) {
+          expect(alert).toBeInTheDocument()
+        }
+      }
+    })
+  })
+
+  describe("Creating news", () => {
+    test("submits news successfully", async () => {
+      const user = factories.user.user({
+        is_authenticated: true,
+        is_article_editor: true,
+      })
+      setMockResponse.get(urls.userMe.get(), user)
+
+      const createdNewsItem = factories.websiteContent.websiteContent({
+        id: 101,
+        title: "My Article",
+        is_published: true,
+      })
+      setMockResponse.post(urls.websiteContent.list(), createdNewsItem)
+
+      renderWithProviders(
+        <NewsEditor autosaveDelayMs={AUTOSAVE_OFF} onSave={mockOnSave} />,
+        { user },
+      )
+
+      await screen.findByTestId("editor")
+
+      const editor = screen.getByTestId("editor")
+      const heading =
+        editor.querySelector("h1") || editor.querySelector("[data-placeholder]")
+      if (!heading) throw new Error("Heading element not found")
+
+      await userEvent.click(heading)
+
+      await userEvent.keyboard("{Control>}a{/Control}")
+      await userEvent.type(heading, "My Article", { delay: 0 })
+
+      // Wait for the text to be updated in the editor
+      await waitFor(() => {
+        expect(heading.textContent).toContain("My Article")
+      })
+
+      const publishButton = await screen.findByRole("button", {
+        name: "Publish",
+      })
+
+      expect(publishButton).not.toBeDisabled()
+
+      fireEvent.click(publishButton!)
+
+      /**
+       * Nothing has ever been saved here, so there is no SEO title or
+       * description yet and the press opens the settings drawer first. Filling
+       * them in and saving resumes the publish, confirmation and all -- see
+       * "news is not published without an SEO title and description".
+       */
+      await screen.findByRole("heading", { name: "News Settings" })
+      await userEvent.type(
+        await screen.findByLabelText(/^SEO Title/),
+        "My Article in search",
+      )
+      await userEvent.type(
+        screen.getByLabelText(/^SEO Description/),
+        "What this article is about.",
+      )
+      await userEvent.click(
+        screen.getByRole("button", { name: "Save Settings" }),
+      )
+
+      await confirmPublish()
+
+      await waitFor(
+        () => {
+          expect(makeRequest).toHaveBeenCalledWith({
+            method: "post",
+            url: urls.websiteContent.list(),
+            body: expect.objectContaining({
+              title: "My Article",
+              author_name: "",
+              content: {
+                type: "doc",
+                content: [
+                  {
+                    type: "banner",
+                    content: [
+                      {
+                        type: "heading",
+                        attrs: { level: 1, textAlign: null },
+                        content: [{ type: "text", text: "My Article" }],
+                      },
+                      {
+                        type: "paragraph",
+                        attrs: {
+                          textAlign: null,
+                        },
+                      },
+                    ],
+                  },
+                  { type: "byline", attrs: { authorName: null } },
+                  {
+                    type: "paragraph",
+                    attrs: {
+                      textAlign: null,
+                    },
+                  },
+                ],
+              },
+              is_published: true,
+            }),
+          })
+        },
+        { timeout: 5000 },
+      )
+
+      expect(mockOnSave).toHaveBeenCalled()
+
+      const calls = mockOnSave.mock.calls
+      expect(calls.length).toBeGreaterThan(0)
+      const savedData = calls[calls.length - 1][0]
+
+      expect(savedData).toBeDefined()
+      expect(savedData).toMatchObject({
+        id: createdNewsItem.id,
+        title: "My Article",
+        is_published: true,
+      })
+    }, 15000)
+  })
+})
+
+describe("NewsEditor - Document Rendering", () => {
+  let consoleErrorSpy: ReturnType<typeof jest.spyOn>
+
+  beforeEach(() => {
+    const originalError = console.error
+    consoleErrorSpy = jest
+      .spyOn(console, "error")
+      .mockImplementation((message) => {
+        if (
+          typeof message === "string" &&
+          // Expected as task items (checkboxes) don't have change handlers in edit mode.
+          message.includes(
+            "You provided a `checked` prop to a form field without an `onChange` handler",
+          )
+        ) {
+          return
+        }
+        originalError(message)
+      })
+  })
+
+  afterEach(() => {
+    consoleErrorSpy.mockRestore()
+  })
+
+  const setupEditor = async (content: JSONContent, articleId = 1) => {
+    const user = factories.user.user({
+      is_authenticated: true,
+      is_article_editor: true,
+    })
+    setMockResponse.get(urls.userMe.get(), user)
+
+    const newsItem = factories.websiteContent.websiteContent({
+      id: 1,
+      title: "Test Article",
+      content,
+    })
+    setMockResponse.get(urls.websiteContent.details(articleId), newsItem)
+
+    renderWithProviders(
+      <NewsEditor
+        autosaveDelayMs={AUTOSAVE_OFF}
+        newsItem={newsItem}
+        onSave={mockOnSave}
+        readOnly
+      />,
+      { user },
+    )
+
+    await screen.findByTestId("editor")
+    return newsItem
+  }
+
+  test("renders editor when user has ArticleEditor permission", async () => {
+    const user = factories.user.user({
+      is_authenticated: true,
+      is_article_editor: true,
+    })
+    setMockResponse.get(urls.userMe.get(), user)
+
+    renderWithProviders(
+      <NewsEditor autosaveDelayMs={AUTOSAVE_OFF} onSave={mockOnSave} />,
+      { user },
+    )
+
+    await screen.findByTestId("editor")
+  })
+
+  describe("Basic document structure", () => {
+    test("renders empty document with banner, byline, and empty paragraph", async () => {
+      const content: JSONContent = {
+        type: "doc",
+        content: [
+          {
+            type: "banner",
+            content: [
+              {
+                type: "heading",
+                attrs: { level: 1 },
+                content: [],
+              },
+              {
+                type: "paragraph",
+                content: [],
+              },
+            ],
+          },
+          {
+            type: "byline",
+          },
+          {
+            type: "paragraph",
+            content: [],
+          },
+        ],
+      }
+
+      await setupEditor(content)
+
+      await screen.findByTestId("editor")
+
+      await screen.findByRole("heading", { level: 1 })
+    })
+
+    test("renders document with title in banner heading", async () => {
+      const content: JSONContent = {
+        type: "doc",
+        content: [
+          {
+            type: "banner",
+            content: [
+              {
+                type: "heading",
+                attrs: { level: 1 },
+                content: [{ type: "text", text: "Article Title" }],
+              },
+              {
+                type: "paragraph",
+                content: [{ type: "text", text: "Banner subtitle" }],
+              },
+            ],
+          },
+          {
+            type: "byline",
+          },
+          {
+            type: "paragraph",
+            content: [],
+          },
+        ],
+      }
+
+      await setupEditor(content)
+
+      await screen.findByRole("heading", { level: 1, name: "Article Title" })
+      await screen.findByText("Banner subtitle")
+    })
+
+    test("renders document with multiple paragraphs", async () => {
+      const content: JSONContent = {
+        type: "doc",
+        content: [
+          {
+            type: "banner",
+            content: [
+              {
+                type: "heading",
+                attrs: { level: 1 },
+                content: [{ type: "text", text: "Title" }],
+              },
+              {
+                type: "paragraph",
+                content: [],
+              },
+            ],
+          },
+          {
+            type: "byline",
+          },
+          {
+            type: "paragraph",
+            content: [{ type: "text", text: "First paragraph" }],
+          },
+          {
+            type: "paragraph",
+            content: [{ type: "text", text: "Second paragraph" }],
+          },
+          {
+            type: "paragraph",
+            content: [{ type: "text", text: "Third paragraph" }],
+          },
+        ],
+      }
+
+      await setupEditor(content)
+
+      await screen.findByText("First paragraph")
+      await screen.findByText("Second paragraph")
+      await screen.findByText("Third paragraph")
+    })
+  })
+
+  describe("Headings", () => {
+    test("renders document with multiple heading levels", async () => {
+      const content: JSONContent = {
+        type: "doc",
+        content: [
+          {
+            type: "banner",
+            content: [
+              {
+                type: "heading",
+                attrs: { level: 1 },
+                content: [{ type: "text", text: "H1 Title" }],
+              },
+              {
+                type: "paragraph",
+                content: [],
+              },
+            ],
+          },
+          {
+            type: "byline",
+          },
+          {
+            type: "heading",
+            attrs: { level: 2 },
+            content: [{ type: "text", text: "H2 Heading" }],
+          },
+          {
+            type: "heading",
+            attrs: { level: 3 },
+            content: [{ type: "text", text: "H3 Heading" }],
+          },
+          {
+            type: "heading",
+            attrs: { level: 4 },
+            content: [{ type: "text", text: "H4 Heading" }],
+          },
+        ],
+      }
+
+      await setupEditor(content)
+
+      await screen.findByRole("heading", { level: 1, name: "H1 Title" })
+      await screen.findByRole("heading", { level: 2, name: "H2 Heading" })
+      await screen.findByRole("heading", { level: 3, name: "H3 Heading" })
+      await screen.findByRole("heading", { level: 4, name: "H4 Heading" })
+    })
+  })
+
+  describe("Text formatting", () => {
+    test("renders document with bold text", async () => {
+      const content: JSONContent = {
+        type: "doc",
+        content: [
+          {
+            type: "banner",
+            content: [
+              {
+                type: "heading",
+                attrs: { level: 1 },
+                content: [{ type: "text", text: "Title" }],
+              },
+              {
+                type: "paragraph",
+                content: [],
+              },
+            ],
+          },
+          {
+            type: "byline",
+          },
+          {
+            type: "paragraph",
+            content: [
+              { type: "text", text: "This is " },
+              { type: "text", marks: [{ type: "bold" }], text: "bold text" },
+              { type: "text", text: " in a paragraph." },
+            ],
+          },
+        ],
+      }
+
+      await setupEditor(content)
+
+      const boldText = await screen.findByText("bold text")
+      expect(boldText.closest("strong") || boldText.closest("b")).toBeTruthy()
+    })
+
+    test("renders document with italic text", async () => {
+      const content: JSONContent = {
+        type: "doc",
+        content: [
+          {
+            type: "banner",
+            content: [
+              {
+                type: "heading",
+                attrs: { level: 1 },
+                content: [{ type: "text", text: "Title" }],
+              },
+              {
+                type: "paragraph",
+                content: [],
+              },
+            ],
+          },
+          {
+            type: "byline",
+          },
+          {
+            type: "paragraph",
+            content: [
+              { type: "text", text: "This is " },
+              {
+                type: "text",
+                marks: [{ type: "italic" }],
+                text: "italic text",
+              },
+              { type: "text", text: " in a paragraph." },
+            ],
+          },
+        ],
+      }
+
+      await setupEditor(content)
+
+      const italicText = await screen.findByText("italic text")
+      expect(italicText.closest("em") || italicText.closest("i")).toBeTruthy()
+    })
+
+    test("renders document with links", async () => {
+      const content: JSONContent = {
+        type: "doc",
+        content: [
+          {
+            type: "banner",
+            content: [
+              {
+                type: "heading",
+                attrs: { level: 1 },
+                content: [{ type: "text", text: "Title" }],
+              },
+              {
+                type: "paragraph",
+                content: [],
+              },
+            ],
+          },
+          {
+            type: "byline",
+          },
+          {
+            type: "paragraph",
+            content: [
+              { type: "text", text: "Visit " },
+              {
+                type: "text",
+                marks: [
+                  {
+                    type: "link",
+                    attrs: { href: "https://example.com", target: "_blank" },
+                  },
+                ],
+                text: "example.com",
+              },
+              { type: "text", text: " for more info." },
+            ],
+          },
+        ],
+      }
+
+      await setupEditor(content)
+
+      const link = await screen.findByRole("link", { name: "example.com" })
+      expect(link).toHaveAttribute("href", "https://example.com")
+    })
+  })
+
+  describe("Lists", () => {
+    test("renders document with bullet list", async () => {
+      const content: JSONContent = {
+        type: "doc",
+        content: [
+          {
+            type: "banner",
+            content: [
+              {
+                type: "heading",
+                attrs: { level: 1 },
+                content: [{ type: "text", text: "Title" }],
+              },
+              {
+                type: "paragraph",
+                content: [],
+              },
+            ],
+          },
+          {
+            type: "byline",
+          },
+          {
+            type: "bulletList",
+            content: [
+              {
+                type: "listItem",
+                content: [
+                  {
+                    type: "paragraph",
+                    content: [{ type: "text", text: "First item" }],
+                  },
+                ],
+              },
+              {
+                type: "listItem",
+                content: [
+                  {
+                    type: "paragraph",
+                    content: [{ type: "text", text: "Second item" }],
+                  },
+                ],
+              },
+              {
+                type: "listItem",
+                content: [
+                  {
+                    type: "paragraph",
+                    content: [{ type: "text", text: "Third item" }],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      }
+
+      await setupEditor(content)
+
+      const firstItem = await screen.findByText("First item")
+      const secondItem = await screen.findByText("Second item")
+      const thirdItem = await screen.findByText("Third item")
+      expect(firstItem.closest("li")).toBeTruthy()
+      expect(secondItem.closest("li")).toBeTruthy()
+      expect(thirdItem.closest("li")).toBeTruthy()
+    })
+
+    test("renders document with ordered list", async () => {
+      const content: JSONContent = {
+        type: "doc",
+        content: [
+          {
+            type: "banner",
+            content: [
+              {
+                type: "heading",
+                attrs: { level: 1 },
+                content: [{ type: "text", text: "Title" }],
+              },
+              {
+                type: "paragraph",
+                content: [],
+              },
+            ],
+          },
+          {
+            type: "byline",
+          },
+          {
+            type: "orderedList",
+            content: [
+              {
+                type: "listItem",
+                content: [
+                  {
+                    type: "paragraph",
+                    content: [{ type: "text", text: "Step one" }],
+                  },
+                ],
+              },
+              {
+                type: "listItem",
+                content: [
+                  {
+                    type: "paragraph",
+                    content: [{ type: "text", text: "Step two" }],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      }
+
+      await setupEditor(content)
+
+      const stepOne = await screen.findByText("Step one")
+      const stepTwo = await screen.findByText("Step two")
+      expect(stepOne.closest("li")).toBeTruthy()
+      expect(stepTwo.closest("li")).toBeTruthy()
+    })
+
+    test("renders document with task list", async () => {
+      const content: JSONContent = {
+        type: "doc",
+        content: [
+          {
+            type: "banner",
+            content: [
+              {
+                type: "heading",
+                attrs: { level: 1 },
+                content: [{ type: "text", text: "Title" }],
+              },
+              {
+                type: "paragraph",
+                content: [],
+              },
+            ],
+          },
+          {
+            type: "byline",
+          },
+          {
+            type: "taskList",
+            content: [
+              {
+                type: "taskItem",
+                attrs: { checked: false },
+                content: [
+                  {
+                    type: "paragraph",
+                    content: [{ type: "text", text: "Unchecked task" }],
+                  },
+                ],
+              },
+              {
+                type: "taskItem",
+                attrs: { checked: true },
+                content: [
+                  {
+                    type: "paragraph",
+                    content: [{ type: "text", text: "Checked task" }],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      }
+
+      await setupEditor(content)
+
+      const uncheckedTask = await screen.findByText("Unchecked task")
+      const checkedTask = await screen.findByText("Checked task")
+      expect(uncheckedTask.closest("li")).toBeTruthy()
+      expect(checkedTask.closest("li")).toBeTruthy()
+      expect(screen.getByText("Checked task")).toBeInTheDocument()
+    })
+  })
+
+  describe("Block elements", () => {
+    test("renders document with blockquote", async () => {
+      const content: JSONContent = {
+        type: "doc",
+        content: [
+          {
+            type: "banner",
+            content: [
+              {
+                type: "heading",
+                attrs: { level: 1 },
+                content: [{ type: "text", text: "Title" }],
+              },
+              {
+                type: "paragraph",
+                content: [],
+              },
+            ],
+          },
+          {
+            type: "byline",
+          },
+          {
+            type: "blockquote",
+            content: [
+              {
+                type: "paragraph",
+                content: [{ type: "text", text: "This is a quote" }],
+              },
+            ],
+          },
+        ],
+      }
+
+      await setupEditor(content)
+
+      const quote = await screen.findByText("This is a quote")
+      expect(quote.closest("blockquote")).toBeTruthy()
+    })
+
+    test("renders document with code block", async () => {
+      const content: JSONContent = {
+        type: "doc",
+        content: [
+          {
+            type: "banner",
+            content: [
+              {
+                type: "heading",
+                attrs: { level: 1 },
+                content: [{ type: "text", text: "Title" }],
+              },
+              {
+                type: "paragraph",
+                content: [],
+              },
+            ],
+          },
+          {
+            type: "byline",
+          },
+          {
+            type: "codeBlock",
+            attrs: { language: "javascript" },
+            content: [{ type: "text", text: "const x = 1;" }],
+          },
+        ],
+      }
+
+      await setupEditor(content)
+
+      const code = await screen.findByText("const x = 1;")
+      expect(code.closest("code")).toBeTruthy()
+    })
+
+    test("renders document with horizontal rule", async () => {
+      const content: JSONContent = {
+        type: "doc",
+        content: [
+          {
+            type: "banner",
+            content: [
+              {
+                type: "heading",
+                attrs: { level: 1 },
+                content: [{ type: "text", text: "Title" }],
+              },
+              {
+                type: "paragraph",
+                content: [],
+              },
+            ],
+          },
+          {
+            type: "byline",
+          },
+          {
+            type: "horizontalRule",
+          },
+        ],
+      }
+
+      await setupEditor(content)
+
+      await screen.findByRole("separator")
+    })
+  })
+
+  describe("Complex document structures", () => {
+    test("renders document with mixed content types", async () => {
+      const content: JSONContent = {
+        type: "doc",
+        content: [
+          {
+            type: "banner",
+            content: [
+              {
+                type: "heading",
+                attrs: { level: 1 },
+                content: [{ type: "text", text: "Complex Article" }],
+              },
+              {
+                type: "paragraph",
+                content: [
+                  { type: "text", text: "A " },
+                  {
+                    type: "text",
+                    marks: [{ type: "bold" }],
+                    text: "complex",
+                  },
+                  { type: "text", text: " article with " },
+                  {
+                    type: "text",
+                    marks: [{ type: "italic" }],
+                    text: "various",
+                  },
+                  { type: "text", text: " elements." },
+                ],
+              },
+            ],
+          },
+          {
+            type: "byline",
+          },
+          {
+            type: "heading",
+            attrs: { level: 2 },
+            content: [{ type: "text", text: "Introduction" }],
+          },
+          {
+            type: "paragraph",
+            content: [{ type: "text", text: "First paragraph of content." }],
+          },
+          {
+            type: "bulletList",
+            content: [
+              {
+                type: "listItem",
+                content: [
+                  {
+                    type: "paragraph",
+                    content: [{ type: "text", text: "List item one" }],
+                  },
+                ],
+              },
+            ],
+          },
+          {
+            type: "blockquote",
+            content: [
+              {
+                type: "paragraph",
+                content: [{ type: "text", text: "Important quote" }],
+              },
+            ],
+          },
+          {
+            type: "heading",
+            attrs: { level: 3 },
+            content: [{ type: "text", text: "Conclusion" }],
+          },
+          {
+            type: "paragraph",
+            content: [{ type: "text", text: "Final thoughts." }],
+          },
+        ],
+      }
+
+      await setupEditor(content)
+
+      expect(
+        screen.getByRole("heading", { level: 1, name: "Complex Article" }),
+      ).toBeInTheDocument()
+      expect(screen.getByText("complex")).toBeInTheDocument()
+      expect(screen.getByText("various")).toBeInTheDocument()
+
+      expect(
+        screen.getByRole("heading", { level: 2, name: "Introduction" }),
+      ).toBeInTheDocument()
+      expect(
+        screen.getByRole("heading", { level: 3, name: "Conclusion" }),
+      ).toBeInTheDocument()
+
+      expect(
+        screen.getByText("First paragraph of content."),
+      ).toBeInTheDocument()
+      expect(screen.getByText("Final thoughts.")).toBeInTheDocument()
+
+      expect(screen.getByText("List item one")).toBeInTheDocument()
+
+      expect(screen.getByText("Important quote")).toBeInTheDocument()
+    })
+
+    test("renders document with nested lists", async () => {
+      const content: JSONContent = {
+        type: "doc",
+        content: [
+          {
+            type: "banner",
+            content: [
+              {
+                type: "heading",
+                attrs: { level: 1 },
+                content: [{ type: "text", text: "Title" }],
+              },
+              {
+                type: "paragraph",
+                content: [],
+              },
+            ],
+          },
+          {
+            type: "byline",
+          },
+          {
+            type: "bulletList",
+            content: [
+              {
+                type: "listItem",
+                content: [
+                  {
+                    type: "paragraph",
+                    content: [{ type: "text", text: "Parent item" }],
+                  },
+                  {
+                    type: "bulletList",
+                    content: [
+                      {
+                        type: "listItem",
+                        content: [
+                          {
+                            type: "paragraph",
+                            content: [{ type: "text", text: "Nested item" }],
+                          },
+                        ],
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      }
+
+      await setupEditor(content)
+
+      expect(screen.getByText("Parent item")).toBeInTheDocument()
+      expect(screen.getByText("Nested item")).toBeInTheDocument()
+    })
+  })
+
+  describe("Document structure validation", () => {
+    test("renders editor even with minimal valid structure", async () => {
+      const content: JSONContent = {
+        type: "doc",
+        content: [
+          {
+            type: "banner",
+            content: [
+              {
+                type: "heading",
+                attrs: { level: 1 },
+                content: [],
+              },
+              {
+                type: "paragraph",
+                content: [],
+              },
+            ],
+          },
+          {
+            type: "byline",
+          },
+          {
+            type: "paragraph",
+            content: [],
+          },
+        ],
+      }
+
+      await setupEditor(content)
+
+      expect(screen.getByTestId("editor")).toBeInTheDocument()
+      await screen.findByRole("heading", { level: 1 })
+    })
+
+    test("renders document with empty banner subtitle", async () => {
+      const content: JSONContent = {
+        type: "doc",
+        content: [
+          {
+            type: "banner",
+            content: [
+              {
+                type: "heading",
+                attrs: { level: 1 },
+                content: [{ type: "text", text: "Title Only" }],
+              },
+              {
+                type: "paragraph",
+                content: [],
+              },
+            ],
+          },
+          {
+            type: "byline",
+          },
+          {
+            type: "paragraph",
+            content: [{ type: "text", text: "Content paragraph" }],
+          },
+        ],
+      }
+
+      await setupEditor(content)
+
+      expect(
+        screen.getByRole("heading", { level: 1, name: "Title Only" }),
+      ).toBeInTheDocument()
+      expect(screen.getByText("Content paragraph")).toBeInTheDocument()
+    })
+
+    test("Shows schema errors when content is invalid (missing banner and byline)", async () => {
+      const currentMock = consoleErrorSpy.getMockImplementation()
+      consoleErrorSpy.mockImplementation((message: unknown) => {
+        if (
+          typeof message === "string" &&
+          message.includes("Document schema check failed")
+        ) {
+          return
+        }
+        if (currentMock) {
+          currentMock(message)
+        }
+      })
+
+      // Content missing required banner and byline
+      const content: JSONContent = {
+        type: "doc",
+        content: [
+          {
+            type: "paragraph",
+            attrs: {
+              textAlign: null,
+            },
+            content: [
+              {
+                text: "Content paragraph",
+                type: "text",
+              },
+            ],
+          },
+        ],
+      }
+      await setupEditor(content)
+
+      await screen.findByText(
+        "Document schema check failed: Invalid content for node doc: paragraph is not allowed in this position",
+      )
+
+      if (currentMock) {
+        consoleErrorSpy.mockImplementation(currentMock)
+      }
+    })
+  })
+})
+
+describe("NewsEditor - Byline publish date", () => {
+  // A minimal valid document (banner + byline + paragraph) so the byline node
+  // renders in the read-only viewer.
+  const bylineDoc: JSONContent = {
+    type: "doc",
+    content: [
+      {
+        type: "banner",
+        content: [
+          {
+            type: "heading",
+            attrs: { level: 1 },
+            content: [{ type: "text", text: "Byline Article" }],
+          },
+          { type: "paragraph", content: [] },
+        ],
+      },
+      { type: "byline" },
+      { type: "paragraph", content: [] },
+    ],
+  }
+
+  const renderReadOnly = async (overrides: Partial<WebsiteContent>) => {
+    const user = factories.user.user({
+      is_authenticated: true,
+      is_article_editor: true,
+    })
+    setMockResponse.get(urls.userMe.get(), user)
+
+    const newsItem = factories.websiteContent.websiteContent({
+      id: 300,
+      title: "Byline Article",
+      content: bylineDoc,
+      ...overrides,
+    })
+    setMockResponse.get(urls.websiteContent.details(newsItem.id), newsItem)
+
+    renderWithProviders(
+      <NewsEditor
+        autosaveDelayMs={AUTOSAVE_OFF}
+        newsItem={newsItem}
+        readOnly
+      />,
+      { user },
+    )
+    await screen.findByTestId("editor")
+    return newsItem
+  }
+
+  // publish_date and created_on are deliberately different so we can prove the
+  // byline reads from publish_date and never falls back to created_on.
+  test.each([
+    {
+      description: "shows the formatted publish_date when published",
+      isPublished: true,
+      expected: "Mar 15, 2024",
+    },
+    {
+      description: "shows 'Draft' (never created_on) when unpublished",
+      isPublished: false,
+      expected: "Draft",
+    },
+  ])("$description", async ({ isPublished, expected }) => {
+    await renderReadOnly({
+      is_published: isPublished,
+      publish_date: "2024-03-15T12:00:00Z",
+      created_on: "2020-01-01T12:00:00Z",
+    })
+
+    // "Draft" now also appears in the control bar (the drafts link and the
+    // status readout), so scope this to the byline under test.
+    const byline = document.querySelector(".byline-info-bar")
+    expect(byline).not.toBeNull()
+    await within(byline as HTMLElement).findByText(expected)
+    // The byline must never surface the created_on date.
+    expect(screen.queryByText("Jan 1, 2020")).not.toBeInTheDocument()
+  })
+})
+
+describe("NewsEditor - Delete draft", () => {
+  beforeEach(() => {
+    jest.clearAllMocks()
+  })
+
+  test("the edit toolbar does not offer delete", async () => {
+    const user = factories.user.user({
+      is_authenticated: true,
+      is_article_editor: true,
+    })
+    setMockResponse.get(urls.userMe.get(), user)
+
+    const newsItem = factories.websiteContent.websiteContent({
+      id: 321,
+      title: "Draft news",
+      content_type: "news",
+      is_published: false,
+    })
+    setMockResponse.get(urls.websiteContent.details(newsItem.id), newsItem)
+
+    renderWithProviders(
+      <NewsEditor
+        autosaveDelayMs={AUTOSAVE_OFF}
+        newsItem={newsItem}
+        onSave={mockOnSave}
+      />,
+      {
+        user,
+      },
+    )
+    await screen.findByTestId("editor")
+
+    /**
+     * Deleting a draft lives on the drafts listing instead, where
+     * `WebsiteContentDraftListingPage delete` covers it. The edit bar carries
+     * the status, Publish and the settings icon, and nothing else.
+     */
+    expect(screen.queryByRole("button", { name: "Delete" })).toBe(null)
+  })
+})
+
+describe("NewsEditor - shared content controls", () => {
+  beforeEach(() => {
+    jest.clearAllMocks()
+  })
+
+  /**
+   * The control bar and settings drawer are drawn from the /articles design but
+   * shared by every content type, so their copy must name the type being
+   * edited. These lock the substitution in: news must never say "Article".
+   */
+  test("the news control bar carries the status readout", async () => {
+    const user = factories.user.user({
+      is_authenticated: true,
+      is_article_editor: true,
+    })
+    setMockResponse.get(urls.userMe.get(), user)
+
+    const newsItem = factories.websiteContent.websiteContent({
+      id: 401,
+      title: "Draft news",
+      content_type: "news",
+      is_published: false,
+    })
+    setMockResponse.get(urls.websiteContent.details(newsItem.id), newsItem)
+
+    renderWithProviders(
+      <NewsEditor autosaveDelayMs={AUTOSAVE_OFF} newsItem={newsItem} />,
+      { user },
+    )
+    await screen.findByTestId("editor")
+
+    await screen.findByRole("button", { name: "Settings" })
+    /* The readout no longer names the content type, for either type. */
+    expect(await screen.findByText(/Status:/)).toHaveTextContent(
+      "Status: Draft",
+    )
+  })
+
+  test("the settings drawer is titled for news", async () => {
+    const user = factories.user.user({
+      is_authenticated: true,
+      is_article_editor: true,
+    })
+    setMockResponse.get(urls.userMe.get(), user)
+    setMockResponse.get(
+      urls.topics.list({ limit: 1000 }),
+      factories.learningResources.topics({ count: 2 }),
+    )
+
+    const newsItem = factories.websiteContent.websiteContent({
+      id: 402,
+      title: "Draft news",
+      content_type: "news",
+      is_published: false,
+    })
+    setMockResponse.get(urls.websiteContent.details(newsItem.id), newsItem)
+
+    renderWithProviders(
+      <NewsEditor autosaveDelayMs={AUTOSAVE_OFF} newsItem={newsItem} />,
+      { user },
+    )
+    await screen.findByTestId("editor")
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Settings" }),
+    )
+
+    await screen.findByRole("heading", { name: "News Settings" })
+    expect(
+      screen.queryByRole("heading", { name: "Article Settings" }),
+    ).not.toBeInTheDocument()
+  })
+
+  test("the settings drawer offers news no topics", async () => {
+    const user = factories.user.user({
+      is_authenticated: true,
+      is_article_editor: true,
+    })
+    setMockResponse.get(urls.userMe.get(), user)
+
+    const newsItem = factories.websiteContent.websiteContent({
+      id: 403,
+      title: "Draft news",
+      content_type: "news",
+      is_published: false,
+    })
+    setMockResponse.get(urls.websiteContent.details(newsItem.id), newsItem)
+
+    renderWithProviders(
+      <NewsEditor autosaveDelayMs={AUTOSAVE_OFF} newsItem={newsItem} />,
+      { user },
+    )
+    await screen.findByTestId("editor")
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Settings" }),
+    )
+    await screen.findByRole("heading", { name: "News Settings" })
+
+    /* Only an article is projected into a LearningResource, so only there do
+       topics reach anything. SEO settings are still offered. */
+    expect(
+      screen.queryByRole("heading", { name: "Select Topics" }),
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole("combobox", { name: "Topic" }),
+    ).not.toBeInTheDocument()
+    await screen.findByRole("heading", { name: "SEO Settings" })
+
+    /* No topics query either: this test mocks no topics response at all, so a
+       request for one would fail the suite. */
+    setMockResponse.patch(urls.websiteContent.details(newsItem.id), newsItem)
+    await userEvent.type(
+      await screen.findByLabelText(/^SEO Title/),
+      "News for search",
+    )
+    /* This is a draft, so a title on its own saves -- the description is
+       insisted on at the publish, not here. */
+    await userEvent.type(
+      screen.getByLabelText(/^SEO Description/),
+      "What this is about.",
+    )
+    await userEvent.click(screen.getByRole("button", { name: "Save Settings" }))
+
+    /**
+     * The SEO fields are saved for news as they are for an article, but no
+     * `topics` is sent: writing `[]` would empty a selection the editor was
+     * never shown.
+     */
+    await waitFor(() => {
+      expect(makeRequest).toHaveBeenCalledWith(
+        expect.objectContaining({
+          method: "patch",
+          body: {
+            seo_title_override: "News for search",
+            seo_description_override: "What this is about.",
+          },
+        }),
+      )
+    })
+  })
+
+  /**
+   * News has no topics section, so the SEO fields are the only thing
+   * publishing can be waiting on -- which makes this the case that would
+   * strand a held-back publish if the resume still tested the topic count.
+   */
+  test("news is not published without an SEO title and description", async () => {
+    const user = factories.user.user({
+      is_authenticated: true,
+      is_article_editor: true,
+    })
+    setMockResponse.get(urls.userMe.get(), user)
+
+    const newsItem = factories.websiteContent.websiteContent({
+      id: 404,
+      title: "Draft news",
+      content_type: "news",
+      is_published: false,
+      /* A real banner: the editor takes its title from that heading, and
+         Publish is disabled without one. */
+      content: {
+        type: "doc",
+        content: [
+          {
+            type: "banner",
+            content: [
+              {
+                type: "heading",
+                attrs: { level: 1 },
+                content: [{ type: "text", text: "Draft news" }],
+              },
+              { type: "paragraph", content: [] },
+            ],
+          },
+          { type: "byline" },
+          { type: "paragraph", content: [] },
+        ],
+      },
+    })
+    setMockResponse.get(urls.websiteContent.details(newsItem.id), newsItem)
+    setMockResponse.patch(urls.websiteContent.details(newsItem.id), {
+      ...newsItem,
+      is_published: true,
+    })
+
+    renderWithProviders(
+      <NewsEditor autosaveDelayMs={AUTOSAVE_OFF} newsItem={newsItem} />,
+      { user },
+    )
+    await screen.findByTestId("editor")
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Publish" }),
+    )
+
+    // The drawer, not the publish confirmation.
+    await screen.findByRole("heading", { name: "News Settings" })
+    expect(
+      screen.queryByRole("heading", { name: "Publish news" }),
+    ).not.toBeInTheDocument()
+    /* Only the description: the banner's heading resolves the title. */
+    await screen.findByText(
+      /Add an SEO description to publish your news\. Your news has no line under the headline to fall back to\./,
+    )
+
+    await userEvent.type(
+      await screen.findByLabelText(/^SEO Title/),
+      "What MIT built this week",
+    )
+    await userEvent.type(
+      screen.getByLabelText(/^SEO Description/),
+      "A short summary for search results.",
+    )
+    await userEvent.click(screen.getByRole("button", { name: "Save Settings" }))
+
+    /* The press picks up where it left off, with no topics involved. */
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Yes, Publish news" }),
+    )
+
+    await waitFor(() => {
+      expect(makeRequest).toHaveBeenCalledWith(
+        expect.objectContaining({
+          method: "patch",
+          body: expect.objectContaining({
+            is_published: true,
+            seo_title_override: "What MIT built this week",
+            seo_description_override: "A short summary for search results.",
+          }),
+        }),
+      )
+    })
+  }, 30000)
+})

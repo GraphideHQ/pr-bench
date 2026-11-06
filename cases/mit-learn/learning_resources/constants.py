@@ -1,0 +1,462 @@
+"""Constants for learning_resources"""
+
+from django.db.models import TextChoices
+from named_enum import ExtendedEnum
+
+FAVORITES_TITLE = "Favorites"
+
+
+class RunStatus(ExtendedEnum):
+    """
+    Enum for run status options dictated by edX API values.
+    """
+
+    current = "Current"
+    upcoming = "Upcoming"
+    starting_soon = "Starting Soon"
+    archived = "Archived"
+
+
+class Availability(ExtendedEnum):
+    """
+    Describes when a resource is available to users.
+    """
+
+    dated = "Dated"  # available within specific date ranges
+    anytime = "Anytime"  # available any time
+
+
+class LearningResourceType(ExtendedEnum):
+    """Enum for LearningResource resource_type values"""
+
+    course = "Course"
+    program = "Program"
+    learning_path = "Learning Path"
+    podcast = "Podcast"
+    podcast_episode = "Podcast Episode"
+    video = "Video"
+    video_playlist = "Video Playlist"
+    document = "Document"
+
+
+# The resource types a shadow run compares (learning_resources.etl.shadow):
+# what load_courses, load_programs, load_documents and load_podcasts write.
+SHADOW_COMPARED_TYPES = frozenset(
+    {
+        LearningResourceType.course.name,
+        LearningResourceType.program.name,
+        LearningResourceType.document.name,
+        LearningResourceType.podcast.name,
+        LearningResourceType.podcast_episode.name,
+    }
+)
+# The (etl_source, resource_type) pairs of other types that one pipeline's
+# shadow run compares, by that pipeline: SyncYouTubeTask's playlists and
+# videos (shadow.observe_youtube). Any other pair cannot be shadowed, since
+# nothing would report on it.
+SHADOW_COMPARED_PAIRS = {
+    ("youtube", LearningResourceType.video_playlist.name): "warehouse",
+    ("youtube", LearningResourceType.video.name): "warehouse",
+}
+
+
+def shadow_compares(etl_source: str, resource_type: str, pipeline: str) -> bool:
+    """Whether a shadow run of ``pipeline`` compares a pair, so it can shadow it"""
+    return (
+        resource_type in SHADOW_COMPARED_TYPES
+        or SHADOW_COMPARED_PAIRS.get((etl_source, resource_type)) == pipeline
+    )
+
+
+# `resource_category` for editorial articles. They are `document` resources --
+# 0105 folded the `article` resource type into `document` -- distinguished by
+# this category, the same way the MIT Climate ETL models its own articles and
+# what the frontend keys its "View Article" call to action off.
+ARTICLE_RESOURCE_CATEGORY = "Article"
+
+# Prefix for the readable_id of a LearningResource mirroring a WebsiteContent
+# item, so editorial content is distinguishable from ETL'd documents.
+WEBSITE_CONTENT_READABLE_ID_PREFIX = "website_content:"
+
+LEARNING_MATERIAL_RESOURCE_TYPE_GROUP = "learning_material"
+RESOURCE_TYPE_GROUP_VALUES = [
+    LearningResourceType.course.name,
+    LearningResourceType.program.name,
+    LEARNING_MATERIAL_RESOURCE_TYPE_GROUP,
+]
+
+# Choices for the resource_type_group DRF field (a higher-level grouping
+# than resource_type).
+RESOURCE_TYPE_GROUP_CHOICES = [
+    (value, value.replace("_", " ").title()) for value in RESOURCE_TYPE_GROUP_VALUES
+]
+
+PROGRAM_COURSE_CACHE_KEY_TEST_MODE = "program_course_resource_cache_with_test_mode"
+PROGRAM_COURSE_CACHE_KEY_PUBLISHED = "program_course_resource_cache_published_only"
+
+
+class OfferedBy(ExtendedEnum):
+    """
+    Enum for our Offered By labels. They are our MIT "brands" for LearningResources
+    (Courses, Bootcamps, Programs) and are independent of what platform.
+    User generated lists UserLists (like a learning path) don't have offered by "brand".
+    Values are user-facing.
+    These should be kept in sync with the LearningResourceOfferor model objects
+    """
+
+    mitx = "MITx"
+    ocw = "MIT OpenCourseWare"
+    bootcamps = "Bootcamps"
+    xpro = "MIT xPRO"
+    mitpe = "MIT Professional Education"
+    see = "MIT Sloan Executive Education"
+    climate = "MIT Climate"
+
+
+class PlatformType(ExtendedEnum):
+    """
+    Enum for platforms, this should be kept in sync
+    with LearningResourcePlatform model objects
+    """
+
+    edx = "edX"
+    ocw = "MIT OpenCourseWare"
+    oll = "Open Learning Library"
+    mitxonline = "MITx Online"
+    bootcamps = "Bootcamps"
+    xpro = "MIT xPRO"
+    csail = "CSAIL"
+    mitpe = "MIT Professional Education"
+    see = "MIT Sloan Executive Education"
+    scc = "Schwarzman College of Computing"
+    ctl = "Center for Transportation & Logistics"
+    whu = "WHU"
+    susskind = "Susskind"
+    globalalumni = "Global Alumni"
+    simplilearn = "Simplilearn"
+    emeritus = "Emeritus"
+    podcast = "Podcast"
+    youtube = "YouTube"
+    canvas = "Canvas"
+    climate = "MIT Climate"
+    ovs = "ODL Video Service"
+
+
+class PrivacyLevel(ExtendedEnum):
+    """
+    Enum tracking privacy levels for user-created UserLists
+    """
+
+    private = "private"
+    unlisted = "unlisted"
+
+
+semester_mapping = {"1T": "Spring", "2T": "Summer", "3T": "Fall"}
+
+
+class LearningResourceRelationTypes(TextChoices):
+    """Enum for LearningResourceRelationship relation_type values"""
+
+    PROGRAM_COURSES = "PROGRAM_COURSES", "Program Courses"
+    PROGRAM_PROGRAMS = "PROGRAM_PROGRAMS", "Program Programs"
+    LEARNING_PATH_ITEMS = "LEARNING_PATH_ITEMS", "Learning Path Items"
+    PODCAST_EPISODES = "PODCAST_EPISODES", "Podcast Episodes"
+    PLAYLIST_VIDEOS = "PLAYLIST_VIDEOS", "Playlist Videos"
+    COURSE_LEARNING_MATERIALS = "COURSE_LEARNING_MATERIALS", "Course Learning Materials"
+
+
+# Relation types whose parent forms part of the child's URL. A resource's type
+# admits only one of them, so they can be read as a single list.
+CANONICAL_PARENT_RELATION_TYPES = (
+    LearningResourceRelationTypes.PODCAST_EPISODES.value,
+    LearningResourceRelationTypes.PLAYLIST_VIDEOS.value,
+)
+
+# Feeds Meta.ordering, so changing it needs a migration.
+RELATIONSHIP_ORDERING = ("position", "id")
+
+
+GROUP_STAFF_LISTS_EDITORS = "learning_path_editors"
+
+
+OCW_CONTENT_CATEGORY_PRACTICE_AND_ASSIGNMENT = "Practice & Assignment"
+OCW_CONTENT_CATEGORY_OPEN_TEXTBOOKS = "Open Textbook"
+OCW_CONTENT_CATEGORY_LECTURE_VIDEOS = "Lecture Video"
+
+OCW_INSTRUCTOR_INSIGHTS_TAG = "Instructor Insights"
+
+VIDEO_SHORT_RESOURCE_CATEGORY = "Video Short"
+
+OCW_PLAYLIST_VIDEO_THRESHOLD = 0.6
+
+
+OCW_COURSE_CONTENT_CATEGORY_MAPPING = {
+    "Exams": OCW_CONTENT_CATEGORY_PRACTICE_AND_ASSIGNMENT,
+    "Exams Solutions": OCW_CONTENT_CATEGORY_PRACTICE_AND_ASSIGNMENT,
+    "Supplemental Exam Materials": OCW_CONTENT_CATEGORY_PRACTICE_AND_ASSIGNMENT,
+    "Problem Sets": OCW_CONTENT_CATEGORY_PRACTICE_AND_ASSIGNMENT,
+    "Problem Set Solutions": OCW_CONTENT_CATEGORY_PRACTICE_AND_ASSIGNMENT,
+    "Recitations": OCW_CONTENT_CATEGORY_PRACTICE_AND_ASSIGNMENT,
+    "Tutorials": OCW_CONTENT_CATEGORY_PRACTICE_AND_ASSIGNMENT,
+    "Projects": OCW_CONTENT_CATEGORY_PRACTICE_AND_ASSIGNMENT,
+    "Assignments": OCW_CONTENT_CATEGORY_PRACTICE_AND_ASSIGNMENT,
+    "Laboratory Assignments": OCW_CONTENT_CATEGORY_PRACTICE_AND_ASSIGNMENT,
+    "Programming Assignments": OCW_CONTENT_CATEGORY_PRACTICE_AND_ASSIGNMENT,
+    "Activity Assignments": OCW_CONTENT_CATEGORY_PRACTICE_AND_ASSIGNMENT,
+    "Written Assignments": OCW_CONTENT_CATEGORY_PRACTICE_AND_ASSIGNMENT,
+    "Open Textbooks": OCW_CONTENT_CATEGORY_OPEN_TEXTBOOKS,
+}
+
+OCW_VISIBLE_TAGS = ["Open Textbooks"]
+
+
+VALID_FILE_TYPES = [
+    ".csv",
+    ".doc",
+    ".docx",
+    ".htm",
+    ".html",
+    ".json",
+    ".m",
+    ".mat",
+    ".md",
+    ".pdf",
+    ".ppt",
+    ".pptx",
+    ".ps",
+    ".py",
+    ".r",
+    ".rtf",
+    ".sjson",
+    ".srt",
+    ".txt",
+    ".vtt",
+    ".xls",
+    ".xlsx",
+    ".xml",
+]
+
+VALID_TEXT_FILE_TYPES = [
+    ".doc",
+    ".docx",
+    ".htm",
+    ".html",
+    ".json",
+    ".md",
+    ".pdf",
+    ".tex",
+    ".ppt",
+    ".pptx",
+    ".rtf",
+    ".sjson",
+    ".srt",
+    ".txt",
+    ".vtt",
+    ".xml",
+]
+
+VALID_TUTOR_PROBLEM_FILE_TYPES = [*VALID_TEXT_FILE_TYPES, ".csv", ".py"]
+
+VALID_ALL_FILE_TYPES = list(
+    zip(
+        [*VALID_FILE_TYPES, *VALID_TEXT_FILE_TYPES],
+        [*VALID_FILE_TYPES, *VALID_TEXT_FILE_TYPES],
+    )
+)
+
+
+CONTENT_TYPE_PAGE = "page"
+CONTENT_TYPE_FILE = "file"
+CONTENT_TYPE_VIDEO = "video"
+CONTENT_TYPE_PDF = "pdf"
+
+VALID_COURSE_CONTENT_TYPES = (
+    CONTENT_TYPE_PAGE,
+    CONTENT_TYPE_FILE,
+    CONTENT_TYPE_VIDEO,
+    CONTENT_TYPE_PDF,
+)
+VALID_COURSE_CONTENT_CHOICES = list(
+    zip(VALID_COURSE_CONTENT_TYPES, VALID_COURSE_CONTENT_TYPES)
+)
+
+# Large text fields excluded from API responses (both nested serializers and
+# OpenSearch _source filtering) but retained in the search index for querying
+CONTENT_FILE_LARGE_FIELDS = ("content", "summary", "flashcards")
+
+TUTOR_PROBLEM_TYPE = "problem"
+TUTOR_SOLUTION_TYPE = "solution"
+VALID_TUTOR_PROBLEM_TYPES = [TUTOR_PROBLEM_TYPE, TUTOR_SOLUTION_TYPE]
+VALID_TUTOR_PROBLEM_TYPE_CHOICES = list(
+    zip(VALID_TUTOR_PROBLEM_TYPES, VALID_TUTOR_PROBLEM_TYPES)
+)
+
+DEPARTMENTS = {
+    "1": "Civil and Environmental Engineering",
+    "2": "Mechanical Engineering",
+    "3": "Materials Science and Engineering",
+    "4": "Architecture",
+    "5": "Chemistry",
+    "6": "Electrical Engineering and Computer Science",
+    "7": "Biology",
+    "8": "Physics",
+    "9": "Brain and Cognitive Sciences",
+    "10": "Chemical Engineering",
+    "11": "Urban Studies and Planning",
+    "12": "Earth, Atmospheric, and Planetary Sciences",
+    "14": "Economics",
+    "15": "Management",
+    "16": "Aeronautics and Astronautics",
+    "17": "Political Science",
+    "18": "Mathematics",
+    "20": "Biological Engineering",
+    "21A": "Anthropology",
+    "21G": "Global Languages",
+    "21H": "History",
+    "21L": "Literature",
+    "21M": "Music",
+    "21T": "Theater Arts",
+    "22": "Nuclear Science and Engineering",
+    "24": "Linguistics and Philosophy",
+    "CC": "Concourse",
+    "CMS-W": "Comparative Media Studies/Writing",
+    "EC": "Edgerton Center",
+    "ES": "Experimental Study Group",
+    "ESD": "Engineering Systems Division",
+    "HST": "Medical Engineering and Science",
+    "IDS": "Data, Systems, and Society",
+    "MAS": "Media Arts and Sciences",
+    "PE": "Athletics, Physical Education and Recreation",
+    "SP": "Special Programs",
+    "STS": "Science, Technology, and Society",
+    "WGS": "Women's and Gender Studies",
+}
+
+
+LEARNING_RESOURCE_SORTBY_OPTIONS = {
+    "id": {
+        "title": "Object ID ascending",
+        "sort": "id",
+    },
+    "-id": {
+        "title": "Object ID descending",
+        "sort": "-id",
+    },
+    "readable_id": {
+        "title": "Readable ID ascending",
+        "sort": "readable_id",
+    },
+    "-readable_id": {
+        "title": "Readable ID descending",
+        "sort": "-readable_id",
+    },
+    "last_modified": {
+        "title": "Last Modified Date ascending",
+        "sort": "last_modified",
+    },
+    "-last_modified": {
+        "title": "Last Modified Date descending",
+        "sort": "-last_modified",
+    },
+    "new": {
+        "title": "Newest resources first",
+        "sort": "-created_on",
+    },
+    "start_date": {
+        "title": "Start Date ascending",
+        "sort": "runs__start_date",
+    },
+    "-start_date": {
+        "title": "Start Date descending",
+        "sort": "-runs__start_date",
+    },
+    "mitcoursenumber": {
+        "title": "MIT course number ascending",
+        "sort": "course__course_numbers__0__sort_coursenum",
+    },
+    "-mitcoursenumber": {
+        "title": "MIT course number descending",
+        "sort": "-course__course_numbers__0__sort_coursenum",
+    },
+    "views": {
+        "title": "Popularity ascending",
+        "sort": "views",
+    },
+    "-views": {
+        "title": "Popularity descending",
+        "sort": "-views",
+    },
+    "upcoming": {
+        "title": "Next start date ascending",
+        "sort": "next_start_date",
+    },
+}
+
+
+class LevelType(ExtendedEnum):
+    """
+    Enum for resource (run) level.
+    """
+
+    undergraduate = "Undergraduate"
+    graduate = "Graduate"
+    high_school = "High School"
+    noncredit = "Non-Credit"
+    advanced = "Advanced"
+    intermediate = "Intermediate"
+    introductory = "Introductory"
+
+
+class LearningResourceDelivery(ExtendedEnum):
+    """
+    Enum for resource delivery methods.
+    """
+
+    online = "Online"
+    hybrid = "Hybrid"
+    in_person = "In person"
+    offline = "Offline"
+
+
+class CertificationType(ExtendedEnum):
+    """Enum for resource certification types"""
+
+    micromasters = "MicroMasters Credential"
+    professional = "Professional Certificate"
+    completion = "Certificate of Completion"
+    none = "No Certificate"
+
+
+class Pace(ExtendedEnum):
+    """Enum for resource pace types"""
+
+    self_paced = "Self-paced"
+    instructor_paced = "Instructor-paced"
+
+
+class Format(ExtendedEnum):
+    """Enum for resource format types"""
+
+    synchronous = "Synchronous"
+    asynchronous = "Asynchronous"
+
+
+CURRENCY_USD = "USD"
+
+
+GROUP_CONTENT_FILE_CONTENT_VIEWERS = "content_file_viewers"
+GROUP_TUTOR_PROBLEM_VIEWERS = "tutor_problem_viewers"
+GROUP_COURSE_AUTHORS = "course_authors"
+
+
+class CredentialMetadataField(ExtendedEnum):
+    """The Open Badges fields the credential metadata API generates"""
+
+    description = "Description"
+    criteria = "Criteria"
+
+
+CREDENTIAL_METADATA_RESOURCE_TYPES = (
+    LearningResourceType.course.name,
+    LearningResourceType.program.name,
+)

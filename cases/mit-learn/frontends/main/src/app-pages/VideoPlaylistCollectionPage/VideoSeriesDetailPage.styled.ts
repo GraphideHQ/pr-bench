@@ -1,0 +1,320 @@
+import Link from "next/link"
+import { Typography, styled, theme, type TypographyProps } from "ol-components"
+import { richTextDescription } from "./shared.styled"
+import { ButtonLink } from "@mitodl/smoot-design"
+import VideoContainer from "./VideoContainer"
+export { SkipLinksNav, StyledBreadcrumbs, VideoTitle } from "./shared.styled"
+export {
+  NoVideoMessage,
+  ScreenReaderOnly,
+} from "@/page-components/VideoPlayer/shared.styled"
+
+export const PageWrapper = styled.div({
+  backgroundColor: theme.custom.colors.lightGray1,
+  minHeight: "100vh",
+})
+
+export const BreadcrumbBar = styled.div(({ theme }) => ({
+  padding: "18px 0 2px 0",
+  borderBottom: `1px solid ${theme.custom.colors.red}`,
+  [theme.breakpoints.down("sm")]: {
+    padding: "12px 0 0 0",
+  },
+}))
+
+export const VideoShareSection = styled("div")({
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  flexWrap: "wrap",
+  gap: "8px",
+  margin: "0 0 24px",
+  [theme.breakpoints.down("sm")]: {
+    margin: "0 0 16px",
+  },
+})
+
+export const ShareRow = styled.div(({ theme }) => ({
+  display: "flex",
+  justifyContent: "flex-end",
+  width: "100%",
+  [theme.breakpoints.down("sm")]: {
+    marginBottom: "32px",
+  },
+}))
+export const UpNextRight = styled.div({
+  display: "flex",
+  alignItems: "center",
+  gap: "24px",
+})
+
+// ── Series navigation bar ──
+
+export const SeriesNavBar = styled.div({})
+
+export const SeriesNavTopRow = styled(VideoContainer)(({ theme }) => ({
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  padding: "56px 0 12px !important",
+  gap: "16px",
+  [theme.breakpoints.down("lg")]: {
+    padding: "32px 16px 12px !important",
+  },
+}))
+
+export const SeriesNavTitle = styled(Link)(({ theme }) => ({
+  ...theme.typography.body3,
+  color: theme.custom.colors.darkRed,
+  fontWeight: theme.typography.fontWeightMedium,
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap",
+  textDecoration: "none",
+  flexShrink: 1,
+  minWidth: 0,
+  "&:hover": { color: theme.custom.colors.red, textDecoration: "underline" },
+  [theme.breakpoints.down("sm")]: {
+    ...theme.typography.body3,
+    fontWeight: theme.typography.fontWeightMedium,
+  },
+}))
+
+export const VideoPositionLabel = styled(Typography)(({ theme }) => ({
+  ...theme.typography.body3,
+  color: theme.custom.colors.darkGray2,
+  whiteSpace: "nowrap",
+  flexShrink: 0,
+  [theme.breakpoints.down("sm")]: {
+    ...theme.typography.body3,
+    fontWeight: theme.typography.fontWeightMedium,
+  },
+}))
+
+export const ProgressBarRow = styled(VideoContainer)(({ theme }) => ({
+  display: "flex",
+  gap: "3px",
+  padding: "0 0 0 0 !important",
+  [theme.breakpoints.down("lg")]: {
+    padding: "0 16px !important",
+  },
+}))
+
+export const ProgressSegment = styled.div<{ $active: boolean; $done: boolean }>(
+  ({ theme, $active, $done }) => ({
+    flex: 1,
+    height: "4px",
+    borderRadius: "2px",
+    backgroundColor: $active
+      ? theme.custom.colors.darkGray1
+      : $done
+        ? theme.custom.colors.darkRed
+        : theme.custom.colors.lightGray2,
+  }),
+)
+
+export const SeriesNavBottomRow = styled(VideoContainer)(({ theme }) => ({
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  padding: "16px 0 16px !important",
+  borderBottom: `1px solid ${theme.custom.colors.lightGray2}`,
+  [theme.breakpoints.down("lg")]: {
+    padding: "16px 16px 16px !important",
+    flexDirection: "column",
+    alignItems: "flex-start",
+    gap: "16px",
+  },
+}))
+
+export const NavLink = styled(Link)(({ theme }) => ({
+  display: "flex",
+  alignItems: "center",
+  gap: "6px",
+  ...theme.typography.body3,
+  color: theme.custom.colors.darkRed,
+  textDecoration: "none",
+  maxWidth: "45%",
+  minWidth: 0,
+  flexShrink: 1,
+  "&:hover": { color: theme.custom.colors.red },
+  [theme.breakpoints.down("sm")]: {
+    maxWidth: "100%",
+  },
+}))
+
+export const StyledButtonLink = styled(ButtonLink)(({ theme }) => ({
+  marginTop: "8px",
+  [theme.breakpoints.down("sm")]: {
+    marginLeft: "24px",
+    marginTop: "0",
+  },
+}))
+
+export const NavLinkText = styled.span({
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap",
+  minWidth: 0,
+  "&:hover": {
+    textDecoration: "underline",
+  },
+})
+
+export const NavArrowIcon = styled.span({
+  flexShrink: 0,
+  display: "flex",
+  alignItems: "center",
+})
+
+export const ContentArea = styled.div(({ theme }) => ({
+  padding: "40px 0 80px",
+  [theme.breakpoints.down("sm")]: {
+    padding: "32px 0 80px",
+  },
+}))
+
+export const InstitutionLabel = styled.span(({ theme }) => ({
+  display: "block",
+  ...theme.typography.body2,
+  fontWeight: theme.typography.fontWeightBold,
+  color: theme.custom.colors.silverGrayDark,
+  textTransform: "uppercase",
+  marginBottom: "16px",
+  lineHeight: "26px",
+  [theme.breakpoints.down("sm")]: {
+    ...theme.typography.body3,
+    lineHeight: "22px",
+    marginBottom: "8px",
+  },
+}))
+
+export const SectionDivider = styled.div(({ theme }) => ({
+  borderTop: `1px solid ${theme.custom.colors.lightGray2}`,
+  margin: "32px 0",
+}))
+
+// ── UP NEXT section ──
+
+export const UpNextSection = styled.div(({ theme }) => ({
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "space-between",
+  gap: "16px",
+  padding: "16px 32px",
+  marginBottom: "32px",
+  [theme.breakpoints.down("sm")]: {
+    flexDirection: "column",
+    alignItems: "flex-start",
+    gap: "12px",
+    padding: "16px 0",
+  },
+}))
+
+export const UpNextLeft = styled.div(({ theme }) => ({
+  display: "flex",
+  flexDirection: "column",
+  gap: "4px",
+  minWidth: 0,
+  [theme.breakpoints.down("sm")]: {
+    paddingLeft: "24px",
+  },
+}))
+
+export const UpNextLabel = styled(Typography)(({ theme }) => ({
+  ...theme.typography.body1,
+  fontWeight: theme.typography.fontWeightBold,
+  color: theme.custom.colors.silverGrayDark,
+  textTransform: "uppercase",
+  lineHeight: "150%",
+  [theme.breakpoints.down("sm")]: {
+    ...theme.typography.body2,
+    lineHeight: "22px",
+  },
+}))
+
+export const UpNextTitle = styled(Typography)(({ theme }) => ({
+  ...theme.typography.body1,
+  fontWeight: theme.typography.fontWeightMedium,
+  color: theme.custom.colors.darkGray2,
+  lineHeight: "24px",
+  overflow: "hidden",
+  display: "-webkit-box",
+  WebkitLineClamp: 2,
+  WebkitBoxOrient: "vertical",
+}))
+
+export const MetaRow = styled.div(({ theme }) => ({
+  ...theme.typography.body2,
+  color: theme.custom.colors.darkGray1,
+  marginBottom: "40px",
+  lineHeight: "1.8",
+  [theme.breakpoints.down("sm")]: {
+    marginBottom: "32px",
+  },
+}))
+
+export const MetaInstructorLine = styled.div(({ theme }) => ({
+  fontWeight: theme.typography.fontWeightBold,
+  color: theme.custom.colors.darkGray2,
+}))
+
+export const StyledDuration = styled.div(({ theme }) => ({
+  ...theme.typography.body2,
+  color: theme.custom.colors.silverGrayDark,
+}))
+
+/*
+ * This page has its own DescriptionText - it is not the one in
+ * VideoDetailPage.styled - so it needs the same two things: the component
+ * generic, because a sanitized OVS description contains block elements that are
+ * invalid inside Typography's element for this variant (<p>), and the shared
+ * rich-text rules so lists and links are styled.
+ */
+export const DescriptionText = styled(Typography)<
+  Pick<TypographyProps, "component">
+>(({ theme }) => ({
+  ...theme.typography.body2,
+  ...richTextDescription,
+  color: theme.custom.colors.darkGray2,
+  marginBottom: "16px",
+  lineHeight: "22px",
+  [theme.breakpoints.down("sm")]: {
+    ...theme.typography.body2,
+    lineHeight: "22px",
+    marginBottom: "24px",
+  },
+}))
+
+// ── VIDEO SERIES section (topic chips) ──
+
+export const VideoSeriesSectionHeading = styled(Typography)(({ theme }) => ({
+  ...theme.typography.body3,
+  fontWeight: theme.typography.fontWeightBold,
+  color: theme.custom.colors.black,
+  textTransform: "uppercase",
+  letterSpacing: "1.92px",
+  marginBottom: "16px",
+}))
+
+export const TopicChipsRow = styled.div({
+  display: "flex",
+  flexWrap: "wrap",
+  gap: "8px",
+})
+
+export const TopicChip = styled(Link)(({ theme }) => ({
+  display: "inline-flex",
+  alignItems: "center",
+  padding: "8px 16px",
+  border: `1px solid ${theme.custom.colors.silverGrayLight}`,
+  color: theme.custom.colors.darkRed,
+  textDecoration: "none",
+  ...theme.typography.body3,
+  lineHeight: "12px",
+  fontWeight: theme.typography.fontWeightMedium,
+  "&:hover": {
+    backgroundColor: theme.custom.colors.silverGrayLight,
+    color: theme.custom.colors.red,
+  },
+}))

@@ -1,0 +1,55 @@
+"""main constants"""
+
+from enum import Enum
+
+from rest_framework import status
+
+PERMISSION_DENIED_ERROR_TYPE = "PermissionDenied"
+NOT_AUTHENTICATED_ERROR_TYPE = "NotAuthenticated"
+DJANGO_PERMISSION_ERROR_TYPES = (
+    status.HTTP_401_UNAUTHORIZED,
+    status.HTTP_403_FORBIDDEN,
+)
+
+ISOFORMAT = "%Y-%m-%dT%H:%M:%SZ"
+VALID_HTTP_METHODS = ["get", "post", "patch", "delete"]
+ALLOWED_HTML_TAGS = {
+    "b",
+    "blockquote",
+    "br",
+    "caption",
+    "center",
+    "cite",
+    "code",
+    "div",
+    "em",
+    "hr",
+    "i",
+    "li",
+    "ol",
+    "p",
+    "pre",
+    "q",
+    "small",
+    "span",
+    "strike",
+    "strong",
+    "sub",
+    "sup",
+    "u",
+    "ul",
+}
+ALLOWED_HTML_ATTRIBUTES = {}
+# Podcast RSS "show notes" often contain resource links we want to keep.
+ALLOWED_HTML_TAGS_WITH_LINKS = ALLOWED_HTML_TAGS | {"a"}
+ALLOWED_HTML_ATTRIBUTES_WITH_LINKS = {"a": {"href", "title"}}
+
+TASK_REJECTED = "task-rejected"
+
+
+class PostHogEvents(Enum):
+    """
+    Enum for PostHog events
+    """
+
+    ACCOUNT_CREATED = "user_account_created"

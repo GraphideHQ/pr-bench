@@ -1,0 +1,1087 @@
+"""Tests for Articles News ETL"""
+
+import pytest
+
+from news_events.etl import articles_news
+from website_content.utils import extract_image_from_content
+
+
+@pytest.fixture
+def mock_articles(mocker):
+    """Mock Article.objects.filter"""
+    mock_user = mocker.Mock()
+    mock_user.first_name = "John"
+    mock_user.last_name = "Doe"
+    mock_user.username = "johndoe"
+
+    mock_article = mocker.Mock()
+    mock_article.id = 1
+    mock_article.title = "Test Article"
+    mock_article.slug = "test-article"
+    mock_article.content = {
+        "blocks": [
+            {"type": "paragraph", "text": "This is test content."},
+            {"type": "paragraph", "text": "More content here."},
+        ]
+    }
+    mock_article.user = mock_user
+    mock_article.created_on = mocker.Mock()
+    mock_article.created_on.isoformat.return_value = "2024-01-01T00:00:00Z"
+    mock_article.updated_on = mocker.Mock()
+
+    mock_article.publish_date = mocker.Mock()
+    mock_article.publish_date.isoformat.return_value = "2024-01-01T00:00:00Z"
+
+    mock_queryset = mocker.Mock()
+    mock_queryset.select_related.return_value = [mock_article]
+
+    mocker.patch(
+        "news_events.etl.articles_news.WebsiteContent.objects.filter",
+        return_value=mock_queryset,
+    )
+
+    return [mock_article]
+
+
+def test_extract(mock_articles):
+    """Test extract function returns article data"""
+    result = articles_news.extract()
+
+    assert len(result) == 1
+    assert result[0]["title"] == "Test Article"
+    assert result[0]["slug"] == "test-article"
+    assert result[0]["id"] == 1
+
+
+def test_transform_items():
+    """Test transform_items converts articles to feed format"""
+
+    # Create a mock datetime object
+    from datetime import UTC, datetime
+
+    mock_datetime = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+
+    # Create a simple user class
+    class MockUser:
+        first_name = "John"
+        last_name = "Doe"
+        username = "johndoe"
+
+    articles_data = [
+        {
+            "id": 1,
+            "title": "Test Article",
+            "slug": "test-article",
+            "content": {"blocks": [{"text": "Test content"}]},
+            "user": MockUser(),
+            "created_on": mock_datetime,
+            "publish_date": mock_datetime,
+        }
+    ]
+
+    result = articles_news.transform_items(articles_data)
+
+    assert len(result) == 1
+    assert result[0]["guid"] == "article-1"
+    assert result[0]["title"] == "Test Article"
+    assert result[0]["url"] == "/news/test-article"
+    assert result[0]["detail"]["authors"] == ["John Doe"]
+    assert result[0]["detail"]["publish_date"] == "2024-01-01T00:00:00+00:00"
+
+
+def test_extract_text_from_content():
+    """Test text extraction from JSON content"""
+    # ProseMirror structure (actual format)
+    content_json = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "paragraph",
+                "content": [{"type": "text", "text": "First paragraph."}],
+            },
+            {
+                "type": "paragraph",
+                "content": [{"type": "text", "text": "Second paragraph."}],
+            },
+        ],
+    }
+
+    result = articles_news.extract_text_from_content(content_json)
+
+    assert "First paragraph." in result
+    assert "Second paragraph." in result
+
+
+def test_extract_text_from_nested_prosemirror():
+    """Test text extraction from nested ProseMirror content"""
+    content_json = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "banner",
+                "content": [
+                    {
+                        "type": "heading",
+                        "content": [{"type": "text", "text": "Heading text"}],
+                    }
+                ],
+            },
+            {"type": "paragraph", "content": [{"type": "text", "text": "Body text"}]},
+        ],
+    }
+
+    result = articles_news.extract_text_from_content(content_json)
+
+    assert "Heading text" in result
+    assert "Body text" in result
+
+
+def test_extract_text_from_empty_content():
+    """Test text extraction with empty content"""
+    result = articles_news.extract_text_from_content({})
+    assert result == ""
+
+    result = articles_news.extract_text_from_content(None)
+    assert result == ""
+
+
+def test_extract_image_from_content():
+    """Test image extraction from JSON content"""
+    # ProseMirror imageWithCaption (actual format used)
+    content_json = {
+        "type": "doc",
+        "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": "Some text"}]},
+            {
+                "type": "imageWithCaption",
+                "attrs": {
+                    "src": "http://example.com/image.webp",
+                    "alt": "download",
+                    "title": "download",
+                    "caption": "Image caption",
+                },
+            },
+        ],
+    }
+
+    result = extract_image_from_content(content_json)
+
+    assert result is not None
+    assert result["url"] == "http://example.com/image.webp"
+    assert result["alt"] == "download"
+    assert result["description"] == "Image caption"
+
+
+def test_extract_image_from_prosemirror_image():
+    """Test image extraction from ProseMirror image node"""
+    content_json = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "image",
+                "attrs": {
+                    "src": "http://example.com/photo.jpg",
+                    "alt": "Photo alt text",
+                    "title": "Photo title",
+                },
+            }
+        ],
+    }
+
+    result = extract_image_from_content(content_json)
+
+    assert result is not None
+    assert result["url"] == "http://example.com/photo.jpg"
+    assert result["alt"] == "Photo alt text"
+
+
+def test_extract_image_returns_none_when_no_image():
+    """Test image extraction returns None when no image found"""
+    content_json = {"blocks": [{"type": "paragraph", "text": "Just text, no images"}]}
+
+    result = extract_image_from_content(content_json)
+    assert result is None
+
+    result = extract_image_from_content({})
+    assert result is None
+
+    result = extract_image_from_content(None)
+    assert result is None
+
+
+def test_extract_summary_from_banner_with_banner_paragraph():
+    """Test extracting summary from banner paragraph"""
+    content_json = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "banner",
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "This is the banner summary text.",
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "type": "paragraph",
+                "content": [{"type": "text", "text": "This is a regular paragraph."}],
+            },
+        ],
+    }
+
+    result = articles_news.extract_summary_from_banner(content_json)
+
+    assert result == "This is the banner summary text."
+
+
+def test_extract_summary_from_banner_fallback_to_first_paragraph():
+    """Test fallback to first paragraph when no banner paragraph"""
+    content_json = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "banner",
+                "content": [
+                    {
+                        "type": "heading",
+                        "content": [{"type": "text", "text": "Just a heading"}],
+                    }
+                ],
+            },
+            {
+                "type": "paragraph",
+                "content": [{"type": "text", "text": "First regular paragraph text."}],
+            },
+        ],
+    }
+
+    result = articles_news.extract_summary_from_banner(content_json)
+
+    assert result == "First regular paragraph text."
+
+
+def test_extract_summary_from_banner_no_banner_node():
+    """Test extracting summary when there's no banner node at all"""
+    content_json = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "paragraph",
+                "content": [
+                    {"type": "text", "text": "First paragraph without banner."}
+                ],
+            },
+            {
+                "type": "paragraph",
+                "content": [{"type": "text", "text": "Second paragraph."}],
+            },
+        ],
+    }
+
+    result = articles_news.extract_summary_from_banner(content_json)
+
+    assert result == "First paragraph without banner."
+
+
+def test_extract_summary_from_banner_multiple_text_nodes():
+    """Test extracting summary with multiple text nodes in paragraph"""
+    content_json = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "banner",
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {"type": "text", "text": "This is "},
+                            {"type": "text", "text": "a multi-part "},
+                            {"type": "text", "text": "summary."},
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+    result = articles_news.extract_summary_from_banner(content_json)
+
+    # Text parts are joined without extra spaces
+    assert result == "This is a multi-part summary."
+
+
+def test_extract_summary_from_banner_with_links():
+    """Test extracting summary with links preserves anchor tags"""
+    content_json = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "banner",
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {"type": "text", "text": "Visit "},
+                            {
+                                "type": "text",
+                                "text": "MIT Learn",
+                                "marks": [
+                                    {
+                                        "type": "link",
+                                        "attrs": {
+                                            "href": "https://learn.mit.edu",
+                                            "target": "_blank",
+                                            "rel": "noopener noreferrer nofollow",
+                                        },
+                                    }
+                                ],
+                            },
+                            {"type": "text", "text": " for more information."},
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+    result = articles_news.extract_summary_from_banner(content_json)
+
+    assert (
+        result
+        == 'Visit <a href="https://learn.mit.edu" target="_blank" rel="noopener noreferrer nofollow">MIT Learn</a> for more information.'
+    )
+
+
+def test_extract_summary_from_banner_with_multiple_links():
+    """Test extracting summary with multiple links"""
+    content_json = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "banner",
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {"type": "text", "text": "Check out "},
+                            {
+                                "type": "text",
+                                "text": "MIT",
+                                "marks": [
+                                    {
+                                        "type": "link",
+                                        "attrs": {
+                                            "href": "https://mit.edu",
+                                            "target": "_blank",
+                                            "rel": "noopener noreferrer nofollow",
+                                        },
+                                    }
+                                ],
+                            },
+                            {"type": "text", "text": " and "},
+                            {
+                                "type": "text",
+                                "text": "Google",
+                                "marks": [
+                                    {
+                                        "type": "link",
+                                        "attrs": {
+                                            "href": "https://google.com",
+                                            "target": "_blank",
+                                            "rel": "noopener noreferrer",
+                                        },
+                                    }
+                                ],
+                            },
+                            {"type": "text", "text": " for details."},
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+    result = articles_news.extract_summary_from_banner(content_json)
+
+    assert (
+        result
+        == 'Check out <a href="https://mit.edu" target="_blank" rel="noopener noreferrer nofollow">MIT</a> and <a href="https://google.com" target="_blank" rel="noopener noreferrer">Google</a> for details.'
+    )
+
+
+def test_extract_summary_from_banner_escapes_malicious_link_attrs():
+    """
+    A link href that tries to break out of the href attribute must not be
+    able to inject a new HTML attribute. Regression test for the exploit in
+    https://github.com/mitodl/hq/issues/13456: an editor-supplied href of
+    '" onmouseover="alert(document.cookie)' previously closed the href
+    attribute early and added onmouseover as a real, separate attribute.
+    """
+    content_json = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "banner",
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Click here",
+                                "marks": [
+                                    {
+                                        "type": "link",
+                                        "attrs": {
+                                            "href": (
+                                                '" onmouseover="alert(document.cookie)'
+                                            ),
+                                            "target": "_blank",
+                                            "rel": "noopener",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+    result = articles_news.extract_summary_from_banner(content_json)
+
+    assert "onmouseover" not in result
+    assert result == '<a href="#" target="_blank" rel="noopener">Click here</a>'
+
+
+def test_extract_summary_from_banner_rejects_javascript_scheme_links():
+    """A javascript: href must not be emitted verbatim into the anchor tag"""
+    content_json = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "banner",
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Click",
+                                "marks": [
+                                    {
+                                        "type": "link",
+                                        "attrs": {
+                                            "href": "javascript:alert(document.cookie)",
+                                            "target": "_blank",
+                                            "rel": "noopener",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+    result = articles_news.extract_summary_from_banner(content_json)
+
+    assert "javascript:" not in result
+    assert result == '<a href="#" target="_blank" rel="noopener">Click</a>'
+
+
+def test_extract_summary_from_banner_escapes_target_and_rel_attrs():
+    """
+    target/rel must be escaped too, not just href. Uses a valid https://
+    href specifically so the scheme check doesn't neutralize the link (and
+    so this test can't pass merely because href/target/rel escaping was
+    removed entirely -- it must actually escape the hostile target/rel
+    values to pass).
+    """
+    content_json = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "banner",
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Click here",
+                                "marks": [
+                                    {
+                                        "type": "link",
+                                        "attrs": {
+                                            "href": "https://example.com",
+                                            "target": '"><script>alert(1)</script>',
+                                            "rel": '" onmouseover="alert(2)',
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+    result = articles_news.extract_summary_from_banner(content_json)
+
+    # The exact-match below is the real assertion: it confirms the hostile
+    # target/rel values are safely quoted inside their own attribute values
+    # rather than breaking out to add a real onmouseover attribute -- the
+    # literal word "onmouseover" legitimately still appears in the escaped
+    # text, so checking for its absence would be wrong.
+    assert "<script>" not in result
+    assert result == (
+        '<a href="https://example.com" '
+        'target="&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;" '
+        'rel="&quot; onmouseover=&quot;alert(2)">Click here</a>'
+    )
+
+
+def test_extract_summary_from_banner_handles_malformed_url():
+    """
+    A syntactically invalid URL (urlparse raises ValueError rather than
+    just failing to parse) must not raise -- it should be treated the same
+    as any other disallowed href and replaced with the safe placeholder,
+    rather than aborting the whole feed transform for every other article.
+    """
+    content_json = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "banner",
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Click",
+                                "marks": [
+                                    {
+                                        "type": "link",
+                                        "attrs": {"href": "http://["},
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+    result = articles_news.extract_summary_from_banner(content_json)
+
+    assert (
+        result
+        == '<a href="#" target="_blank" rel="noopener noreferrer nofollow">Click</a>'
+    )
+
+
+@pytest.mark.parametrize(
+    ("href", "expected_href"),
+    [
+        ("https://example.com", "https://example.com"),
+        ("mailto:foo@example.com", "mailto:foo@example.com"),
+        ("tel:+16175551234", "tel:+16175551234"),
+        ("/news/foo", "/news/foo"),
+        ("/search?q=abc", "/search?q=abc"),
+        ("//evil.com", "#"),
+        ("/\\evil.com", "#"),
+        ("javascript:alert(1)", "#"),
+    ],
+)
+def test_extract_summary_from_banner_allows_mailto_tel_and_relative_links(
+    href, expected_href
+):
+    """
+    mailto:/tel: URIs and site-relative paths (e.g. "/news/foo") are links
+    editors can legitimately create via the link popover, so they must
+    render as real hrefs rather than the safe "#" placeholder. Protocol-
+    relative ("//host") and backslash ("/\\host") variants are excluded
+    since browsers treat those as other-host URLs.
+    """
+    content_json = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "banner",
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Click",
+                                "marks": [
+                                    {
+                                        "type": "link",
+                                        "attrs": {"href": href},
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+    result = articles_news.extract_summary_from_banner(content_json)
+
+    assert (
+        result == f'<a href="{expected_href}" target="_blank" '
+        'rel="noopener noreferrer nofollow">Click</a>'
+    )
+
+
+def test_extract_summary_from_banner_handles_non_string_link_attrs():
+    """
+    ProseMirror content is unvalidated JSON, so a link mark's attrs can
+    hold null/non-string values instead of a string or being absent
+    entirely. None of these should raise (html.escape/urlparse only accept
+    strings) or abort the whole feed transform for every other article.
+    """
+    content_json = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "banner",
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Click",
+                                "marks": [
+                                    {
+                                        "type": "link",
+                                        "attrs": {
+                                            "href": "https://mit.edu",
+                                            "target": None,
+                                            "rel": None,
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+    result = articles_news.extract_summary_from_banner(content_json)
+
+    # Falls back to the same defaults as when target/rel are absent entirely
+    assert result == (
+        '<a href="https://mit.edu" target="_blank" '
+        'rel="noopener noreferrer nofollow">Click</a>'
+    )
+
+
+def test_extract_summary_from_banner_handles_non_string_href():
+    """A non-string href (e.g. a number) must not raise; treated as absent"""
+    content_json = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "banner",
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Click",
+                                "marks": [{"type": "link", "attrs": {"href": 12345}}],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+    result = articles_news.extract_summary_from_banner(content_json)
+
+    assert result == "Click"
+
+
+def test_extract_summary_from_banner_handles_non_dict_link_attrs():
+    """A link mark whose attrs is not a dict must not raise"""
+    content_json = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "banner",
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Click",
+                                "marks": [{"type": "link", "attrs": "garbage"}],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+    result = articles_news.extract_summary_from_banner(content_json)
+
+    assert result == "Click"
+
+
+def test_extract_summary_from_banner_handles_non_string_text():
+    """A text node whose text value isn't a string must not raise"""
+    content_json = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "banner",
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": 12345}],
+                    }
+                ],
+            }
+        ],
+    }
+
+    result = articles_news.extract_summary_from_banner(content_json)
+
+    assert result == ""
+
+
+def test_extract_summary_from_banner_handles_non_list_marks():
+    """A text node whose marks value is not a list must not raise"""
+    content_json = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "banner",
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {"type": "text", "text": "Click", "marks": "garbage"}
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+    result = articles_news.extract_summary_from_banner(content_json)
+
+    assert result == "Click"
+
+
+def test_extract_summary_from_banner_escapes_plain_text_html():
+    """
+    Plain (non-linked) text containing literal HTML must be escaped, not
+    passed through verbatim -- this text is later rendered with
+    dangerouslySetInnerHTML on the public /news page with no other
+    sanitization step.
+    """
+    content_json = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "banner",
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "<script>alert(document.cookie)</script>",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+    result = articles_news.extract_summary_from_banner(content_json)
+
+    assert "<script>" not in result
+    assert result == "&lt;script&gt;alert(document.cookie)&lt;/script&gt;"
+
+
+def test_extract_summary_from_banner_empty_content():
+    """Test extracting summary from empty content"""
+    result = articles_news.extract_summary_from_banner({})
+    assert result == ""
+
+    result = articles_news.extract_summary_from_banner(None)
+    assert result == ""
+
+
+def test_extract_summary_from_banner_no_paragraphs():
+    """Test extracting summary when there are no paragraphs"""
+    content_json = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "banner",
+                "content": [
+                    {
+                        "type": "heading",
+                        "content": [{"type": "text", "text": "Only heading"}],
+                    }
+                ],
+            },
+            {
+                "type": "image",
+                "attrs": {"src": "http://example.com/image.jpg"},
+            },
+        ],
+    }
+
+    result = articles_news.extract_summary_from_banner(content_json)
+
+    assert result == ""
+
+
+def test_extract_summary_from_banner_empty_paragraphs():
+    """Test extracting summary when paragraphs are empty"""
+    content_json = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "banner",
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": "   "}],
+                    }
+                ],
+            },
+            {
+                "type": "paragraph",
+                "content": [{"type": "text", "text": "Non-empty paragraph."}],
+            },
+        ],
+    }
+
+    result = articles_news.extract_summary_from_banner(content_json)
+
+    # Should skip empty/whitespace-only banner paragraph and use first non-empty
+    assert result == "Non-empty paragraph."
+
+
+def test_transform(mock_articles):
+    """Test full transform pipeline"""
+    articles_data = articles_news.extract()
+    result = articles_news.transform(articles_data)
+
+    assert len(result) == 1
+    assert result[0]["title"] == "MIT Learn Articles"
+    assert result[0]["feed_type"] == "news"
+    assert result[0]["url"] == "/news"
+    assert "items" in result[0]
+    assert len(result[0]["items"]) == 1
+
+
+def test_transform_with_no_articles():
+    """Test transform with empty data"""
+    result = articles_news.transform([])
+    assert result == []
+
+
+def test_extract_single_article():
+    """Test extracting a single article"""
+    from datetime import UTC, datetime
+
+    # Create a mock user
+    class User:
+        first_name = "John"
+        last_name = "Doe"
+        username = "johndoe"
+
+    # Create a mock article
+    class MockArticle:
+        id = 1
+        title = "Test Article"
+        slug = "test-article"
+        content = {"blocks": [{"text": "Test content"}]}
+        cover_image = ""
+        created_on = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        updated_on = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        publish_date = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        user = User()
+
+    result = articles_news.extract_single_website_content(MockArticle())
+
+    assert result["id"] == 1
+    assert result["title"] == "Test Article"
+    assert result["slug"] == "test-article"
+
+
+def test_transform_single_article():
+    """Test transforming a single article"""
+    from datetime import UTC, datetime
+
+    class MockUser:
+        first_name = "John"
+        last_name = "Doe"
+        username = "johndoe"
+
+    article_data = {
+        "id": 1,
+        "title": "Test Article",
+        "slug": "test-article",
+        "content": {
+            "type": "doc",
+            "content": [
+                {"type": "paragraph", "content": [{"type": "text", "text": "Test"}]}
+            ],
+        },
+        "user": MockUser(),
+        "created_on": datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC),
+        "publish_date": datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC),
+    }
+
+    result = articles_news.transform_single_article(article_data)
+
+    assert result is not None
+    assert result["guid"] == "article-1"
+    assert result["title"] == "Test Article"
+    assert result["url"] == "/news/test-article"
+
+
+def test_sync_single_article_to_news(mocker):
+    """Test syncing a single article to news feed"""
+    from datetime import UTC, datetime
+
+    # Mock the FeedSource and loaders
+    mock_source = mocker.Mock()
+    mock_get_or_create = mocker.patch(
+        "news_events.models.FeedSource.objects.get_or_create",
+        return_value=(mock_source, True),
+    )
+    mock_load_feed_item = mocker.patch("news_events.etl.loaders.load_feed_item")
+
+    # Create a mock user
+    class User:
+        first_name = "John"
+        last_name = "Doe"
+        username = "johndoe"
+
+    # Create a mock article
+    class MockArticle:
+        id = 1
+        title = "Test Article"
+        slug = "test-article"
+        content = {
+            "type": "doc",
+            "content": [
+                {"type": "paragraph", "content": [{"type": "text", "text": "Test"}]}
+            ],
+        }
+        cover_image = ""
+        is_published = True
+        content_type = "news"
+        created_on = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        updated_on = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        publish_date = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        user = User()
+
+    # Sync the article
+    articles_news.sync_single_website_content_news_to_news(MockArticle())
+
+    # Verify FeedSource was created/retrieved
+    mock_get_or_create.assert_called_once()
+
+    # Verify load_feed_item was called
+    mock_load_feed_item.assert_called_once()
+    call_args = mock_load_feed_item.call_args
+    assert call_args[0][0] == mock_source  # First arg is the source
+    assert call_args[0][1]["guid"] == "article-1"  # Second arg is item_data
+
+
+def test_sync_single_article_unpublished(mocker):
+    """Test that unpublished articles are not synced"""
+    mock_load_feed_item = mocker.patch("news_events.etl.loaders.load_feed_item")
+
+    # Create an unpublished article
+    class MockArticle:
+        is_published = False
+
+    # Sync the article
+    articles_news.sync_single_website_content_news_to_news(MockArticle())
+
+    # Verify load_feed_item was NOT called
+    mock_load_feed_item.assert_not_called()
+
+
+def test_sync_single_article_wrong_content_type(mocker):
+    """Test that articles with a content_type other than 'news' are not synced"""
+    mock_load_feed_item = mocker.patch("news_events.etl.loaders.load_feed_item")
+
+    class MockArticle:
+        is_published = True
+        content_type = "article"  # not WebsiteContentType.news
+
+    articles_news.sync_single_website_content_news_to_news(MockArticle())
+
+    mock_load_feed_item.assert_not_called()
+
+
+def test_website_content_feed_guid():
+    """The guid convention is stable: the sync and the delete must agree on it"""
+    assert articles_news.website_content_feed_guid(7) == "article-7"
+
+
+@pytest.mark.django_db
+def test_delete_website_content_news_from_news_removes_the_item():
+    """Deleting by guid removes the feed item and reports one FeedItem gone"""
+    from news_events.constants import FeedType
+    from news_events.models import FeedItem, FeedSource
+
+    source = FeedSource.objects.create(
+        title="MIT Learn Articles",
+        url="/news",
+        feed_type=FeedType.news.name,
+    )
+    FeedItem.objects.create(
+        guid=articles_news.website_content_feed_guid(42),
+        source=source,
+        title="Doomed",
+        url="/news/doomed",
+    )
+
+    deleted = articles_news.delete_website_content_news_from_news(42)
+
+    # One FeedItem, not the cascade total.
+    assert deleted == 1
+    assert not FeedItem.objects.filter(guid="article-42").exists()
+
+
+@pytest.mark.django_db
+def test_delete_website_content_news_from_news_is_a_noop_when_absent():
+    """Content that never had a feed entry (a draft, or a non-news type)"""
+    assert articles_news.delete_website_content_news_from_news(999) == 0
